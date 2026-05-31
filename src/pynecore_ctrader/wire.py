@@ -26,6 +26,8 @@ import struct
 
 from google.protobuf.message import Message
 
+from pynecore.core.plugin import ProviderError
+
 from . import helpers
 from .messages import OpenApiCommonMessages_pb2 as _common
 from .messages import OpenApiMessages_pb2 as _oa
@@ -33,8 +35,14 @@ from .messages import OpenApiMessages_pb2 as _oa
 logger = logging.getLogger(__name__)
 
 
-class CTraderWireError(Exception):
-    """Base class for wire-level errors."""
+class CTraderWireError(ProviderError):
+    """Base class for wire-level errors.
+
+    Subclasses :class:`~pynecore.core.plugin.ProviderError` so the ``pyne data``
+    CLI reports connection/auth/protocol failures as a clean one-line error
+    rather than a traceback; on the live path the same errors still propagate to
+    the :class:`LiveProviderPlugin` reconnect logic untouched.
+    """
 
 
 class CTraderConnectionError(CTraderWireError):

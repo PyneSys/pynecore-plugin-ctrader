@@ -15,5 +15,8 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = ["pynesys-pynecore>=6.5", "protobuf", "httpx"]
 
+[project.entry-points."pyne.plugin"]
+ctrader = "pynecore_ctrader:CTrader"
+
 [project.optional-dependencies]
 dev = ["grpcio-tools", "types-protobuf"]

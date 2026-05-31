@@ -6,4 +6,6 @@ persistent TCP+TLS connection). The implementation lands in milestones; see
 for the design.
 """
 
-__all__: list[str] = []
+from .plugin import CTrader, CTraderConfig
+
+__all__ = ['CTrader', 'CTraderConfig']
