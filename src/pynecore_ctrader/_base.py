@@ -14,9 +14,9 @@ lifecycle plus the OAuth socket handshake, and exposes two ways to use them:
 cTrader is a *multi-broker* provider: one OAuth application reaches every broker
 the user holds a cTrader account with (Pepperstone, IC Markets, ...). The broker
 is selected by the leading segment of the provider string
-(``ctrader:Pepperstone:EURUSD``) — matched against
-:attr:`ProtoOACtidTraderAccount.brokerTitleShort` — with the config ``account_id``
-as the tie-breaker when one broker holds several accounts.
+(``ctrader:pepperstoneuk:EURUSD``) — matched against the short
+:attr:`ProtoOATrader.brokerName` slug — with the config ``account_id`` as the
+tie-breaker when one broker holds several accounts.
 
 In M2 this base swaps :class:`LiveProviderPlugin` for ``BrokerPlugin``.
 """
@@ -168,16 +168,55 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
         response = cast(_oa.ProtoOAGetAccountListByAccessTokenRes, await self._token_call(wire, call))
         return list(response.ctidTraderAccount)
 
-    def _resolve_account(self, accounts: list[_model.ProtoOACtidTraderAccount]) -> int:
-        """Pick the ``ctidTraderAccountId`` to authenticate.
+    async def _account_auth(self, wire: WireClient, account_id: int) -> None:
+        """Authorize one trading account on the channel (refresh-aware).
+
+        cTrader rejects a second auth of the same account on one channel
+        (``ALREADY_LOGGED_IN``), so each account must be authorized exactly once.
+
+        :param wire: A connected, application-authenticated client.
+        :param account_id: The ``ctidTraderAccountId`` to authorize.
+        """
+        async def call(token: str) -> Message:
+            return await wire.send_request(
+                _oa.ProtoOAAccountAuthReq(ctidTraderAccountId=account_id, accessToken=token)
+            )
+        await self._token_call(wire, call)
+
+    async def _broker_name(self, wire: WireClient, account_id: int) -> str:
+        """Fetch the broker whitelabel slug for an authorized account.
+
+        ``ProtoOATrader.brokerName`` is the short, space-free broker identifier
+        (e.g. ``pepperstoneuk``) — unlike ``brokerTitleShort`` which is a readable
+        UI title (e.g. ``Pepperstone - Europe``). The account must already be
+        authorized via :meth:`_account_auth`.
+
+        :param wire: A connected client with ``account_id`` authorized.
+        :param account_id: The authorized account's ``ctidTraderAccountId``.
+        :return: The broker slug (possibly empty if the broker set none).
+        """
+        response = cast(_oa.ProtoOATraderRes, await wire.send_request(
+            _oa.ProtoOATraderReq(ctidTraderAccountId=account_id)
+        ))
+        return response.trader.brokerName
+
+    async def _resolve_account(
+        self, wire: WireClient, accounts: list[_model.ProtoOACtidTraderAccount]
+    ) -> int:
+        """Authorize and return the ``ctidTraderAccountId`` to trade on.
 
         Resolution order: an explicit config ``account_id`` wins; otherwise the
-        broker title from the provider string selects it; otherwise the sole
+        broker slug from the provider string selects it; otherwise the sole
         account of the right kind is used. The pool is first filtered to the
         host's kind (demo accounts on the demo host, live on live).
 
+        Broker matching is on the short ``brokerName`` slug (e.g. ``pepperstoneuk``),
+        which lives on ``ProtoOATrader`` and so requires authorizing each candidate
+        account before it can be read. The chosen account is left authorized.
+
+        :param wire: A connected, application-authenticated client.
         :param accounts: The accounts the access token grants.
-        :return: The selected account id.
+        :return: The selected (and authorized) account id.
         :raises CTraderAuthError: If the choice is empty or ambiguous.
         """
         want_live = not self._demo
@@ -189,47 +228,49 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
             )
         if self._account_id is not None:
             if any(a.ctidTraderAccountId == self._account_id for a in pool):
+                await self._account_auth(wire, self._account_id)
                 return self._account_id
             raise auth.CTraderAuthError(
                 "ACCOUNT_NOT_FOUND",
                 f"account_id {self._account_id} is not among the {kind} accounts",
             )
         if self._broker_title:
-            matches = [a for a in pool
-                       if a.brokerTitleShort.lower() == self._broker_title.lower()]
+            target = self._broker_title.lower()
+            matches: list[int] = []
+            names: dict[int, str] = {}
+            for a in pool:
+                await self._account_auth(wire, a.ctidTraderAccountId)
+                name = await self._broker_name(wire, a.ctidTraderAccountId)
+                names[a.ctidTraderAccountId] = name
+                if name.lower() == target:
+                    matches.append(a.ctidTraderAccountId)
             if not matches:
-                available = ", ".join(sorted({a.brokerTitleShort for a in pool}))
+                available = ", ".join(sorted({n for n in names.values() if n}))
                 raise auth.CTraderAuthError(
                     "BROKER_NOT_FOUND",
                     f"broker '{self._broker_title}' not found; available: {available}",
                 )
             if len(matches) > 1:
-                ids = ", ".join(str(a.ctidTraderAccountId) for a in matches)
+                ids = ", ".join(str(i) for i in matches)
                 raise auth.CTraderAuthError(
                     "ACCOUNT_AMBIGUOUS",
                     f"broker '{self._broker_title}' has multiple accounts; set account_id: {ids}",
                 )
-            return matches[0].ctidTraderAccountId
+            return matches[0]
         if len(pool) > 1:
             ids = ", ".join(str(a.ctidTraderAccountId) for a in pool)
             raise auth.CTraderAuthError(
                 "ACCOUNT_AMBIGUOUS",
                 f"multiple {kind} accounts; set account_id or name a broker: {ids}",
             )
+        await self._account_auth(wire, pool[0].ctidTraderAccountId)
         return pool[0].ctidTraderAccountId
 
     async def _full_handshake(self, wire: WireClient) -> int:
-        """Run app-auth, resolve the account and account-auth; return its id."""
+        """Run app-auth, then resolve and authorize the account; return its id."""
         await self._app_auth(wire)
         accounts = await self._get_accounts(wire)
-        account_id = self._resolve_account(accounts)
-
-        async def call(token: str) -> Message:
-            return await wire.send_request(
-                _oa.ProtoOAAccountAuthReq(ctidTraderAccountId=account_id, accessToken=token)
-            )
-        await self._token_call(wire, call)
-        return account_id
+        return await self._resolve_account(wire, accounts)
 
     # --- one-shot synchronous bridge ----------------------------------------
 

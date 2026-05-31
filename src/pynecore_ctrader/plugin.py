@@ -37,9 +37,9 @@ class CTrader(_ProviderMixin, CLIPlugin[CTraderConfig]):
       events
 
     **Multi-broker** — the broker segment of the provider string
-    (``ctrader:Pepperstone:EURUSD@60``) selects the trading account by broker
-    title; ``account_id`` in the config disambiguates multiple accounts at one
-    broker.
+    (``ctrader:pepperstoneuk:EURUSD@60``) selects the trading account by broker
+    slug (``ProtoOATrader.brokerName``); ``account_id`` in the config
+    disambiguates multiple accounts at one broker.
     """
 
     @staticmethod

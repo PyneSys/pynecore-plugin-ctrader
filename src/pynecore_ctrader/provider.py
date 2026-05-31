@@ -20,7 +20,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Callable, cast
 from zoneinfo import ZoneInfo
 
-from pynecore.core.plugin import override
+from pynecore.core.plugin import override, Broker
 from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
 from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
@@ -81,8 +81,8 @@ class _ProviderMixin(_CTraderBase):
 
     @classmethod
     @override
-    def get_list_of_brokers(cls) -> list[str]:
-        """List the broker titles the configured token grants accounts with.
+    def get_list_of_brokers(cls) -> list[Broker]:
+        """List the brokers the configured token grants accounts with.
 
         Unlike a static exchange list, cTrader's brokers come from the user's
         own account list, so this opens a short-lived authenticated socket. The
@@ -90,7 +90,8 @@ class _ProviderMixin(_CTraderBase):
         provider method that reaches the CLI app state, and only on the
         ``--list-brokers`` path (never inside a security subprocess).
 
-        :return: The distinct broker titles, sorted.
+        :return: The distinct brokers (short ``brokerName`` slug as id, readable
+            ``brokerTitleShort`` as name), sorted by id.
         """
         # Local import: keep the plugin import graph free of the CLI app module;
         # this classmethod only ever runs from the ``pyne data`` command.
@@ -102,15 +103,26 @@ class _ProviderMixin(_CTraderBase):
         )
         return cls(symbol=None, config=cast(CTraderConfig, config))._list_brokers()
 
-    def _list_brokers(self) -> list[str]:
-        """Enumerate the distinct broker titles for the configured host kind."""
-        async def work(wire) -> list[str]:
+    def _list_brokers(self) -> list[Broker]:
+        """Enumerate the distinct brokers for the configured host kind.
+
+        The id (``ProtoOATrader.brokerName`` slug, e.g. ``pepperstoneuk``) lives
+        on the per-account trader record, so each account is authorized to read
+        it; the readable name is the account list's ``brokerTitleShort``.
+        """
+        async def work(wire) -> list[Broker]:
             accounts = await self._get_accounts(wire)
             want_live = not self._demo
-            titles = {a.brokerTitleShort for a in accounts
-                      if a.isLive == want_live and a.brokerTitleShort}
-            return sorted(titles)
-        return cast(list[str], self._run(self._app_session(work)))
+            titles: dict[str, str] = {}
+            for a in accounts:
+                if a.isLive != want_live:
+                    continue
+                await self._account_auth(wire, a.ctidTraderAccountId)
+                slug = await self._broker_name(wire, a.ctidTraderAccountId)
+                if slug:
+                    titles.setdefault(slug, a.brokerTitleShort or "")
+            return [Broker(id=slug, name=titles[slug]) for slug in sorted(titles)]
+        return cast("list[Broker]", self._run(self._app_session(work)))
 
     # --- symbol listing + resolution ----------------------------------------
 
@@ -267,11 +279,19 @@ class _ProviderMixin(_CTraderBase):
         chunk = limit or 2000
         window = period_seconds * chunk
 
+        # ``time_from`` / ``time_to`` arrive as naive UTC (framework contract).
+        # Anchor them to UTC before converting to epoch — a naive datetime's
+        # ``.timestamp()`` would otherwise be interpreted in the local timezone.
+        from_dt = time_from.replace(tzinfo=timezone.utc) if time_from.tzinfo is None \
+            else time_from.astimezone(timezone.utc)
+        to_dt = time_to.replace(tzinfo=timezone.utc) if time_to.tzinfo is None \
+            else time_to.astimezone(timezone.utc)
+
         async def work(wire, account_id: int) -> None:
             symbol_id = await self._resolve_symbol_id(wire, account_id)
             period = self._period_value()
-            from_ms = int(time_from.timestamp() * 1000)
-            to_ms = int(time_to.timestamp() * 1000)
+            from_ms = int(from_dt.timestamp() * 1000)
+            to_ms = int(to_dt.timestamp() * 1000)
             cursor = from_ms
             while cursor < to_ms:
                 end_ms = min(cursor + window * 1000, to_ms)
@@ -292,7 +312,8 @@ class _ProviderMixin(_CTraderBase):
                         self.save_ohlcv_data(candle)
                     last_ts = max(last_ts, (bar.utcTimestampInMinutes * 60 + period_seconds) * 1000)
                 if on_progress is not None:
-                    on_progress(datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc))
+                    on_progress(datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc)
+                                .replace(tzinfo=None))
                 cursor = max(last_ts, cursor + window * 1000)
 
         self._run(self._authed_session(work))
