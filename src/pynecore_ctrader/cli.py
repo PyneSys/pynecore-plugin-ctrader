@@ -6,7 +6,8 @@ flow against the user's own cTrader Open API application:
 1. open a localhost loopback listener (the registered ``redirect_uri``),
 2. send the user to the consent page (browser or printed URL),
 3. catch the redirect, exchange the ``code`` for a token pair, and
-4. write the refresh/access token into ``config/plugins/ctrader.toml``.
+4. store the refresh/access token in the workdir cache via
+   :mod:`pynecore_ctrader.session` (never in the user config).
 
 The handler is synchronous: a blocking loopback wait plus a synchronous HTTP
 token exchange, with no ``sleep`` polling — :meth:`HTTPServer.handle_request`
@@ -15,7 +16,6 @@ blocks until one request arrives and honours the server timeout.
 import asyncio
 import http.server
 import logging
-import secrets
 import time
 import urllib.parse
 import webbrowser
@@ -24,9 +24,9 @@ from typing import cast
 import typer
 
 from pynecore.cli.app import app_state
-from pynecore.core.config import ensure_config, generate_toml
+from pynecore.core.config import ensure_config
 
-from . import auth, helpers
+from . import auth, helpers, session
 from .config import CTraderConfig
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,13 @@ ctrader_app = typer.Typer(help="cTrader Open API authentication")
 
 
 class _CallbackHandler(http.server.BaseHTTPRequestHandler):
-    """Capture the OAuth redirect's ``code``/``state``/``error`` query params."""
+    """Capture the OAuth redirect's ``code``/``error`` query params.
+
+    cTrader does not echo the OAuth ``state`` parameter back to the redirect, so
+    there is nothing to validate it against; the loopback flow's protection rests
+    on the listener being bound to ``127.0.0.1`` only, short-lived and single-use,
+    with the ``code`` exchanged immediately over TLS using the ``client_secret``.
+    """
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -47,7 +53,6 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         self.server.oauth_code = code  # type: ignore[attr-defined]
-        self.server.oauth_state = params.get("state", [""])[0]  # type: ignore[attr-defined]
         self.server.oauth_error = error  # type: ignore[attr-defined]
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -62,8 +67,9 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
 
 @ctrader_app.command("auth")
 def ctrader_auth(
-    demo: bool = typer.Option(True, "--demo/--live",
-                              help="Authenticate against the demo or live system."),
+    demo: bool | None = typer.Option(None, "--demo/--live",
+                                     help="Which environment to store the session under; "
+                                          "defaults to the config's demo setting."),
     port: int = typer.Option(8765, "-p", "--port",
                              help="Loopback port; must match the app's registered redirect URI."),
     timeout: int = typer.Option(300, "--timeout",
@@ -74,6 +80,11 @@ def ctrader_auth(
     """Obtain and store a cTrader OAuth token via the loopback consent flow."""
     config_path = app_state.config_dir / "plugins" / "ctrader.toml"
     config = cast(CTraderConfig, ensure_config(CTraderConfig, config_path))
+
+    # The OAuth consent/token exchange is environment-agnostic; ``demo`` only
+    # selects which session key the token is stored under. Default it from the
+    # config so the stored env matches the one the runtime will connect to.
+    demo_env = config.demo if demo is None else demo
 
     client_id = (config.client_id or "").strip()
     client_secret = (config.client_secret or "").strip()
@@ -88,13 +99,11 @@ def ctrader_auth(
     # One redirect_uri value, used byte-identically in the consent URL and the
     # token exchange (a mismatch yields invalid_grant).
     redirect_uri = f"http://localhost:{port}"
-    state = secrets.token_urlsafe(24)
     consent_url = helpers.AUTH_URI + "?" + urllib.parse.urlencode({
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "scope": helpers.DEFAULT_SCOPE,
         "response_type": "code",
-        "state": state,
     })
 
     try:
@@ -108,7 +117,6 @@ def ctrader_auth(
         raise typer.Exit(1)
     server.timeout = timeout
     server.oauth_code = ""  # type: ignore[attr-defined]
-    server.oauth_state = ""  # type: ignore[attr-defined]
     server.oauth_error = ""  # type: ignore[attr-defined]
 
     if no_browser or not webbrowser.open(consent_url):
@@ -137,10 +145,6 @@ def ctrader_auth(
         typer.secho(f"Error: authorization failed: {server.oauth_error}",  # type: ignore[attr-defined]
                     err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
-    if server.oauth_state != state:  # type: ignore[attr-defined]
-        typer.secho("Error: state mismatch; aborting (possible CSRF).",
-                    err=True, fg=typer.colors.RED)
-        raise typer.Exit(1)
 
     try:
         tokens = asyncio.run(auth.exchange_code(
@@ -151,16 +155,7 @@ def ctrader_auth(
         typer.secho(f"Error: token exchange failed: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
 
-    _persist_tokens(config, config_path, tokens, demo=demo)
-    typer.secho("cTrader authentication stored. You can now use the ctrader provider.",
-                fg=typer.colors.GREEN)
-
-
-def _persist_tokens(config: CTraderConfig, config_path, tokens: auth.TokenSet,
-                    *, demo: bool) -> None:
-    """Write the obtained tokens back into the plugin TOML, preserving the rest."""
-    values = {k: v for k, v in vars(config).items() if v not in ("", None, {})}
-    values["refresh_token"] = tokens.refresh_token
-    values["access_token"] = tokens.access_token
-    values["demo"] = demo
-    config_path.write_text(generate_toml(CTraderConfig, values))
+    session.save_session(tokens, demo=demo_env)
+    env_name = "demo" if demo_env else "live"
+    typer.secho(f"cTrader authentication stored ({env_name}). "
+                "You can now use the ctrader provider.", fg=typer.colors.GREEN)

@@ -32,7 +32,7 @@ from google.protobuf.message import Message
 from pynecore.core.plugin import LiveProviderPlugin
 from pynecore.types.ohlcv import OHLCV
 
-from . import auth, helpers
+from . import auth, helpers, session
 from .config import CTraderConfig
 from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
@@ -77,9 +77,10 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
         self._demo = bool(getattr(config, 'demo', False))
         account_id = str(getattr(config, 'account_id', '') or '').strip()
         self._account_id: int | None = int(account_id) if account_id else None
-        self._tokens = auth.TokenSet(
-            access_token=str(getattr(config, 'access_token', '') or ''),
-            refresh_token=str(getattr(config, 'refresh_token', '') or ''),
+        # The token pair is machine-generated auth state, loaded from the workdir
+        # cache rather than the user config; empty until ``pyne ctrader auth`` ran.
+        self._tokens = session.load_session(demo=self._demo) or auth.TokenSet(
+            access_token="", refresh_token=""
         )
 
         #: Persistent live connection (``None`` until :meth:`connect`).
@@ -145,6 +146,9 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
                 raise
             logger.debug("cTrader token-scoped request failed; refreshing on socket")
             self._tokens = await auth.refresh_via_socket(wire, self._tokens.refresh_token)
+            # cTrader may rotate the refresh token on refresh; persist the new pair
+            # so it survives a restart (the old refresh token may now be invalid).
+            session.save_session(self._tokens, demo=self._demo)
             return await call(self._tokens.access_token)
 
     async def _app_auth(self, wire: WireClient) -> None:

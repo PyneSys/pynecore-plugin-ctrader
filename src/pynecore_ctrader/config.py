@@ -1,11 +1,14 @@
 """Configuration dataclass for the cTrader Open API plugin.
 
-One OAuth credential block (application + token) serves both the data-ingest
-and the order-execution side. Internal tuning knobs (heartbeat cadence,
-reconnect timing, request timeouts) live as module-level constants in
-:mod:`pynecore_ctrader.helpers`, deliberately NOT in this dataclass: they have
-no user-facing reason to be touched, and exposing them as config fields balloons
-the user TOML with knobs the user does not understand.
+The user-facing OAuth application credentials (``client_id`` / ``client_secret``)
+serve both the data-ingest and the order-execution side. The minted token pair is
+*not* here: it is machine-generated auth state, persisted to the workdir cache via
+:mod:`pynecore_ctrader.session` so the program never rewrites this user-edited
+file. Internal tuning knobs (heartbeat cadence, reconnect timing, request
+timeouts) live as module-level constants in :mod:`pynecore_ctrader.helpers`,
+deliberately NOT in this dataclass: they have no user-facing reason to be touched,
+and exposing them as config fields balloons the user TOML with knobs the user does
+not understand.
 """
 from dataclasses import dataclass
 
@@ -17,8 +20,8 @@ class CTraderConfig(LiveProviderConfig):
     """cTrader Open API plugin configuration.
 
     Covers both the data-ingest and the order-execution side; one OAuth
-    application plus its token serves both. ``symbol_map`` (TradingView key ->
-    native cTrader symbol name) is inherited from :class:`LiveProviderConfig`.
+    application serves both. ``symbol_map`` (TradingView key -> native cTrader
+    symbol name) is inherited from :class:`LiveProviderConfig`.
     """
 
     demo: bool = False
@@ -29,12 +32,6 @@ class CTraderConfig(LiveProviderConfig):
 
     client_secret: str = ""
     """OAuth application client secret."""
-
-    refresh_token: str = ""
-    """Long-lived OAuth refresh token, obtained via ``pyne ctrader auth``; used to mint access tokens without re-consent."""
-
-    access_token: str = ""
-    """Cached OAuth access token (Bearer); refreshed automatically from the refresh token when it expires."""
 
     account_id: str = ""
     """The ctidTraderAccountId to trade and stream on, selected from the access token's account list."""

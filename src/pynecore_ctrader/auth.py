@@ -14,9 +14,9 @@ Two distinct phases, deliberately kept apart:
   HTTP endpoint and no resending of the client secret, since the socket is
   already application-authenticated.
 
-The functions are pure protocol logic: they never touch the config TOML. The
-caller (the CLI persists, the provider keeps it in memory) owns the returned
-:class:`TokenSet`.
+The functions are pure protocol logic: they never touch disk. The caller owns the
+returned :class:`TokenSet` and persists it via :mod:`pynecore_ctrader.session` —
+the CLI after consent, the provider after a runtime refresh rotates the token.
 """
 import logging
 from dataclasses import dataclass
