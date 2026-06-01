@@ -8,7 +8,8 @@ Implements the :class:`~pynecore.core.plugin.ProviderPlugin` /
 - broker and symbol listing (``--list-brokers`` / ``--list-symbols``),
 - symbol metadata (:meth:`update_symbol_info`) from ``ProtoOASymbol`` plus the
   asset list, with the weekly trading schedule mapped to PyneCore sessions,
-- historical OHLCV via paged ``ProtoOAGetTrendbarsReq``, and
+- historical OHLCV via paged ``ProtoOAGetTrendbarsReq`` (bid) with the ask side
+  reconstructed from paged ``ProtoOAGetTickDataReq`` (``ASK``), and
 - live OHLCV from ``ProtoOASpotEvent`` trendbars.
 
 All cTrader trendbar prices are integers in units of 1/100000; the low carries
@@ -272,8 +273,14 @@ class _ProviderMixin(_CTraderBase):
     @override
     def download_ohlcv(self, time_from: datetime, time_to: datetime,
                        on_progress: Callable[[datetime], None] | None = None,
-                       limit: int | None = None) -> None:
-        """Download historical OHLCV via paged ``ProtoOAGetTrendbarsReq``."""
+                       limit: int | None = None, with_extra: bool = False) -> None:
+        """Download historical OHLCV via paged ``ProtoOAGetTrendbarsReq``.
+
+        When ``with_extra`` is set, the ask side is additionally reconstructed
+        from paged ``ProtoOAGetTickDataReq`` (``ASK``) and written to the
+        ``.extra.csv`` sidecar; this roughly multiplies the request count, so it
+        is opt-in.
+        """
         assert self.symbol is not None
         period_seconds = max(1, int(in_seconds(self.timeframe))) if self.timeframe else 60
         chunk = limit or 2000
@@ -305,11 +312,17 @@ class _ProviderMixin(_CTraderBase):
                 if not bars:
                     cursor = end_ms
                     continue
+                # The trendbars are bid-based; the ask side has no trendbars and
+                # is reconstructed (only when requested) by bucketing ``ASK`` tick
+                # history into the same bars (open/high/low/close per period).
+                ask_bars = await self._fetch_ask_bars(
+                    wire, account_id, symbol_id, cursor, end_ms, period_seconds
+                ) if with_extra else {}
                 last_ts = cursor
                 for bar in bars:
                     candle = self._decode_trendbar(bar)
                     if from_ms <= candle.timestamp * 1000 < to_ms:
-                        self.save_ohlcv_data(candle)
+                        self.save_ohlcv_data(self._attach_ask(candle, ask_bars.get(candle.timestamp)))
                     last_ts = max(last_ts, (bar.utcTimestampInMinutes * 60 + period_seconds) * 1000)
                 if on_progress is not None:
                     on_progress(datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc)
@@ -317,6 +330,97 @@ class _ProviderMixin(_CTraderBase):
                 cursor = max(last_ts, cursor + window * 1000)
 
         self._run(self._authed_session(work))
+
+    async def _fetch_ask_bars(
+        self, wire, account_id: int, symbol_id: int, from_ms: int, to_ms: int,
+        period_seconds: int,
+    ) -> dict[int, tuple[float, float, float, float]]:
+        """Aggregate ``ASK`` tick history into per-bar open/high/low/close.
+
+        cTrader has no ask trendbars, so the ask side is rebuilt from raw tick
+        data. ``ProtoOAGetTickDataReq`` returns ticks newest-first and capped per
+        response (``hasMore`` flags truncation); each response is its own delta
+        chain (first tick absolute, the rest cumulative deltas of both timestamp
+        and price). The window is paged backwards by re-requesting up to one
+        millisecond before the oldest tick seen so far.
+
+        :param from_ms: Window start in epoch milliseconds (inclusive).
+        :param to_ms: Window end in epoch milliseconds (exclusive upper bound).
+        :param period_seconds: The bar length, used to bucket ticks.
+        :return: Mapping of bar timestamp (epoch seconds) to ``(open, high, low,
+            close)`` ask prices; empty when no tick history covers the window.
+        """
+        # ``[min_ts, open, max_ts, close, high, low]`` per bar, updated tick by
+        # tick so ticks may arrive in any order across pages.
+        buckets: dict[int, list[float]] = {}
+        upper = to_ms
+        while upper > from_ms:
+            response = cast(_oa.ProtoOAGetTickDataRes, await wire.send_request(
+                _oa.ProtoOAGetTickDataReq(
+                    ctidTraderAccountId=account_id, symbolId=symbol_id,
+                    type=_model.ProtoOAQuoteType.ASK,
+                    fromTimestamp=from_ms, toTimestamp=upper,
+                )
+            ))
+            ticks = self._decode_ticks(response.tickData)
+            if not ticks:
+                break
+            for ts_ms, price in ticks:
+                key = (ts_ms // 1000 // period_seconds) * period_seconds
+                bucket = buckets.get(key)
+                if bucket is None:
+                    buckets[key] = [ts_ms, price, ts_ms, price, price, price]
+                    continue
+                if price > bucket[4]:
+                    bucket[4] = price
+                if price < bucket[5]:
+                    bucket[5] = price
+                if ts_ms < bucket[0]:
+                    bucket[0], bucket[1] = ts_ms, price
+                if ts_ms > bucket[2]:
+                    bucket[2], bucket[3] = ts_ms, price
+            if not response.hasMore:
+                break
+            upper = int(ticks[-1][0]) - 1
+        return {key: (b[1], b[4], b[5], b[3]) for key, b in buckets.items()}
+
+    @staticmethod
+    def _decode_ticks(ticks) -> list[tuple[int, float]]:
+        """Decode a ``ProtoOAGetTickDataRes`` tick array to ``(ts_ms, price)``.
+
+        The first tick is absolute and the rest are cumulative deltas, so a
+        running sum yields absolute values; the array is newest-first, so the
+        result keeps that order (index 0 newest, last oldest).
+        """
+        out: list[tuple[int, float]] = []
+        ts = 0
+        raw = 0
+        for tick in ticks:
+            ts += tick.timestamp
+            raw += tick.tick
+            out.append((ts, raw / _PRICE_SCALE))
+        return out
+
+    @staticmethod
+    def _attach_ask(
+        candle: OHLCV, ask: tuple[float, float, float, float] | None
+    ) -> OHLCV:
+        """Attach ask O/H/L/C and ``spread`` to a bid candle, if ask is known.
+
+        ``spread`` is ``ask_close - close`` (close is the bid close), matching the
+        live path. When no ask ticks covered the bar the candle is returned
+        unchanged (bid-only), so a download never stalls on sparse tick history.
+        """
+        if ask is None:
+            return candle
+        ask_open, ask_high, ask_low, ask_close = ask
+        return candle._replace(extra_fields={
+            'ask_open': ask_open,
+            'ask_high': ask_high,
+            'ask_low': ask_low,
+            'ask_close': ask_close,
+            'spread': ask_close - candle.close,
+        })
 
     async def _resolve_symbol_id(self, wire, account_id: int) -> int:
         """Resolve ``self.symbol`` to its numeric ``symbolId`` (cached)."""
