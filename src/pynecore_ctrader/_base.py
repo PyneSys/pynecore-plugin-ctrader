@@ -96,6 +96,15 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
         self._pending_bars: deque[OHLCV] = deque()
         self._current_bar: OHLCV | None = None
         self._current_bar_ts: int | None = None
+        # Latest spot ``bid`` of the bar in progress. The live trendbar's close
+        # lags the spot stream (it is not refreshed on every tick), so the spot
+        # bid is the authoritative close. Reset on each rollover.
+        self._last_bid: float | None = None
+        # Ask-side ``(open, high, low, close)`` accumulated from spot ``ask``
+        # quotes for the bar in progress (the bid OHLC comes from the trendbar;
+        # the ask is only on the spot stream). Reset on each rollover; ``None``
+        # until the first ask tick of the bar.
+        self._ask_bar: tuple[float, float, float, float] | None = None
 
     # --- credentials --------------------------------------------------------
 

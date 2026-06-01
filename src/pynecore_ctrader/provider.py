@@ -392,19 +392,66 @@ class _ProviderMixin(_CTraderBase):
                 continue
             if message.symbolId != self._watch_symbol_id:
                 continue
+            # Roll the trendbars first (they finalize the prior bar against the
+            # bid/ask seen so far), then fold THIS event's quotes into the new
+            # current bar.
             for bar in message.trendbar:
                 self._ingest_live_bar(bar)
+            if message.bid:
+                self._last_bid = message.bid / _PRICE_SCALE
+            if message.ask:
+                self._track_ask(message.ask / _PRICE_SCALE)
 
     def _ingest_live_bar(self, bar: _model.ProtoOATrendbar) -> None:
         """Fold a live trendbar into the pending-bar buffer.
 
         When the bar's timestamp advances past the bar being tracked, the prior
-        bar is flushed as closed before the new (forming) bar is queued.
+        bar has closed: it is finalized (spot bid close, ask O/H/L/C) and queued,
+        then the quote accumulators are reset for the new bar.
         """
         candle = self._decode_trendbar(bar, is_closed=False)
         if self._current_bar_ts is not None and candle.timestamp > self._current_bar_ts:
             if self._current_bar is not None:
-                self._pending_bars.append(self._current_bar._replace(is_closed=True))
+                self._pending_bars.append(self._finalize_bar(self._current_bar, is_closed=True))
+            self._reset_quotes()
         self._current_bar_ts = candle.timestamp
         self._current_bar = candle
-        self._pending_bars.append(candle)
+        self._pending_bars.append(self._finalize_bar(candle, is_closed=False))
+
+    def _track_ask(self, ask: float) -> None:
+        """Fold a spot ``ask`` quote into the current bar's ask O/H/L/C."""
+        if self._ask_bar is None:
+            self._ask_bar = (ask, ask, ask, ask)
+        else:
+            o, high, low, _ = self._ask_bar
+            self._ask_bar = (o, max(high, ask), min(low, ask), ask)
+
+    def _reset_quotes(self) -> None:
+        """Clear the per-bar bid/ask accumulators at a bar boundary."""
+        self._last_bid = None
+        self._ask_bar = None
+
+    def _finalize_bar(self, candle: OHLCV, *, is_closed: bool) -> OHLCV:
+        """Apply the spot bid close and ask/spread to a trendbar-derived candle.
+
+        The live trendbar's close lags the spot stream, so the authoritative
+        close is the last spot ``bid`` of the bar; high/low are widened to keep
+        the close inside the range. Ask O/H/L/C and ``spread`` (= ask_close -
+        close) are attached from the spot ``ask`` stream when available.
+        """
+        high, low, close = candle.high, candle.low, candle.close
+        if self._last_bid is not None:
+            close = self._last_bid
+            high = max(high, close)
+            low = min(low, close)
+        candle = candle._replace(high=high, low=low, close=close, is_closed=is_closed)
+        if self._ask_bar is None:
+            return candle
+        ask_open, ask_high, ask_low, ask_close = self._ask_bar
+        return candle._replace(extra_fields={
+            'ask_open': ask_open,
+            'ask_high': ask_high,
+            'ask_low': ask_low,
+            'ask_close': ask_close,
+            'spread': ask_close - close,
+        })
