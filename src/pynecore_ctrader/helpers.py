@@ -45,3 +45,80 @@ def protobuf_host(demo: bool) -> str:
     :return: The hostname to connect to.
     """
     return PROTOBUF_DEMO_HOST if demo else PROTOBUF_LIVE_HOST
+
+
+# === Unit conversions (broker order layer) ===============================
+#
+# cTrader expresses order ``volume`` as an INT64 in 1/100 of a unit
+# (centi-units): a protocol ``volume`` of 1000 means 10.00 units. Order
+# prices (limit / stop / SL / TP) are absolute ``double`` values rounded to
+# the symbol's ``digits``, NOT the 1/100000 integer scaling the trendbar /
+# spot decode uses. Money amounts (balance, commission, gross profit) are
+# INT64 paired with a per-record ``moneyDigits`` exponent.
+
+#: Protocol ``volume`` unit: 100 centi-units == 1.00 traded unit.
+VOLUME_SCALE = 100
+
+
+def raw_volume(units: float) -> int:
+    """Convert a Pine unit quantity to un-stepped cTrader centi-units.
+
+    The min/max acceptance test must run against the *requested* size, before
+    snapping to ``stepVolume`` — otherwise a below-min size can round up to the
+    minimum (and an above-max size round down to the maximum), so an out-of-range
+    order is sent at the boundary instead of being skipped.
+
+    :param units: The Pine-level quantity in traded units (contracts).
+    :return: The requested centi-unit ``volume`` rounded to the nearest INT64.
+    """
+    return int(round(units * VOLUME_SCALE))
+
+
+def quantize_volume(units: float, step_volume: int) -> int:
+    """Snap a Pine unit quantity to a cTrader centi-unit ``volume``.
+
+    Converts ``units`` to centi-units and rounds to the nearest multiple of
+    ``step_volume``. Min/max acceptance is the caller's concern: the execute
+    path compares the requested raw centi-units (see :func:`raw_volume`) against
+    ``minVolume`` / ``maxVolume`` and raises
+    :class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin` rather than
+    silently clamping (a clamp would diverge the executed size from the
+    strategy's intent and corrupt downstream sizing).
+
+    :param units: The Pine-level quantity in traded units (contracts).
+    :param step_volume: The symbol's ``stepVolume`` in centi-units.
+    :return: The raw INT64 ``volume`` the order messages expect.
+    """
+    raw = units * VOLUME_SCALE
+    if step_volume > 0:
+        return int(round(raw / step_volume) * step_volume)
+    return int(round(raw))
+
+
+def volume_to_units(volume: int) -> float:
+    """Convert a cTrader centi-unit ``volume`` back to Pine traded units.
+
+    :param volume: The protocol ``volume`` in centi-units.
+    :return: The quantity in traded units.
+    """
+    return volume / VOLUME_SCALE
+
+
+def round_price(price: float, digits: int) -> float:
+    """Round an absolute order price to the symbol's ``digits`` precision.
+
+    :param price: The absolute price (limit / stop / SL / TP).
+    :param digits: The symbol's price precision (``ProtoOASymbol.digits``).
+    :return: The rounded price the order messages expect.
+    """
+    return round(price, digits)
+
+
+def money_value(raw: int, money_digits: int) -> float:
+    """Convert a cTrader INT64 money amount to its real value.
+
+    :param raw: The raw INT64 amount (balance, commission, gross profit).
+    :param money_digits: The paired ``moneyDigits`` exponent for the record.
+    :return: ``raw / 10**money_digits``.
+    """
+    return raw / (10 ** money_digits)

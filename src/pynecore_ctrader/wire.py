@@ -49,6 +49,20 @@ class CTraderConnectionError(CTraderWireError):
     """The connection is not established or was lost."""
 
 
+class CTraderRequestSentConnectionError(CTraderConnectionError):
+    """The connection dropped after a request was (or may have been) written.
+
+    Distinct from a plain pre-write :class:`CTraderConnectionError`: the request
+    bytes were already handed to the socket (a successful ``drain`` followed by a
+    lost pending future, or a ``drain`` that failed after ``write`` queued the
+    bytes), so the server may have accepted the order. The order path maps this
+    to a disposition-unknown rather than a clean "nothing happened" reconnect, so
+    a retry cannot blindly duplicate an entry / close the server already took.
+    Subclasses :class:`CTraderConnectionError` so every data-path
+    ``except CTraderConnectionError`` site still treats it as a dropped link.
+    """
+
+
 class CTraderTimeoutError(CTraderWireError):
     """A request did not receive its correlated response in time."""
 
@@ -190,7 +204,11 @@ class WireClient:
         :return: The decoded response message.
         :raises CTraderTimeoutError: If no response arrives within ``timeout``.
         :raises CTraderProtocolError: If the server answers with an error response.
-        :raises CTraderConnectionError: If the connection drops while waiting.
+        :raises CTraderConnectionError: If the connection is down before the
+            request was written.
+        :raises CTraderRequestSentConnectionError: If the connection drops after
+            the request bytes were (or may have been) written — disposition
+            unknown.
         """
         loop = asyncio.get_running_loop()
         self._msg_id += 1
@@ -199,7 +217,17 @@ class WireClient:
         self._pending[client_msg_id] = future
         try:
             await self._send_message(message, client_msg_id)
-            result = await asyncio.wait_for(future, timeout)
+            # The request bytes are now on the wire: a connection loss while we
+            # await the correlated response leaves the disposition unknown (the
+            # server may have accepted the order), so re-raise the pending
+            # future's plain ``CTraderConnectionError`` as the request-sent
+            # variant. A response that never arrives within ``timeout`` is the
+            # ``CTraderTimeoutError`` path below, which the order layer already
+            # treats as disposition-unknown.
+            try:
+                result = await asyncio.wait_for(future, timeout)
+            except CTraderConnectionError as exc:
+                raise CTraderRequestSentConnectionError(str(exc)) from exc
         except asyncio.TimeoutError:
             raise CTraderTimeoutError(
                 f"no response within {timeout}s for {type(message).__name__}"
@@ -230,8 +258,10 @@ class WireClient:
 
         :param message: The concrete message to send.
         :param client_msg_id: The correlation id, or ``""`` for none.
-        :raises CTraderConnectionError: If the socket is not writable, or the write
-            fails because the peer dropped.
+        :raises CTraderConnectionError: If the socket is not writable (nothing was
+            sent).
+        :raises CTraderRequestSentConnectionError: If the write was queued but the
+            drain failed — the bytes may already be on the wire.
         """
         writer = self._writer
         if writer is None or writer.is_closing():
@@ -243,7 +273,12 @@ class WireClient:
                 await writer.drain()
             except (OSError, ssl.SSLError) as exc:
                 self._close_writer()
-                raise CTraderConnectionError("connection lost while sending") from exc
+                # ``write`` already queued the bytes into the transport buffer;
+                # a failed ``drain`` cannot prove they never reached the peer, so
+                # this is a disposition-unknown send, not a clean no-op.
+                raise CTraderRequestSentConnectionError(
+                    "connection lost while sending"
+                ) from exc
             self._last_send = asyncio.get_running_loop().time()
 
     async def _recv_loop(self) -> None:

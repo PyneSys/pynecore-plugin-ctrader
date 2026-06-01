@@ -18,18 +18,21 @@ is selected by the leading segment of the provider string
 :attr:`ProtoOATrader.brokerName` slug — with the config ``account_id`` as the
 tie-breaker when one broker holds several accounts.
 
-In M2 this base swaps :class:`LiveProviderPlugin` for ``BrokerPlugin``.
+In M2 this base extends ``BrokerPlugin`` so the one class serves both the
+data-provider surface and the high-level order-execution layer, and acts as
+the shared base every cTrader mix-in derives from.
 """
 import asyncio
 import logging
 import threading
 from collections import deque
 from collections.abc import Awaitable, Callable
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from google.protobuf.message import Message
 
-from pynecore.core.plugin import LiveProviderPlugin
+from pynecore.core.broker.exceptions import ExchangeCapabilityError
+from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.types.ohlcv import OHLCV
 
 from . import auth, helpers, session
@@ -38,15 +41,26 @@ from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
 from .wire import CTraderProtocolError, WireClient
 
+if TYPE_CHECKING:
+    from .models import _SymbolRules
+
 logger = logging.getLogger(__name__)
 
 
-class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
-    """Connection, authentication and account/broker resolution for cTrader."""
+class _CTraderBase(BrokerPlugin[CTraderConfig]):
+    """Connection, authentication and account/broker resolution for cTrader.
+
+    Also the shared base every cTrader mix-in derives from: it declares the
+    cross-mix-in instance state and the plugin-private method surface (type
+    -only stubs with a ``...`` body) so static analysers resolve the
+    ``self.<x>`` references one mix-in makes against another's implementation.
+    The real method always wins at runtime via the MRO.
+    """
 
     plugin_name = "cTrader"
     Config = CTraderConfig
     multi_broker = True
+    require_one_way_mode = True
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
                  ohlcv_dir=None, config: CTraderConfig | None = None) -> None:
@@ -75,8 +89,15 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
         self.symbol = instrument
 
         self._demo = bool(getattr(config, 'demo', False))
+        # Optional numeric ``ctidTraderAccountId`` selector from the user config
+        # (tie-breaker when one broker holds several accounts). This is NOT the
+        # ``BrokerPlugin.account_id`` identity — that inherited ``str | None``
+        # slot is populated with a plugin-qualified id once the live account is
+        # resolved (see :meth:`connect`), so the BrokerStore run-tag / persisted
+        # state never collide across two cTrader accounts running the same
+        # script + symbol + timeframe.
         account_id = str(getattr(config, 'account_id', '') or '').strip()
-        self._account_id: int | None = int(account_id) if account_id else None
+        self._account_selector: int | None = int(account_id) if account_id else None
         # The token pair is machine-generated auth state, loaded from the workdir
         # cache rather than the user config; empty until ``pyne ctrader auth`` ran.
         self._tokens = session.load_session(demo=self._demo) or auth.TokenSet(
@@ -105,6 +126,36 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
         # the ask is only on the spot stream). Reset on each rollover; ``None``
         # until the first ask tick of the bar.
         self._ask_bar: tuple[float, float, float, float] | None = None
+
+        # --- Broker layer (M2) ---
+        #: Symbol-name -> order-sizing / precision rules cache (lazy, populated
+        #: on first order for the symbol). See :class:`._SymbolRules`.
+        self._symbol_rules: dict[str, '_SymbolRules'] = {}
+        #: Reverse of ``_symbols_by_name`` (symbolId -> name), filled alongside
+        #: it so the broker state queries can label orders/positions by name.
+        self._symbols_by_id: dict[int, str] = {}
+        #: ``moneyDigits`` exponent for the authorized account; set by the
+        #: startup probe and used to decode balance / commission / PnL.
+        self._money_digits: int | None = None
+        #: ``depositAssetId`` (balance currency); set by the startup probe.
+        self._deposit_asset_id: int | None = None
+        #: Demultiplexed event queues, created on :meth:`connect`. The shared
+        #: ``wire.events`` queue is drained by a single router task that fans
+        #: spot events to ``_spot_events`` (consumed by ``watch_ohlcv``) and
+        #: execution events to ``_exec_events`` (consumed by ``watch_orders``).
+        self._spot_events: asyncio.Queue | None = None
+        self._exec_events: asyncio.Queue | None = None
+        self._event_router_task: asyncio.Task | None = None
+        #: Deal ids already surfaced to ``watch_orders``. A correlated fill the
+        #: dispatch path re-injects (``send_request`` consumes the wire copy) and
+        #: any uncorrelated PUSH copy of the same fill share a ``dealId``, so this
+        #: set keeps the fill from being recorded twice. M2: unbounded (deal ids
+        #: are unique and a session's fill volume is modest).
+        self._seen_deal_ids: set[int] = set()
+        #: Position ids whose pyramid-sharing was already audit-logged, so the
+        #: ``ctrader_position_id_shared`` warning fires once per position per run
+        #: rather than per linking entry. See :meth:`_link_position_ref`.
+        self._shared_position_logged: set[int] = set()
 
     # --- credentials --------------------------------------------------------
 
@@ -235,13 +286,13 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
             raise auth.CTraderAuthError(
                 "NO_TRADING_ACCOUNTS", f"the access token grants no {kind} accounts"
             )
-        if self._account_id is not None:
-            if any(a.ctidTraderAccountId == self._account_id for a in pool):
-                await self._account_auth(wire, self._account_id)
-                return self._account_id
+        if self._account_selector is not None:
+            if any(a.ctidTraderAccountId == self._account_selector for a in pool):
+                await self._account_auth(wire, self._account_selector)
+                return self._account_selector
             raise auth.CTraderAuthError(
                 "ACCOUNT_NOT_FOUND",
-                f"account_id {self._account_id} is not among the {kind} accounts",
+                f"account_id {self._account_selector} is not among the {kind} accounts",
             )
         if self._broker_title:
             target = self._broker_title.lower()
@@ -276,10 +327,23 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
         return pool[0].ctidTraderAccountId
 
     async def _full_handshake(self, wire: WireClient) -> int:
-        """Run app-auth, then resolve and authorize the account; return its id."""
+        """Run app-auth, then resolve and authorize the account; return its id.
+
+        Also latches the plugin-qualified ``BrokerPlugin.account_id`` identity
+        from the resolved account. This runs on BOTH the one-shot data path
+        (``_authed_session``, driven by the historical warmup) and the
+        persistent live :meth:`connect`, so the unified broker storage already
+        sees the real account id when ``BrokerStore.open_run`` builds the
+        ``RunIdentity`` — before the live connection opens. Without it the
+        warmup-only path would leave the inherited ``"default"`` fallback and
+        two accounts on the same script/symbol/timeframe would share run state.
+        """
         await self._app_auth(wire)
         accounts = await self._get_accounts(wire)
-        return await self._resolve_account(wire, accounts)
+        account_id = await self._resolve_account(wire, accounts)
+        env = 'demo' if self._demo else 'live'
+        self._account_id = f"ctrader-{env}-{account_id}"
+        return account_id
 
     # --- one-shot synchronous bridge ----------------------------------------
 
@@ -350,16 +414,52 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
     # --- persistent live lifecycle ------------------------------------------
 
     async def connect(self) -> None:
-        """Open the persistent live connection and authenticate the account."""
+        """Open the persistent live connection, authenticate and probe.
+
+        Beyond the M1 handshake this also runs the broker startup probe
+        (NETTING enforcement + money/asset cache) and starts the event router
+        that demultiplexes the shared ``wire.events`` queue into the spot and
+        execution streams.
+        """
         self._wire = self._make_wire()
         await self._wire.connect()
+        # ``_full_handshake`` also latches the plugin-qualified
+        # ``BrokerPlugin.account_id`` (``ctrader-<env>-<account>``) so the
+        # BrokerStore run-tag / persisted state are scoped to THIS account (two
+        # cTrader accounts on the same script + symbol + timeframe must not
+        # share state). Mirrors the documented ``capitalcom-<env>-<account>``
+        # pattern on ``BrokerPlugin._account_id``.
         self._live_account_id = await self._full_handshake(self._wire)
+        await self._probe_account(self._wire, self._live_account_id)
+        # Reuse the demux queues across reconnects rather than replacing them.
+        # ``watch_orders`` is consumed by ONE long-lived ``async for`` that
+        # captures ``self._exec_events`` once and is never re-invoked on
+        # reconnect (unlike ``watch_ohlcv``, which the live runner re-calls per
+        # bar under an ``asyncio.wait_for`` and so re-reads the attribute). A
+        # fresh queue here would strand that generator on the dead object and
+        # silently drop every post-reconnect fill / cancel. Keeping the same
+        # object lets the new router task feed the in-flight consumer.
+        if self._spot_events is None:
+            self._spot_events = asyncio.Queue()
+        if self._exec_events is None:
+            self._exec_events = asyncio.Queue()
+        self._event_router_task = asyncio.create_task(
+            self._event_router_loop(self._wire), name="ctrader-event-router"
+        )
 
     async def disconnect(self) -> None:
-        """Close the persistent live connection."""
+        """Close the persistent live connection and stop the event router."""
         wire = self._wire
         self._wire = None
         self._live_account_id = None
+        task = self._event_router_task
+        self._event_router_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         if wire is not None:
             await wire.disconnect()
 
@@ -367,3 +467,143 @@ class _CTraderBase(LiveProviderPlugin[CTraderConfig]):
     def is_connected(self) -> bool:
         """Whether the persistent live connection is open."""
         return self._wire is not None and self._wire.is_connected
+
+    async def _probe_account(self, wire: WireClient, account_id: int) -> None:
+        """Read the trader record once: enforce NETTING and cache money/asset.
+
+        ``require_one_way_mode`` (the broker default) rejects a HEDGED account
+        at startup *in broker mode* — Pine's one-way semantics cannot map onto
+        the hedging model, so failing closed there is safer than mis-trading.
+        The check is gated on broker mode because ``connect()`` also runs for a
+        data-only live stream (``pyne run --live`` without ``--broker``), where
+        no order is ever placed and a HEDGED account is perfectly usable. The
+        same record carries ``moneyDigits`` (money-amount exponent) and
+        ``depositAssetId`` (balance currency), cached unconditionally for the
+        broker state queries.
+
+        :param wire: A connected client with ``account_id`` authorized.
+        :param account_id: The authorized ``ctidTraderAccountId``.
+        :raises ExchangeCapabilityError: If a broker-mode account is in hedging
+            mode.
+        """
+        response = cast(_oa.ProtoOATraderRes, await wire.send_request(
+            _oa.ProtoOATraderReq(ctidTraderAccountId=account_id)
+        ))
+        trader = response.trader
+        self._money_digits = trader.moneyDigits
+        self._deposit_asset_id = trader.depositAssetId
+        # ``store_ctx`` is set by the runner only in broker mode, before
+        # ``connect()`` runs, so it is the broker-vs-data-only signal here.
+        # Mirrors the Capital.com plugin, which gates its broker-side startup
+        # checks on ``store_ctx`` the same way (a data-only stream must not be
+        # refused for an account it will never trade on).
+        if (self.store_ctx is not None
+                and self.require_one_way_mode
+                and trader.accountType == _model.ProtoOAAccountType.HEDGED):
+            raise ExchangeCapabilityError(
+                "cTrader account is in hedging mode; this broker plugin needs "
+                "one-way (netting) mode. Switch the account to netting, or use "
+                "a netting account."
+            )
+
+    async def _event_router_loop(self, wire: WireClient) -> None:
+        """Demultiplex the shared unsolicited-event queue (sole consumer).
+
+        The wire delivers every uncorrelated inbound message on one queue.
+        The data feed (``watch_ohlcv``) and the order stream (``watch_orders``)
+        run concurrently on the same connection, so one ``.get()`` per
+        coroutine would steal the other's messages. This task is the only
+        consumer of ``wire.events`` and fans each message out by type.
+
+        Unsolicited messages neither surface consumes (e.g. symbol-change
+        events) are dropped; execution events are never dropped — the order
+        queue is unbounded and ``watch_orders`` empties it eagerly.
+        """
+        spot = self._spot_events
+        execq = self._exec_events
+        try:
+            while True:
+                message = await wire.events.get()
+                if isinstance(message, _oa.ProtoOASpotEvent):
+                    if spot is not None:
+                        spot.put_nowait(message)
+                elif isinstance(message, (_oa.ProtoOAExecutionEvent,
+                                          _oa.ProtoOAOrderErrorEvent)):
+                    # Broker-slug account resolution authorizes every candidate
+                    # account on this channel to read ``brokerName`` (see
+                    # ``_resolve_account``), and cTrader then pushes execution
+                    # events for ALL authorized accounts. Discard any event not
+                    # carrying the selected ``ctidTraderAccountId`` so activity
+                    # from a non-selected account cannot enter this run's order
+                    # stream and corrupt its position tracking.
+                    if (execq is not None
+                            and (self._live_account_id is None
+                                 or message.ctidTraderAccountId
+                                 == self._live_account_id)):
+                        execq.put_nowait(message)
+        except asyncio.CancelledError:
+            raise
+
+    # --- shared broker helpers ----------------------------------------------
+
+    def _symbol_name_for(self, symbol_id: int) -> str:
+        """Best-effort reverse lookup of a symbol name from its numeric id.
+
+        Falls back to the stringified id when the light-symbol list has not
+        been fetched yet, so the broker state queries still return a usable
+        (if numeric) label.
+
+        :param symbol_id: The numeric ``symbolId``.
+        :return: The symbol name, or ``str(symbol_id)`` when unknown.
+        """
+        return self._symbols_by_id.get(symbol_id, str(symbol_id))
+
+    def _link_position_ref(self, coid: str, position_id: int) -> None:
+        """Pin the ``position_id`` reverse-map alias to the FIFO-oldest entry.
+
+        Under NETTING every pyramid entry on a symbol shares one ``positionId``,
+        but the generic ``position_id`` alias holds exactly ONE client-order-id.
+        Overwriting it per entry (last-write-wins) would make a closing fill —
+        which carries its own ``orderId``, not an entry's — reverse-map to the
+        NEWEST entry. Keep the alias on the OLDEST entry (the FIFO head): a
+        NETTING partial close reduces oldest-first, so that is the safer default
+        until the exact rule is live-verified via ``ProtoOADealOffsetListReq``.
+        Every entry still mirrors its own ``positionId`` into ``orders.extras``
+        (see the callers) so a full-position close flattens ALL pyramid rows
+        (see :meth:`_mark_position_closed`); only the public alias is FIFO-pinned.
+        A second-or-later entry sharing the position is audit-logged once per
+        position so the residual mis-attribution risk stays observable.
+
+        :param coid: The entry's client-order-id.
+        :param position_id: The shared netted ``positionId`` (``0`` is a no-op).
+        """
+        if self.store_ctx is None or not position_id:
+            return
+        existing = self.store_ctx.find_by_ref('position_id', str(position_id))
+        if existing is None:
+            self.store_ctx.add_ref(coid, 'position_id', str(position_id))
+            return
+        if existing.client_order_id == coid:
+            return
+        if position_id not in self._shared_position_logged:
+            self._shared_position_logged.add(position_id)
+            self.store_ctx.log_event(
+                'ctrader_position_id_shared',
+                client_order_id=coid,
+                exchange_order_id=str(position_id),
+                payload={'fifo_head_coid': existing.client_order_id},
+            )
+
+    # === Cross-mix-in private surface (type-only) ===========================
+    # Implementations live in the provider / execution / state / events
+    # mix-ins; declared here with a ``...`` body so each mix-in can call
+    # ``self.<name>`` against another's implementation without analyser
+    # warnings. The real method always wins at runtime via the MRO.
+
+    async def _fetch_light_symbols(self, wire, account_id: int) -> list: ...
+
+    async def _get_symbol_rules(self, symbol: str) -> '_SymbolRules': ...
+
+    async def _reconcile(self) -> '_oa.ProtoOAReconcileRes': ...
+
+    async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...

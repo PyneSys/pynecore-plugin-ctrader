@@ -129,10 +129,16 @@ class _ProviderMixin(_CTraderBase):
 
     @override
     def get_list_of_symbols(self, *args, **kwargs) -> list[str]:
-        """List the tradable symbol names of the selected broker's account."""
+        """List the tradable symbol names of the selected broker's account.
+
+        Only symbols flagged ``enabled`` are returned — the cTrader catalog is
+        the whole broker universe, including symbols not tradable on this
+        account (e.g. spread-bet ``_SB``/``_SBE`` variants on a CFD account, and
+        broker test symbols), which the native platform also hides.
+        """
         async def work(wire, account_id: int) -> list[str]:
             symbols = await self._fetch_light_symbols(wire, account_id)
-            return sorted(s.symbolName for s in symbols if s.symbolName)
+            return sorted(s.symbolName for s in symbols if s.symbolName and s.enabled)
         return cast(list[str], self._run(self._authed_session(work)))
 
     async def _fetch_light_symbols(
@@ -145,6 +151,7 @@ class _ProviderMixin(_CTraderBase):
         response = cast(_oa.ProtoOASymbolsListRes, response)
         symbols = list(response.symbol)
         self._symbols_by_name = {s.symbolName: s.symbolId for s in symbols}
+        self._symbols_by_id = {s.symbolId: s.symbolName for s in symbols}
         return symbols
 
     # --- symbol info --------------------------------------------------------
@@ -200,12 +207,28 @@ class _ProviderMixin(_CTraderBase):
             list(detail.schedule), detail.scheduleTimeZone
         )
 
+        # ``basecurrency`` must be a genuine currency: PyneCore treats the
+        # ``(basecurrency, currency)`` tuple strictly as an FX pair for
+        # exchange-rate lookups, so a non-currency value poisons that machinery.
+        # cTrader only uses a currency as the base asset for real FX / crypto-spot
+        # pairs; for indices, equities and spread-bet symbols the base asset is a
+        # synthetic instrument asset (``GBPJPY_SB`` -> base ``GBPJPY``, ``NAS100``
+        # -> base ``USTEC``). ``measurementUnits`` names the unit a position is
+        # settled in: it equals the base asset name exactly when the base is the
+        # traded currency, so anything else leaves ``basecurrency`` unset. A blank
+        # ``measurementUnits`` (brokers that don't populate it) falls back to the
+        # base asset so normal FX pairs keep their rate source.
+        basecurrency = asset_names.get(light.baseAssetId) or None
+        measurement = detail.measurementUnits
+        if basecurrency is not None and measurement and measurement != basecurrency:
+            basecurrency = None
+
         return SymInfo(
             prefix='CTRADER',
             description=light.description or light.symbolName,
             ticker=light.symbolName,
             currency=asset_names.get(light.quoteAssetId, ''),
-            basecurrency=asset_names.get(light.baseAssetId) or None,
+            basecurrency=basecurrency,
             period=self.timeframe,
             type='other',
             mintick=mintick,
@@ -491,10 +514,18 @@ class _ProviderMixin(_CTraderBase):
             self._subscribed_symbols.add(symbol)
             self._watch_symbol_id = symbol_id
 
+        spot_events = self._spot_events
+        if spot_events is None:
+            raise CTraderConnectionError("live event router not started")
+
         while True:
             if self._pending_bars:
                 return self._pending_bars.popleft()
-            message = await wire.events.get()
+            # The event router (see ``_CTraderBase._event_router_loop``) is the
+            # sole consumer of ``wire.events`` and forwards spot events here, so
+            # ``watch_ohlcv`` and ``watch_orders`` can stream concurrently
+            # without racing on the shared queue.
+            message = await spot_events.get()
             if not isinstance(message, _oa.ProtoOASpotEvent):
                 continue
             if message.symbolId != self._watch_symbol_id:
