@@ -211,7 +211,10 @@ class _ProviderMixin(_CTraderBase):
             mintick=mintick,
             pricescale=pricescale,
             minmove=1,
-            pointvalue=float(detail.lotSize) if detail.lotSize else 1.0,
+            # cTrader trades only forex/CFD/spot instruments, for which the TV
+            # point value is 1.0. ``detail.lotSize`` is the lot volume in
+            # centi-units (order sizing), not a Pine point value.
+            pointvalue=1.0,
             timezone=self.timezone,
             opening_hours=opening_hours,
             session_starts=session_starts,
