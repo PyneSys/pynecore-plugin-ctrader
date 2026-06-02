@@ -350,86 +350,87 @@ def __test_hedging_get_position_aggregates_legs__():
     assert pos.entry_price == 1.175
 
 
-def __test_hedging_close_fans_out_fifo__():
+def __test_fetch_raw_positions_returns_legs_oldest_first__():
+    # Raw legs (no aggregation), oldest open_time first — the surface the core
+    # one-way emulator nets / FIFO-selects over.
     broker = _hedged_broker(
         _position(position_id=2, volume=1000, open_ts=2000),  # newer
-        _position(position_id=1, volume=1000, open_ts=1000),  # older
+        _position(position_id=1, volume=3000, open_ts=1000),  # older
     )
-    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=20.0)
-    asyncio.run(broker.execute_close(_envelope(intent)))
+    legs = asyncio.run(broker.fetch_raw_positions("EURUSD"))
+    assert [leg.leg_id for leg in legs] == ["1", "2"]
+    assert legs[0].qty == 30.0 and legs[1].qty == 10.0
+    assert all(leg.side == "buy" for leg in legs)
+
+
+# === PositionPort transport primitives (one-way emulation) ================
+#
+# The FIFO / reversal / bracket-replication LOGIC lives in core
+# (``OneWayEmulator``, test_039); these verify only the plugin's per-entity
+# cTrader wire shapes — the primitive bodies the core emulator drives through
+# the ``PositionPort`` once a HEDGED account opts in.
+
+
+def __test_close_leg_builds_close_request__():
+    broker = _FakeBroker()
+    asyncio.run(broker.close_leg("EURUSD", "7", 2000, "coid-c"))
     closes = [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
-    # Oldest leg first (FIFO), both fully closed.
-    assert [(c.positionId, c.volume) for c in closes] == [(1, 1000), (2, 1000)]
+    assert len(closes) == 1
+    assert closes[0].positionId == 7 and closes[0].volume == 2000
 
 
-def __test_hedging_close_partial_targets_oldest_leg__():
-    broker = _hedged_broker(
-        _position(position_id=1, volume=1000, open_ts=1000),
-        _position(position_id=2, volume=1000, open_ts=2000),
-    )
-    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=10.0)
-    asyncio.run(broker.execute_close(_envelope(intent)))
-    closes = [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
-    assert [(c.positionId, c.volume) for c in closes] == [(1, 1000)]
-
-
-def __test_hedging_reversal_closes_then_opens_residual__():
-    broker = _hedged_broker(
-        _position(position_id=1, volume=2000, open_ts=1000),  # long 20
-    )
-    # Pine folds a long-20 -> short-10 reversal into one combined sell of 30.
-    intent = EntryIntent(pine_id="Short", symbol="EURUSD", side="sell",
-                         qty=30.0, order_type=OrderType.MARKET)
-    orders = asyncio.run(broker.execute_entry(_envelope(intent)))
-    closes = [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
+def __test_place_leg_builds_new_order_request__():
+    broker = _FakeBroker()
+    intent = EntryIntent(pine_id="L", symbol="EURUSD", side="buy", qty=10.0,
+                         order_type=OrderType.MARKET)
+    orders = asyncio.run(broker.place_leg(_envelope(intent), 10.0))
     opens = [r for r in broker.sent if isinstance(r, _oa.ProtoOANewOrderReq)]
-    assert [(c.positionId, c.volume) for c in closes] == [(1, 2000)]
     assert len(opens) == 1
-    assert opens[0].tradeSide == _model.ProtoOATradeSide.SELL
-    assert opens[0].volume == 1000  # residual 10 units
+    assert opens[0].tradeSide == _model.ProtoOATradeSide.BUY
+    assert opens[0].volume == 1000
     assert len(orders) == 1
 
 
-def __test_hedging_pure_add_opens_new_leg_only__():
-    broker = _hedged_broker(
-        _position(position_id=1, volume=1000, open_ts=1000),  # long 10
-    )
-    intent = EntryIntent(pine_id="Long", symbol="EURUSD", side="buy",
-                         qty=10.0, order_type=OrderType.MARKET)
-    asyncio.run(broker.execute_entry(_envelope(intent)))
-    assert not [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
-    opens = [r for r in broker.sent if isinstance(r, _oa.ProtoOANewOrderReq)]
-    assert len(opens) == 1 and opens[0].volume == 1000
-
-
-def __test_hedging_exact_flatten_via_entry_opens_nothing__():
-    broker = _hedged_broker(
-        _position(position_id=1, volume=2000, open_ts=1000),  # long 20
-    )
-    # Combined sell of exactly 20 flattens the long with no residual.
-    intent = EntryIntent(pine_id="Short", symbol="EURUSD", side="sell",
-                         qty=20.0, order_type=OrderType.MARKET)
-    orders = asyncio.run(broker.execute_entry(_envelope(intent)))
-    closes = [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
-    assert [(c.positionId, c.volume) for c in closes] == [(1, 2000)]
-    assert not [r for r in broker.sent if isinstance(r, _oa.ProtoOANewOrderReq)]
-    assert orders == []
-
-
-def __test_hedging_exit_replicates_bracket_across_legs__():
-    broker = _hedged_broker(
-        _position(position_id=1, volume=1000, open_ts=1000),
-        _position(position_id=2, volume=1000, open_ts=2000),
-    )
-    intent = ExitIntent(pine_id="Exit", from_entry="Long", symbol="EURUSD",
-                        side="sell", qty=20.0, tp_price=1.30, sl_price=1.10)
-    legs = asyncio.run(broker.execute_exit(_envelope(intent)))
+def __test_amend_bracket_builds_sltp_request__():
+    broker = _FakeBroker()
+    asyncio.run(broker.amend_bracket(
+        "EURUSD", "3", side="sell", tp_price=1.30, sl_price=1.10,
+        trail_offset=None, coid="coid-b",
+    ))
     amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
-    # Same SL/TP replicated onto every leg.
-    assert {a.positionId for a in amends} == {1, 2}
-    for a in amends:
-        assert a.stopLoss == 1.1 and a.takeProfit == 1.3
-    assert {leg.id for leg in legs} == {"1:tp", "1:sl"}
+    assert len(amends) == 1
+    assert amends[0].positionId == 3
+    assert amends[0].stopLoss == 1.1 and amends[0].takeProfit == 1.3
+
+
+def __test_amend_bracket_all_none_clears_protection__():
+    # cTrader overwrites the whole protection set, so an all-None amend carries
+    # no SL/TP/trailing fields and clears the bracket wholesale.
+    broker = _FakeBroker()
+    asyncio.run(broker.amend_bracket(
+        "EURUSD", "3", side="sell", tp_price=None, sl_price=None,
+        trail_offset=None, coid="coid-clear",
+    ))
+    amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
+    assert len(amends) == 1
+    set_fields = {f.name for f, _ in amends[0].ListFields()}
+    assert set_fields.isdisjoint({"stopLoss", "takeProfit", "trailingStopLoss"})
+
+
+def __test_reject_out_of_range_below_min_skips__():
+    # 5 units -> 500 centi, below the 1000 minVolume -> non-halting skip.
+    broker = _FakeBroker()
+    intent = EntryIntent(pine_id="L", symbol="EURUSD", side="buy", qty=5.0,
+                         order_type=OrderType.MARKET)
+    with pytest.raises(OrderSkippedByPlugin):
+        asyncio.run(broker.reject_out_of_range(_envelope(intent), 5.0))
+
+
+def __test_get_volume_quantizer_snaps_to_step__():
+    broker = _FakeBroker()
+    quantize = asyncio.run(broker.get_volume_quantizer("EURUSD"))
+    assert quantize(10.0) == 1000  # 1000 centi already on the 1000 step
+    assert quantize(15.0) == 2000  # 1500 centi snapped up to 2000
 
 
 # === error taxonomy =======================================================

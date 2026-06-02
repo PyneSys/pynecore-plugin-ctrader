@@ -41,7 +41,11 @@ from .messages import OpenApiModelMessages_pb2 as _model
 from .wire import CTraderProtocolError, WireClient
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.models import PositionLeg
+    from pynecore.core.broker.models import (
+        DispatchEnvelope,
+        ExchangeOrder,
+        PositionLeg,
+    )
 
     from .models import _SymbolRules
 
@@ -436,6 +440,14 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         # pattern on ``BrokerPlugin._account_id``.
         self._live_account_id = await self._full_handshake(self._wire)
         await self._probe_account(self._wire, self._live_account_id)
+        if self._hedging_enabled:
+            # HEDGED account: opt into core one-way emulation. The Order Sync
+            # Engine then drives reducing / closing / reversing / bracket intents
+            # through the core OneWayEmulator via this plugin's PositionPort
+            # primitives, presenting Pine one-way semantics over the multi-leg
+            # account. A NETTING account leaves ``position_port`` None and keeps
+            # the cheaper single-position ``execute_*`` path.
+            self.position_port = self
         # Reuse the demux queues across reconnects rather than replacing them.
         # ``watch_orders`` is consumed by ONE long-lived ``async for`` that
         # captures ``self._exec_events`` once and is never re-invoked on
@@ -614,3 +626,29 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...
 
     async def fetch_raw_positions(self, symbol: str) -> 'list[PositionLeg]': ...
+
+    # PositionPort transport surface — real bodies on the execution mix-in;
+    # declared here so the assembled plugin structurally satisfies the protocol
+    # and ``connect()`` can assign ``self.position_port = self`` on a HEDGED
+    # account.
+    async def get_volume_quantizer(
+            self, symbol: str,
+    ) -> 'Callable[[float], int]': ...
+
+    async def close_leg(
+            self, symbol: str, leg_id: str, volume: int, coid: str,
+    ) -> None: ...
+
+    async def reject_out_of_range(
+            self, envelope: 'DispatchEnvelope', qty: float,
+    ) -> None: ...
+
+    async def place_leg(
+            self, envelope: 'DispatchEnvelope', qty: float,
+    ) -> 'list[ExchangeOrder]': ...
+
+    async def amend_bracket(
+            self, symbol: str, leg_id: str, *,
+            side: str, tp_price: float | None, sl_price: float | None,
+            trail_offset: float | None, coid: str,
+    ) -> None: ...
