@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, cast
 
 from google.protobuf.message import Message
 
-from pynecore.core.broker.exceptions import ExchangeCapabilityError
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.types.ohlcv import OHLCV
 
@@ -42,6 +41,8 @@ from .messages import OpenApiModelMessages_pb2 as _model
 from .wire import CTraderProtocolError, WireClient
 
 if TYPE_CHECKING:
+    from pynecore.core.broker.models import PositionLeg
+
     from .models import _SymbolRules
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,6 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
     plugin_name = "cTrader"
     Config = CTraderConfig
     multi_broker = True
-    require_one_way_mode = True
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
                  ohlcv_dir=None, config: CTraderConfig | None = None) -> None:
@@ -108,6 +108,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         self._wire: WireClient | None = None
         #: ``ctidTraderAccountId`` resolved for the persistent live connection.
         self._live_account_id: int | None = None
+        #: ``True`` once :meth:`_probe_account` reads a HEDGED account type.
+        #: Drives the one-way emulation path (multi-leg aggregation / FIFO
+        #: close / reversal decomposition); ``False`` on a NETTING account
+        #: keeps the single-position fast path unchanged.
+        self._hedging_enabled: bool = False
         #: Symbol-name -> ``symbolId`` cache, filled on first listing/lookup.
         self._symbols_by_name: dict[str, int] = {}
 
@@ -468,23 +473,33 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         """Whether the persistent live connection is open."""
         return self._wire is not None and self._wire.is_connected
 
-    async def _probe_account(self, wire: WireClient, account_id: int) -> None:
-        """Read the trader record once: enforce NETTING and cache money/asset.
+    @property
+    def hedging_enabled(self) -> bool:
+        """Whether the live account is in cTrader HEDGED (multi-leg) mode.
 
-        ``require_one_way_mode`` (the broker default) rejects a HEDGED account
-        at startup *in broker mode* — Pine's one-way semantics cannot map onto
-        the hedging model, so failing closed there is safer than mis-trading.
-        The check is gated on broker mode because ``connect()`` also runs for a
-        data-only live stream (``pyne run --live`` without ``--broker``), where
-        no order is ever placed and a HEDGED account is perfectly usable. The
-        same record carries ``moneyDigits`` (money-amount exponent) and
-        ``depositAssetId`` (balance currency), cached unconditionally for the
-        broker state queries.
+        Resolved once by :meth:`_probe_account`. When ``True`` the broker-side
+        execution and state paths run the one-way emulation
+        (:mod:`~pynecore.core.broker.emulator`): a symbol may carry several
+        legs, so reads aggregate and reduce / close / reversal operations are
+        planned across legs oldest-first. ``False`` (NETTING) keeps the
+        single-position path the plugin shipped with.
+        """
+        return self._hedging_enabled
+
+    async def _probe_account(self, wire: WireClient, account_id: int) -> None:
+        """Read the trader record once: detect HEDGED mode and cache money/asset.
+
+        A HEDGED account is not refused — the broker-side execution and state
+        paths emulate Pine's one-way semantics over its multiple legs (see
+        :attr:`hedging_enabled` and :mod:`~pynecore.core.broker.emulator`). The
+        account type is recorded so those paths know whether to run the
+        multi-leg emulation (HEDGED) or the single-position fast path
+        (NETTING). The same record carries ``moneyDigits`` (money-amount
+        exponent) and ``depositAssetId`` (balance currency), cached
+        unconditionally for the broker state queries.
 
         :param wire: A connected client with ``account_id`` authorized.
         :param account_id: The authorized ``ctidTraderAccountId``.
-        :raises ExchangeCapabilityError: If a broker-mode account is in hedging
-            mode.
         """
         response = cast(_oa.ProtoOATraderRes, await wire.send_request(
             _oa.ProtoOATraderReq(ctidTraderAccountId=account_id)
@@ -492,19 +507,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         trader = response.trader
         self._money_digits = trader.moneyDigits
         self._deposit_asset_id = trader.depositAssetId
-        # ``store_ctx`` is set by the runner only in broker mode, before
-        # ``connect()`` runs, so it is the broker-vs-data-only signal here.
-        # Mirrors the Capital.com plugin, which gates its broker-side startup
-        # checks on ``store_ctx`` the same way (a data-only stream must not be
-        # refused for an account it will never trade on).
-        if (self.store_ctx is not None
-                and self.require_one_way_mode
-                and trader.accountType == _model.ProtoOAAccountType.HEDGED):
-            raise ExchangeCapabilityError(
-                "cTrader account is in hedging mode; this broker plugin needs "
-                "one-way (netting) mode. Switch the account to netting, or use "
-                "a netting account."
-            )
+        self._hedging_enabled = (
+            trader.accountType == _model.ProtoOAAccountType.HEDGED
+        )
 
     async def _event_router_loop(self, wire: WireClient) -> None:
         """Demultiplex the shared unsolicited-event queue (sole consumer).
@@ -607,3 +612,5 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
     async def _reconcile(self) -> '_oa.ProtoOAReconcileRes': ...
 
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...
+
+    async def fetch_raw_positions(self, symbol: str) -> 'list[PositionLeg]': ...

@@ -14,6 +14,7 @@ NETTING accounts hold at most one open position per symbol, so
 import logging
 from typing import cast
 
+from pynecore.core.broker.emulator import aggregate_positions
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
@@ -21,6 +22,7 @@ from pynecore.core.broker.models import (
     ExchangePosition,
     OrderStatus,
     OrderType,
+    PositionLeg,
 )
 
 from ._base import _CTraderBase
@@ -166,14 +168,57 @@ class _StateMixin(_CTraderBase):
             ))
         return result
 
-    async def get_position(self, symbol: str) -> ExchangePosition | None:
-        """Return the single open position for ``symbol``, or ``None``.
+    async def fetch_raw_positions(self, symbol: str) -> list[PositionLeg]:
+        """Return every open broker leg for ``symbol`` (one-way emulation input).
 
-        NETTING accounts hold at most one open position per symbol. The
-        unrealized PnL is left at ``0.0`` in M2 — it is informational for the
-        sync engine, which drives off size / side / entry price; a dedicated
+        On a HEDGED account a symbol can carry several simultaneous open
+        positions; this returns one :class:`PositionLeg` per open broker
+        position, oldest first (by ``openTimestamp``) so the core FIFO close /
+        reversal planner is deterministic and replay-stable. On a NETTING
+        account it returns at most one leg. Performs ZERO aggregation — the core
+        :mod:`~pynecore.core.broker.emulator` owns netting and leg selection.
+
+        Unrealized P&L is left at ``0.0`` per leg (the reconcile snapshot does
+        not carry it; the sync engine drives off size / side / entry price),
+        matching :meth:`get_position`'s existing M2 behaviour.
+        """
+        want_id = await self._resolve_state_symbol_id(symbol)
+        if want_id is None:
+            return []
+        res = await self._reconcile()
+        digits = self._symbol_rules[symbol].digits if symbol in self._symbol_rules else 5
+        legs: list[PositionLeg] = []
+        for position in res.position:
+            if position.positionStatus != _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                continue
+            if position.tradeData.symbolId != want_id:
+                continue
+            side = ('buy' if position.tradeData.tradeSide == _model.ProtoOATradeSide.BUY
+                    else 'sell')
+            legs.append(PositionLeg(
+                leg_id=str(position.positionId),
+                symbol=symbol,
+                side=side,
+                qty=volume_to_units(position.tradeData.volume),
+                entry_price=round_price(position.price, digits),
+                open_time=position.tradeData.openTimestamp / 1000.0,
+                unrealized_pnl=0.0,
+            ))
+        legs.sort(key=lambda leg: leg.open_time)
+        return legs
+
+    async def get_position(self, symbol: str) -> ExchangePosition | None:
+        """Return the net open position for ``symbol``, or ``None`` when flat.
+
+        On a HEDGED account the symbol's legs are aggregated into one net
+        one-way snapshot by the core emulator; on a NETTING account the single
+        open position row is returned directly. The unrealized PnL is left at
+        ``0.0`` in M2 — it is informational for the sync engine, which drives
+        off size / side / entry price; a dedicated
         ``ProtoOAGetPositionUnrealizedPnLReq`` can populate it later.
         """
+        if self.hedging_enabled:
+            return aggregate_positions(symbol, await self.fetch_raw_positions(symbol))
         want_id = await self._resolve_state_symbol_id(symbol)
         if want_id is None:
             # Unknown symbol — report flat rather than adopting the first open

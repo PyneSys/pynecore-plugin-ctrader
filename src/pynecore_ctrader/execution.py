@@ -30,6 +30,12 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
+from pynecore.core.broker.emulator import (
+    LegClose,
+    aggregate_positions,
+    plan_reversal,
+    select_legs_for_close,
+)
 from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
     KIND_CLOSE,
@@ -266,31 +272,162 @@ class _ExecutionMixin(_CTraderBase):
         out-of-range order cannot halt the bot. A protective bracket is NOT
         attached here — it arrives as a separate ``strategy.exit`` →
         :meth:`execute_exit`.
+
+        On a HEDGED account a MARKET entry whose direction opposes the open
+        position is a Pine reversal: Pine folds it into one combined-size order
+        assuming a netting auto-flip. The opposing legs are FIFO-closed first
+        (so gross exposure does not bloat with a separate opposing leg) and only
+        the residual target size is opened here. A LIMIT / STOP reversal rests
+        and is NOT decomposed at placement time — opening it as a fresh leg on
+        fill is a follow-up.
         """
         intent = envelope.intent
         assert isinstance(intent, EntryIntent)
+        rules = await self._get_symbol_rules(intent.symbol)
+        qty = intent.qty
+        if self.hedging_enabled and intent.order_type == OrderType.MARKET:
+            qty = await self._close_opposing_legs_for_reversal(envelope, intent, rules)
+            if qty <= 0.0:
+                # The combined order exactly flattened the opposing legs — the
+                # close FILLs reduce the position to flat and there is no
+                # residual to open.
+                return []
+        return await self._place_entry_order(envelope, intent, rules, qty)
+
+    async def _close_opposing_legs_for_reversal(
+            self, envelope: DispatchEnvelope, intent: EntryIntent,
+            rules: _SymbolRules,
+    ) -> float:
+        """FIFO-close opposing hedging legs for a reversal; return residual qty.
+
+        Returns ``intent.qty`` unchanged when the order only adds to the
+        existing direction (no opposing legs). Otherwise dispatches a
+        ``ProtoOAClosePositionReq`` per opposing leg (oldest first) and returns
+        the residual size to open in the order's direction
+        (``intent.qty - |opposite|``, clamped at zero). The close FILLs
+        reverse-map to ``LegType.CLOSE`` via the BrokerStore index, so the sync
+        engine's ``BrokerPosition`` reduces then flips exactly as a netting
+        auto-flip would.
+        """
+        legs = await self.fetch_raw_positions(intent.symbol)
+        plan = plan_reversal(intent.side, intent.qty, legs)
+        if not plan.closes:
+            return intent.qty
+        # Pre-flight the requested size BEFORE dispatching any close: the closes
+        # are real broker side effects, so an order that would be skipped (below
+        # ``minVolume`` / above ``maxVolume``) must raise the "no order sent"
+        # skip while it is still true. Validating after the closes would leave
+        # the broker position reduced yet report the whole reversal as skipped,
+        # desyncing the engine's ``BrokerPosition``. With a residual open
+        # (``open_qty > 0``) the residual leg is what gets sized; for a pure
+        # reduce (``open_qty == 0``, the order only nets opposing legs) the
+        # combined order size itself must clear the bounds — otherwise a
+        # below-min order quantizes UP per leg and over-reduces the position.
+        self._reject_out_of_range_entry(
+            intent, rules, plan.open_qty if plan.open_qty > 0.0 else intent.qty,
+        )
+        close_coid = envelope.client_order_id(KIND_CLOSE)
+        for leg_id, volume in self._plan_leg_close_volumes(
+                plan.closes, rules.step_volume):
+            await self._dispatch_order(
+                _oa.ProtoOAClosePositionReq(
+                    ctidTraderAccountId=self._live_account_id,
+                    positionId=leg_id, volume=volume,
+                ),
+                coid=close_coid, context="reversal close",
+            )
+        return plan.open_qty
+
+    def _reject_out_of_range_entry(
+            self, intent: EntryIntent, rules: _SymbolRules, qty: float,
+    ) -> None:
+        """Skip the entry when ``qty`` falls outside cTrader's volume bounds.
+
+        Compares the *requested* raw centi-units (pre-step rounding, see
+        :func:`raw_volume`) against ``minVolume`` / ``maxVolume`` and raises
+        :class:`OrderSkippedByPlugin` rather than clamping. Callable as a
+        pre-flight so the reversal path can decline before its FIFO closes run.
+        """
+        requested = raw_volume(qty)
+        if requested < rules.min_volume:
+            min_units = volume_to_units(rules.min_volume)
+            raise OrderSkippedByPlugin(
+                f"Skipping {intent.symbol} {intent.side.upper()} entry "
+                f"id={intent.pine_id!r}: size {qty} below cTrader minimum "
+                f"{min_units}. No order sent.",
+                intent_key=intent.intent_key, reason="below_min_volume",
+                context={'symbol': intent.symbol, 'qty': qty, 'min_qty': min_units},
+            )
+        if rules.max_volume > 0 and requested > rules.max_volume:
+            max_units = volume_to_units(rules.max_volume)
+            raise OrderSkippedByPlugin(
+                f"Skipping {intent.symbol} {intent.side.upper()} entry "
+                f"id={intent.pine_id!r}: size {qty} above cTrader maximum "
+                f"{max_units}. No order sent.",
+                intent_key=intent.intent_key, reason="above_max_volume",
+                context={'symbol': intent.symbol, 'qty': qty, 'max_qty': max_units},
+            )
+
+    @staticmethod
+    def _plan_leg_close_volumes(
+            closes: tuple[LegClose, ...], step_volume: int,
+    ) -> list[tuple[int, int]]:
+        """Fan a FIFO close plan out to per-leg centi-unit close volumes.
+
+        Quantizing each FIFO slice independently changes the total close size on
+        the step grid: a sub-step slice rounds to ``0`` (an invalid empty close
+        that under-reduces the position) and a fractional-step slice rounds UP
+        past what the leg holds. Snapping the *total* once is not enough either:
+        if a slice that carries part of the owed total quantizes to ``0`` on its
+        own — e.g. two 10-unit legs with ``stepVolume=1000`` closing 15 units,
+        where the second slice of 5 units snaps to ``0`` — handing out
+        per-slice rounded volumes leaves the snapped total under-dispatched (only
+        the first leg closes 1000 instead of the owed 2000).
+
+        Instead a single running total is snapped to ``stepVolume``: each leg
+        receives the delta between the snapped cumulative close-through-this-leg
+        and the snapped cumulative through the previous leg, capped at the
+        snapped grand total. The sub-step remainder a slice would have dropped is
+        carried into the next leg, so the dispatched volumes always sum to the
+        same grand total the single-position close path would use, every volume
+        sits on the step grid (cTrader rejects an off-grid
+        ``ProtoOAClosePositionReq.volume``), and no leg gets more than its own
+        slice rounded up to the next step. Any leg whose delta is zero is dropped
+        (no zero-volume request is sent).
+
+        :param closes: FIFO close plan (oldest first); each ``qty`` is the
+            slice to take from that leg, in Pine units, never above the leg's
+            open size.
+        :param step_volume: The symbol's ``stepVolume`` in centi-units.
+        :return: ``(leg_id, volume)`` pairs to dispatch, in FIFO order, with the
+            INT64 centi-unit ``volume`` each ``ProtoOAClosePositionReq`` expects.
+        """
+        grand_total = quantize_volume(sum(close.qty for close in closes), step_volume)
+        out: list[tuple[int, int]] = []
+        cumulative_units = 0.0
+        dispatched = 0
+        for close in closes:
+            if dispatched >= grand_total:
+                break
+            cumulative_units += close.qty
+            snapped = min(quantize_volume(cumulative_units, step_volume), grand_total)
+            volume = snapped - dispatched
+            if volume <= 0:
+                continue
+            out.append((int(close.leg_id), volume))
+            dispatched = snapped
+        return out
+
+    async def _place_entry_order(
+            self, envelope: DispatchEnvelope, intent: EntryIntent,
+            rules: _SymbolRules, qty: float,
+    ) -> list[ExchangeOrder]:
+        """Place one MARKET / LIMIT / STOP order of ``qty`` for ``intent``."""
         coid = envelope.client_order_id(
             KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
         )
-        rules = await self._get_symbol_rules(intent.symbol)
-        requested = raw_volume(intent.qty)
-        if requested < rules.min_volume:
-            raise OrderSkippedByPlugin(
-                f"Skipping {intent.symbol} {intent.side.upper()} entry "
-                f"id={intent.pine_id!r}: size {intent.qty} below cTrader minimum. "
-                f"No order sent.",
-                intent_key=intent.intent_key, reason="below_min_volume",
-                context={'symbol': intent.symbol, 'qty': intent.qty},
-            )
-        if rules.max_volume > 0 and requested > rules.max_volume:
-            raise OrderSkippedByPlugin(
-                f"Skipping {intent.symbol} {intent.side.upper()} entry "
-                f"id={intent.pine_id!r}: size {intent.qty} above cTrader maximum. "
-                f"No order sent.",
-                intent_key=intent.intent_key, reason="above_max_volume",
-                context={'symbol': intent.symbol, 'qty': intent.qty},
-            )
-        volume = quantize_volume(intent.qty, rules.step_volume)
+        self._reject_out_of_range_entry(intent, rules, qty)
+        volume = quantize_volume(qty, rules.step_volume)
 
         req = _oa.ProtoOANewOrderReq(
             ctidTraderAccountId=self._live_account_id,
@@ -408,6 +545,8 @@ class _ExecutionMixin(_CTraderBase):
         intent = envelope.intent
         assert isinstance(intent, ExitIntent)
         rules = await self._get_symbol_rules(intent.symbol)
+        if self.hedging_enabled:
+            return await self._emulated_exit(envelope, intent, rules)
         position_id = await self._find_open_position_id(intent.symbol)
         if position_id is None:
             raise ExchangeOrderRejectedError(
@@ -441,6 +580,53 @@ class _ExecutionMixin(_CTraderBase):
                          'trail_offset': intent.trail_offset},
             )
         return self._build_bracket_legs(intent, envelope, position_id, rules)
+
+    async def _emulated_exit(
+            self, envelope: DispatchEnvelope, intent: ExitIntent,
+            rules: _SymbolRules,
+    ) -> list[ExchangeOrder]:
+        """Replicate the one-way bracket onto every leg of a hedging position.
+
+        cTrader SL/TP are per-position attributes, so a one-way bracket over a
+        multi-leg position is delivered by amending the SAME levels onto each
+        leg on the position side. When any leg's protection fires it closes that
+        leg; the sync engine reduces ``BrokerPosition`` and runs its cleanup
+        once the aggregate reaches zero. Legs pyramided AFTER this attach are
+        protected when the next bracket amend re-runs the replication.
+        """
+        legs = await self.fetch_raw_positions(intent.symbol)
+        pos = aggregate_positions(intent.symbol, legs)
+        if pos is None or pos.side == 'flat':
+            raise ExchangeOrderRejectedError(
+                f"cTrader execute_exit: no open position for symbol "
+                f"{intent.symbol!r} (from_entry={intent.from_entry!r})"
+            )
+        open_side = 'buy' if pos.side == 'long' else 'sell'
+        target_legs = [leg for leg in legs if leg.side == open_side]
+        coid = envelope.client_order_id(KIND_EXIT_SL)
+        for leg in target_legs:
+            position_id = int(leg.leg_id)
+            req = _oa.ProtoOAAmendPositionSLTPReq(
+                ctidTraderAccountId=self._live_account_id, positionId=position_id,
+            )
+            self._apply_bracket_levels(req, intent, rules)
+            try:
+                await self._dispatch_order(req, coid=coid, context="bracket attach")
+            except ExchangeOrderRejectedError as exc:
+                raise self._bracket_attach_reject(intent, position_id, exc) from exc
+        if self.store_ctx is not None:
+            self.store_ctx.log_event(
+                'bracket_attached', intent_key=intent.intent_key,
+                exchange_order_id=','.join(leg.leg_id for leg in target_legs),
+                payload={'tp': intent.tp_price, 'sl': intent.sl_price,
+                         'trail_offset': intent.trail_offset},
+            )
+        # The synthetic TP/SL leg ids the engine tracks are keyed off the oldest
+        # leg's position id; on the next bracket amend the replication re-runs
+        # across whatever legs are then open.
+        return self._build_bracket_legs(
+            intent, envelope, int(target_legs[0].leg_id), rules,
+        )
 
     def _apply_bracket_levels(
             self, req, intent: ExitIntent, rules: _SymbolRules,
@@ -569,6 +755,8 @@ class _ExecutionMixin(_CTraderBase):
         assert isinstance(intent, CloseIntent)
         coid = envelope.client_order_id(KIND_CLOSE)
         rules = await self._get_symbol_rules(intent.symbol)
+        if self.hedging_enabled:
+            return await self._emulated_close(envelope, intent, coid, rules)
         position_id = await self._find_open_position_id(intent.symbol)
         if position_id is None:
             raise ExchangeOrderRejectedError(
@@ -601,6 +789,97 @@ class _ExecutionMixin(_CTraderBase):
             status=(OrderStatus.FILLED
                     if event.executionType == _model.ProtoOAExecutionType.ORDER_FILLED
                     else OrderStatus.OPEN),
+            timestamp=epoch_time(), fee=0.0, fee_currency='',
+            reduce_only=True, client_order_id=coid,
+        )
+
+    async def _emulated_close(
+            self, envelope: DispatchEnvelope, intent: CloseIntent,
+            coid: str, rules: _SymbolRules,
+    ) -> ExchangeOrder:
+        """Reduce a one-way position by closing its hedging legs FIFO.
+
+        Aggregates the open legs to find the position side, plans the close
+        oldest-first across the legs on that side, and dispatches one
+        ``ProtoOAClosePositionReq`` per leg. Each close FILL reverse-maps to
+        ``LegType.CLOSE`` via the BrokerStore index, so the sync engine reduces
+        ``BrokerPosition`` FIFO and runs its close cleanup once the aggregate
+        reaches zero. A shortfall (Pine asks to close more than the legs hold)
+        is logged and the available legs are still closed — the next reconcile
+        re-derives the truth from the net rather than halting the bot.
+        """
+        legs = await self.fetch_raw_positions(intent.symbol)
+        pos = aggregate_positions(intent.symbol, legs)
+        if pos is None or pos.side == 'flat':
+            raise ExchangeOrderRejectedError(
+                f"cTrader execute_close: no open position for symbol "
+                f"{intent.symbol!r}"
+            )
+        # Close the legs the intent targets, NOT the aggregate net side. A
+        # ``CloseIntent`` carries ``side="sell"`` to reduce a long (buy legs) and
+        # ``side="buy"`` to reduce a short (sell legs); on a hedged account that
+        # also holds opposing legs (a manual or resting leg), the net side can be
+        # the OPPOSITE of what the strategy means to close, so a net-derived side
+        # would close the wrong legs and grow the intended exposure instead of
+        # reducing it.
+        close_side = 'buy' if intent.side == 'sell' else 'sell'
+        plan, shortfall = select_legs_for_close(intent.qty, legs, close_side)
+        if shortfall > 0.0:
+            logger.warning(
+                "cTrader emulated close for %s wants %s units but open legs "
+                "hold %s less; closing what is open",
+                intent.symbol, intent.qty, shortfall,
+            )
+        if not plan:
+            raise ExchangeOrderRejectedError(
+                f"cTrader execute_close: no {close_side} legs to close for "
+                f"symbol {intent.symbol!r}"
+            )
+        last_order = None
+        dispatched = self._plan_leg_close_volumes(plan, rules.step_volume)
+        if not dispatched:
+            # The whole close quantizes to zero on the ``stepVolume`` grid (a
+            # sub-step residual / partial), so no ``ProtoOAClosePositionReq``
+            # can be sent. Returning a phantom OPEN ``ExchangeOrder`` would
+            # leave the sync engine waiting for a fill that never arrives;
+            # decline via ``OrderSkippedByPlugin`` instead — the engine logs a
+            # warning and re-evaluates next bar without halting (a non-EntryIntent
+            # ``ExchangeOrderRejectedError`` would halt the bot on a recoverable
+            # below-step close).
+            raise OrderSkippedByPlugin(
+                f"Skipping {intent.symbol} {intent.side.upper()} close "
+                f"id={intent.pine_id!r}: size {intent.qty} below cTrader "
+                f"minimum step. No order sent.",
+                intent_key=intent.intent_key, reason="below_min_volume",
+                context={'symbol': intent.symbol, 'qty': intent.qty},
+            )
+        for leg_id, volume in dispatched:
+            event = await self._dispatch_order(
+                _oa.ProtoOAClosePositionReq(
+                    ctidTraderAccountId=self._live_account_id,
+                    positionId=leg_id, volume=volume,
+                ),
+                coid=coid, context="close",
+            )
+            last_order = event.order
+        if self.store_ctx is not None:
+            self.store_ctx.log_event(
+                'close_dispatched', client_order_id=coid,
+                exchange_order_id=','.join(str(leg_id) for leg_id, _ in dispatched),
+                intent_key=intent.intent_key,
+            )
+        # The engine reads only ``.id`` off this return; the per-leg FILLs carry
+        # the actual reduction through ``watch_orders``. Surface the last leg's
+        # order id (or the close COID) as the representative handle.
+        avg_price = ((last_order.executionPrice or None)
+                     if last_order is not None else None)
+        return ExchangeOrder(
+            id=(str(last_order.orderId)
+                if last_order is not None and last_order.orderId else coid),
+            symbol=intent.symbol, side=intent.side, order_type=OrderType.MARKET,
+            qty=intent.qty, filled_qty=0.0, remaining_qty=intent.qty,
+            price=None, stop_price=None, average_fill_price=avg_price,
+            status=OrderStatus.OPEN,
             timestamp=epoch_time(), fee=0.0, fee_currency='',
             reduce_only=True, client_order_id=coid,
         )
@@ -669,7 +948,37 @@ class _ExecutionMixin(_CTraderBase):
         ``stopLoss`` / ``takeProfit`` / ``trailingStopLoss`` clears the bracket
         without a cancel+recreate window. A flat symbol (no open position) or a
         ``*_NOT_FOUND`` race is a benign no-op.
+
+        On a HEDGED account the clear is limited to the legs on the aggregate
+        position side — the same legs :meth:`_emulated_exit` attached the bracket
+        to. A symbol can also hold opposite-side legs (a manual hedge, or a leg
+        opened by a resting reversal fill) that this exit never protected;
+        amending them too would strip their own bracket.
         """
+        if self.hedging_enabled:
+            legs = await self.fetch_raw_positions(intent.symbol)
+            pos = aggregate_positions(intent.symbol, legs)
+            if pos is None or pos.side == 'flat':
+                return True
+            open_side = 'buy' if pos.side == 'long' else 'sell'
+            for leg in legs:
+                if leg.side != open_side:
+                    continue
+                try:
+                    await self._dispatch_order(
+                        _oa.ProtoOAAmendPositionSLTPReq(
+                            ctidTraderAccountId=self._live_account_id,
+                            positionId=int(leg.leg_id),
+                        ),
+                        coid=envelope.client_order_id(KIND_CANCEL),
+                        context="clear bracket",
+                    )
+                except ExchangeOrderRejectedError as exc:
+                    if isinstance(exc.__cause__, CTraderProtocolError) and is_not_found(
+                            exc.__cause__.error_code):
+                        continue
+                    raise
+            return True
         position_id = await self._find_open_position_id(intent.symbol)
         if position_id is None:
             return True
@@ -793,10 +1102,28 @@ class _ExecutionMixin(_CTraderBase):
         """
         intent = new.intent
         assert isinstance(intent, ExitIntent)
+        rules = await self._get_symbol_rules(intent.symbol)
+        if self.hedging_enabled:
+            legs = await self.fetch_raw_positions(intent.symbol)
+            pos = aggregate_positions(intent.symbol, legs)
+            if pos is None or pos.side == 'flat':
+                return await super().modify_exit(old, new)
+            open_side = 'buy' if pos.side == 'long' else 'sell'
+            target_legs = [leg for leg in legs if leg.side == open_side]
+            coid = new.client_order_id(KIND_MODIFY_EXIT)
+            for leg in target_legs:
+                req = _oa.ProtoOAAmendPositionSLTPReq(
+                    ctidTraderAccountId=self._live_account_id,
+                    positionId=int(leg.leg_id),
+                )
+                self._apply_bracket_levels(req, intent, rules)
+                await self._dispatch_order(req, coid=coid, context="amend bracket")
+            return self._build_bracket_legs(
+                intent, new, int(target_legs[0].leg_id), rules,
+            )
         position_id = await self._find_open_position_id(intent.symbol)
         if position_id is None:
             return await super().modify_exit(old, new)
-        rules = await self._get_symbol_rules(intent.symbol)
         req = _oa.ProtoOAAmendPositionSLTPReq(
             ctidTraderAccountId=self._live_account_id, positionId=position_id,
         )
@@ -823,6 +1150,13 @@ class _ExecutionMixin(_CTraderBase):
         rejected amend, so the engine records a PUT failure and degrades the
         fail-safe instead of believing the stop landed.
 
+        On a HEDGED account the parent one-way position can span several broker
+        legs (pyramided entries each open their own leg), so the worst-case SL
+        is replicated onto EVERY leg on the position side — the same per-leg
+        fan-out :meth:`_emulated_exit` uses. Amending only the parent entry's
+        own leg would leave the other legs without the downtime stop and report
+        the fail-safe healthy while part of the exposure is unprotected.
+
         On a successful PUT the desired levels are fed straight back to the
         engine's observed sink. M2 has no reconcile pass yet (M3), so the
         actuator self-confirms its own push — enough to flip the fail-safe
@@ -836,31 +1170,36 @@ class _ExecutionMixin(_CTraderBase):
                 "native fail-safe SL refused: no store_ctx to resolve the "
                 f"positionId for parent {snapshot.parent_entry_dispatch_ref!r}"
             )
-        position_id = self._position_id_for_ref(snapshot.parent_entry_dispatch_ref)
-        if not position_id:
-            raise CTraderBrokerError(
-                "native fail-safe SL refused: unresolved positionId for parent "
-                f"{snapshot.parent_entry_dispatch_ref!r} — refusing to amend a "
-                "guessed position."
-            )
         rules = await self._get_symbol_rules(snapshot.symbol)
-        req = _oa.ProtoOAAmendPositionSLTPReq(
-            ctidTraderAccountId=self._live_account_id, positionId=position_id,
-        )
-        if snapshot.stop_level is not None:
-            req.stopLoss = round_price(snapshot.stop_level, rules.digits)
-        if snapshot.profit_level is not None:
-            req.takeProfit = round_price(snapshot.profit_level, rules.digits)
-        if snapshot.trailing_stop is not None:
-            req.trailingStopLoss = True
-        await self._dispatch_order(
-            req, coid=snapshot.parent_entry_dispatch_ref,
-            context="native fail-safe SL",
-        )
+        if self.hedging_enabled:
+            position_ids = await self._failsafe_leg_ids(snapshot)
+        else:
+            single = self._position_id_for_ref(snapshot.parent_entry_dispatch_ref)
+            if not single:
+                raise CTraderBrokerError(
+                    "native fail-safe SL refused: unresolved positionId for parent "
+                    f"{snapshot.parent_entry_dispatch_ref!r} — refusing to amend a "
+                    "guessed position."
+                )
+            position_ids = [single]
+        for position_id in position_ids:
+            req = _oa.ProtoOAAmendPositionSLTPReq(
+                ctidTraderAccountId=self._live_account_id, positionId=position_id,
+            )
+            if snapshot.stop_level is not None:
+                req.stopLoss = round_price(snapshot.stop_level, rules.digits)
+            if snapshot.profit_level is not None:
+                req.takeProfit = round_price(snapshot.profit_level, rules.digits)
+            if snapshot.trailing_stop is not None:
+                req.trailingStopLoss = True
+            await self._dispatch_order(
+                req, coid=snapshot.parent_entry_dispatch_ref,
+                context="native fail-safe SL",
+            )
         self.store_ctx.log_event(
             'native_failsafe_sl_put',
             client_order_id=snapshot.parent_entry_dispatch_ref,
-            exchange_order_id=str(position_id),
+            exchange_order_id=','.join(str(pid) for pid in position_ids),
             payload={'stop_level': snapshot.stop_level,
                      'profit_level': snapshot.profit_level,
                      'trailing_stop': snapshot.trailing_stop,
@@ -877,6 +1216,35 @@ class _ExecutionMixin(_CTraderBase):
                 profit_level=snapshot.profit_level,
                 trailing_stop=None,
             )
+
+    async def _failsafe_leg_ids(
+            self, snapshot: "NativeBracketSnapshot",
+    ) -> list[int]:
+        """Resolve every HEDGED leg the fail-safe SL must protect.
+
+        Fans across all open legs on the parent's position side (the same set
+        :meth:`_emulated_exit` amends), so a pyramided multi-leg position gets
+        the worst-case stop on every leg. ``parent_side`` (``'long'`` /
+        ``'short'``) selects the leg side; an empty / flat result raises so the
+        engine degrades the fail-safe rather than believing it landed.
+        """
+        legs = await self.fetch_raw_positions(snapshot.symbol)
+        pos = aggregate_positions(snapshot.symbol, legs)
+        if pos is None or pos.side == 'flat':
+            raise CTraderBrokerError(
+                "native fail-safe SL refused: no open legs for parent "
+                f"{snapshot.parent_entry_dispatch_ref!r} on "
+                f"{snapshot.symbol!r} — refusing to amend a guessed position."
+            )
+        open_side = 'buy' if snapshot.parent_side == 'long' else 'sell'
+        leg_ids = [int(leg.leg_id) for leg in legs if leg.side == open_side]
+        if not leg_ids:
+            raise CTraderBrokerError(
+                "native fail-safe SL refused: no "
+                f"{snapshot.parent_side} legs for parent "
+                f"{snapshot.parent_entry_dispatch_ref!r} on {snapshot.symbol!r}."
+            )
+        return leg_ids
 
     def _position_id_for_ref(self, parent_ref: str) -> int | None:
         """Resolve a parent entry's netted ``positionId`` from the BrokerStore.

@@ -316,6 +316,122 @@ def __test_get_position_flat_returns_none__():
     assert asyncio.run(broker.get_position("EURUSD")) is None
 
 
+# === HEDGED one-way emulation =============================================
+
+def _position(*, position_id, volume, side=_model.ProtoOATradeSide.BUY,
+              price=1.20, open_ts=1000):
+    return _model.ProtoOAPosition(
+        positionId=position_id, price=price,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        tradeData=_model.ProtoOATradeData(
+            symbolId=1, volume=volume, tradeSide=side, openTimestamp=open_ts,
+        ),
+    )
+
+
+def _hedged_broker(*positions):
+    res = _oa.ProtoOAReconcileRes()
+    for pos in positions:
+        res.position.append(pos)
+    broker = _FakeBroker(reconcile=res)
+    broker._hedging_enabled = True
+    return broker
+
+
+def __test_hedging_get_position_aggregates_legs__():
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, price=1.10, open_ts=1000),
+        _position(position_id=2, volume=3000, price=1.20, open_ts=2000),
+    )
+    pos = asyncio.run(broker.get_position("EURUSD"))
+    assert pos is not None
+    assert pos.side == "long" and pos.size == 40.0
+    # Volume-weighted: (10*1.10 + 30*1.20) / 40 = 1.175.
+    assert pos.entry_price == 1.175
+
+
+def __test_hedging_close_fans_out_fifo__():
+    broker = _hedged_broker(
+        _position(position_id=2, volume=1000, open_ts=2000),  # newer
+        _position(position_id=1, volume=1000, open_ts=1000),  # older
+    )
+    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=20.0)
+    asyncio.run(broker.execute_close(_envelope(intent)))
+    closes = [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
+    # Oldest leg first (FIFO), both fully closed.
+    assert [(c.positionId, c.volume) for c in closes] == [(1, 1000), (2, 1000)]
+
+
+def __test_hedging_close_partial_targets_oldest_leg__():
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, open_ts=1000),
+        _position(position_id=2, volume=1000, open_ts=2000),
+    )
+    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=10.0)
+    asyncio.run(broker.execute_close(_envelope(intent)))
+    closes = [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
+    assert [(c.positionId, c.volume) for c in closes] == [(1, 1000)]
+
+
+def __test_hedging_reversal_closes_then_opens_residual__():
+    broker = _hedged_broker(
+        _position(position_id=1, volume=2000, open_ts=1000),  # long 20
+    )
+    # Pine folds a long-20 -> short-10 reversal into one combined sell of 30.
+    intent = EntryIntent(pine_id="Short", symbol="EURUSD", side="sell",
+                         qty=30.0, order_type=OrderType.MARKET)
+    orders = asyncio.run(broker.execute_entry(_envelope(intent)))
+    closes = [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
+    opens = [r for r in broker.sent if isinstance(r, _oa.ProtoOANewOrderReq)]
+    assert [(c.positionId, c.volume) for c in closes] == [(1, 2000)]
+    assert len(opens) == 1
+    assert opens[0].tradeSide == _model.ProtoOATradeSide.SELL
+    assert opens[0].volume == 1000  # residual 10 units
+    assert len(orders) == 1
+
+
+def __test_hedging_pure_add_opens_new_leg_only__():
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, open_ts=1000),  # long 10
+    )
+    intent = EntryIntent(pine_id="Long", symbol="EURUSD", side="buy",
+                         qty=10.0, order_type=OrderType.MARKET)
+    asyncio.run(broker.execute_entry(_envelope(intent)))
+    assert not [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
+    opens = [r for r in broker.sent if isinstance(r, _oa.ProtoOANewOrderReq)]
+    assert len(opens) == 1 and opens[0].volume == 1000
+
+
+def __test_hedging_exact_flatten_via_entry_opens_nothing__():
+    broker = _hedged_broker(
+        _position(position_id=1, volume=2000, open_ts=1000),  # long 20
+    )
+    # Combined sell of exactly 20 flattens the long with no residual.
+    intent = EntryIntent(pine_id="Short", symbol="EURUSD", side="sell",
+                         qty=20.0, order_type=OrderType.MARKET)
+    orders = asyncio.run(broker.execute_entry(_envelope(intent)))
+    closes = [r for r in broker.sent if isinstance(r, _oa.ProtoOAClosePositionReq)]
+    assert [(c.positionId, c.volume) for c in closes] == [(1, 2000)]
+    assert not [r for r in broker.sent if isinstance(r, _oa.ProtoOANewOrderReq)]
+    assert orders == []
+
+
+def __test_hedging_exit_replicates_bracket_across_legs__():
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, open_ts=1000),
+        _position(position_id=2, volume=1000, open_ts=2000),
+    )
+    intent = ExitIntent(pine_id="Exit", from_entry="Long", symbol="EURUSD",
+                        side="sell", qty=20.0, tp_price=1.30, sl_price=1.10)
+    legs = asyncio.run(broker.execute_exit(_envelope(intent)))
+    amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
+    # Same SL/TP replicated onto every leg.
+    assert {a.positionId for a in amends} == {1, 2}
+    for a in amends:
+        assert a.stopLoss == 1.1 and a.takeProfit == 1.3
+    assert {leg.id for leg in legs} == {"1:tp", "1:sl"}
+
+
 # === error taxonomy =======================================================
 
 def __test_map_error_code_margin__():
