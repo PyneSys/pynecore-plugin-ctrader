@@ -26,7 +26,7 @@ import asyncio
 import logging
 import threading
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, cast
 
 from google.protobuf.message import Message
@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from pynecore.core.broker.models import (
         DispatchEnvelope,
         ExchangeOrder,
+        OrderEvent,
         PositionLeg,
     )
 
@@ -621,7 +622,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
 
     async def _get_symbol_rules(self, symbol: str) -> '_SymbolRules': ...
 
-    async def _reconcile(self) -> '_oa.ProtoOAReconcileRes': ...
+    async def _reconcile(
+            self, *, return_protection_orders: bool = False,
+    ) -> '_oa.ProtoOAReconcileRes': ...
+
+    def _reconcile_snapshot(self) -> 'AsyncIterator[OrderEvent]': ...
 
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...
 

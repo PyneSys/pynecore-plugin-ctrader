@@ -6,11 +6,14 @@ connection's ``ProtoOAExecutionEvent`` PUSH channel, demultiplexed onto
 :class:`~pynecore.core.broker.models.OrderEvent` objects with their Pine
 identity reverse-mapped from the BrokerStore order-ref index.
 
-M2 scope: the forward fill / accept / cancel events. Reconstructing events lost
-during a disconnect / restart (reconcile snapshot + synthetic cancels) is M3 —
-events are never silently dropped here (the queue is unbounded; a backlog
-watermark only warns).
+The PUSH channel is the primary order-event source; the periodic
+``ProtoOAReconcileReq`` snapshot diff (:class:`~pynecore_ctrader.reconcile._ReconcileMixin`)
+that gap-fills events lost during a disconnect / restart is driven from this
+same loop — :meth:`watch_orders` piggybacks the reconcile cadence onto its
+``execq.get()`` wait rather than running a separate background task. Events are
+never silently dropped (the queue is unbounded; a backlog watermark only warns).
 """
+import asyncio
 import logging
 from time import time as epoch_time
 from typing import AsyncIterator
@@ -45,24 +48,51 @@ _EXEC_TYPE_TO_EVENT = {
 #: ``qsize`` above which a consumer backlog is warned about (never dropped).
 _BACKLOG_WATERMARK = 1000
 
+#: Reconcile-snapshot cadence (seconds). The PUSH stream is the primary source;
+#: the reconcile pass is a gap-filler, so the cadence is decoupled from any
+#: disappearance grace window. Engine-ordered: the pass runs when the engine
+#: next resumes the ``watch_orders`` iterator, not on a hard wall clock.
+_RECONCILE_CADENCE_S = 5.0
+
 
 class _EventStreamMixin(_CTraderBase):
     """Order-event PUSH stream: ``ProtoOAExecutionEvent`` -> ``OrderEvent``."""
 
     async def watch_orders(self) -> AsyncIterator[OrderEvent]:
-        """Stream order status updates from the execution PUSH channel.
+        """Stream order status updates, driving the reconcile cadence inline.
 
         Yields one :class:`OrderEvent` per relevant ``ProtoOAExecutionEvent``,
         with Pine identity filled in from the BrokerStore ref index. Execution
         types that carry no order-lifecycle meaning (swaps, deposits) are
         skipped; nothing is dropped silently.
+
+        The reconcile-snapshot pass is piggybacked onto this loop instead of a
+        separate background task: each iteration blocks on ``execq.get()`` only
+        until the next reconcile deadline (``asyncio.wait_for`` — cancellation
+        on timeout does NOT consume a queued event), then runs the pass. The
+        deadline is checked at the TOP of the loop before blocking, so a busy
+        PUSH stream cannot starve the reconcile; and the next deadline is set
+        AFTER the pass completes (no catch-up burst when one pass runs long).
         """
         execq = self._exec_events
         if execq is None:
             raise CTraderConnectionError("live event router not started")
         warned = False
+        loop = asyncio.get_running_loop()
+        next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
         while True:
-            message = await execq.get()
+            now = loop.time()
+            if now >= next_reconcile_at:
+                async for event in self._run_reconcile_pass():
+                    yield event
+                next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
+                continue
+            try:
+                message = await asyncio.wait_for(
+                    execq.get(), timeout=next_reconcile_at - now,
+                )
+            except asyncio.TimeoutError:
+                continue
             if not warned and execq.qsize() > _BACKLOG_WATERMARK:
                 logger.warning(
                     "cTrader order-event backlog above %d; consumer is lagging",
@@ -72,6 +102,21 @@ class _EventStreamMixin(_CTraderBase):
             event = self._translate_exec_event(message)
             if event is not None:
                 yield event
+
+    async def _run_reconcile_pass(self) -> AsyncIterator[OrderEvent]:
+        """Run one reconcile-snapshot pass, isolating transient failures.
+
+        A recoverable reconcile error — a transport hiccup on the snapshot or
+        the deal-history bridge request — is logged and swallowed so the PUSH
+        stream (the primary order-event source) is never torn down by the
+        gap-filler. ``asyncio.CancelledError`` is a ``BaseException`` and so
+        still propagates for a clean teardown.
+        """
+        try:
+            async for event in self._reconcile_snapshot():
+                yield event
+        except Exception as exc:  # noqa: BLE001 - gap-filler must not kill the PUSH stream
+            logger.warning("cTrader reconcile pass failed (transient): %s", exc)
 
     def _translate_exec_event(self, message) -> OrderEvent | None:
         """Translate one execution / order-error message into an OrderEvent.

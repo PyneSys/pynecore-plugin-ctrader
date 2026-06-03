@@ -80,9 +80,17 @@ class _StateMixin(_CTraderBase):
             idempotency=CapabilityLevel.PARTIAL_NATIVE,
         )
 
-    async def _reconcile(self) -> _oa.ProtoOAReconcileRes:
+    async def _reconcile(
+            self, *, return_protection_orders: bool = False,
+    ) -> _oa.ProtoOAReconcileRes:
         """Fetch the account's open orders + positions snapshot.
 
+        :param return_protection_orders: When ``True`` the snapshot's
+            ``order[]`` also carries the position-attached SL/TP protection
+            orders (needed by the reconcile loop's bracket-disappearance
+            detection). The state-query callers leave it ``False`` — they map
+            only standalone working orders and read protective levels off the
+            position itself.
         :return: The ``ProtoOAReconcileRes`` for the live account.
         :raises CTraderConnectionError: If the live connection is not open.
         """
@@ -90,7 +98,10 @@ class _StateMixin(_CTraderBase):
         if wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
         return cast(_oa.ProtoOAReconcileRes, await wire.send_request(
-            _oa.ProtoOAReconcileReq(ctidTraderAccountId=self._live_account_id)
+            _oa.ProtoOAReconcileReq(
+                ctidTraderAccountId=self._live_account_id,
+                returnProtectionOrders=return_protection_orders,
+            )
         ))
 
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None:
