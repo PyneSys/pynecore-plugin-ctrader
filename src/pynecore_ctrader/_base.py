@@ -166,6 +166,14 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         #: ``ctrader_position_id_shared`` warning fires once per position per run
         #: rather than per linking entry. See :meth:`_link_position_ref`.
         self._shared_position_logged: set[int] = set()
+        #: One-shot guard for the startup adoption baseline. The engine's startup
+        #: ``reconcile`` adopts the broker net position deal-independently; the
+        #: FIRST ``get_position`` / ``fetch_raw_positions`` call (which IS that
+        #: adoption call) silently advances each live row's ``filled_qty`` cursor
+        #: to what the adopted snapshot already reflects, so a post-restart fill
+        #: is never re-emitted on top of the adopted size. See
+        #: ``_StateMixin._apply_adoption_baseline``.
+        self._adoption_baselined: bool = False
 
     # --- credentials --------------------------------------------------------
 

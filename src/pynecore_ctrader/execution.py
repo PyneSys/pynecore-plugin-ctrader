@@ -392,6 +392,12 @@ class _ExecutionMixin(_CTraderBase):
             return
         order_id = str(order.orderId)
         position_id = order.positionId or 0
+        # Per-order since-anchor for the M3 deal-history bridge: the earliest
+        # timestamp a fill of this order could carry. ``utcLastUpdateTimestamp``
+        # is the broker-clock order-creation time (a fill is never earlier), so
+        # it avoids client-skew; fall back to the client clock when the ack
+        # carried no timestamp. The bridge subtracts its own safety skew.
+        submitted_at_ms = order.utcLastUpdateTimestamp or int(epoch_time() * 1000)
         self.store_ctx.upsert_order(
             coid,
             symbol=intent.symbol,
@@ -403,7 +409,8 @@ class _ExecutionMixin(_CTraderBase):
             pine_entry_id=intent.pine_id,
             exchange_order_id=(str(position_id) if position_id else order_id),
             extras={'order_id': order_id,
-                    'position_id': position_id or None},
+                    'position_id': position_id or None,
+                    'submitted_at_ms': submitted_at_ms},
         )
         self.store_ctx.add_ref(coid, 'order_id', order_id)
         # FIFO-pin the shared netted position alias (NETTING merges pyramid

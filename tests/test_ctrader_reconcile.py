@@ -91,6 +91,17 @@ def _deal(*, deal_id, order_id, position_id, filled_volume, price=1.1,
     )
 
 
+def _close_deal(*, deal_id, order_id, position_id, closed_volume, price=1.1):
+    """A FILLED closing deal carrying ``closePositionDetail.closedVolume``."""
+    return _model.ProtoOADeal(
+        dealId=deal_id, orderId=order_id, positionId=position_id,
+        filledVolume=closed_volume, executionPrice=price,
+        dealStatus=_model.ProtoOADealStatus.FILLED, moneyDigits=2, commission=0,
+        executionTimestamp=1_700_000_100_000,
+        closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=closed_volume),
+    )
+
+
 def _deal_res(*deals, has_more=False) -> _oa.ProtoOADealListRes:
     return _oa.ProtoOADealListRes(deal=list(deals), hasMore=has_more)
 
@@ -126,7 +137,10 @@ def _seed_position(broker, coid, *, position_id, qty, extras=None):
 
 def _run(broker) -> list:
     async def collect():
-        return [e async for e in broker._reconcile_snapshot()]
+        out = []
+        async for e in broker._reconcile_snapshot():
+            out.append(e)
+        return out
     return asyncio.run(collect())
 
 
@@ -368,3 +382,161 @@ def __test_reconcile_vanished_working_sums_multiple_fill_deals__(tmp_path):
     row = broker.store_ctx.get_order('c9')
     assert row is not None
     assert row.filled_qty == qty
+
+
+# === M3 2.1.5 — cumulative-fill accounting (crash boundaries) =============
+
+def __test_push_advances_cursor_so_same_cycle_reconcile_no_double_count__(tmp_path):
+    # Surface (a): a PUSH partial advances the durable cursor BEFORE its
+    # OrderEvent is enqueued, so a reconcile pass running in the same
+    # watch_orders cycle (the engine has not drained the deferred record_fill
+    # yet) sees ``executedVolume == filled_qty`` and emits nothing — no
+    # double-count of the same slice.
+    qty = volume_to_units(2000)
+    partial = volume_to_units(1000)
+    broker = _ReconcileBroker(
+        _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                              position_id=222, price=1.1)])
+    )
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c10', order_id=111, qty=qty)
+
+    # The PUSH path advances the cursor on the live partial fill.
+    broker._advance_fill_cursor(_order(order_id=111, volume=2000, executed=1000))
+    assert broker.store_ctx.get_order('c10').filled_qty == partial
+
+    # The same-cycle reconcile pass now finds no progress to re-emit.
+    assert _run(broker) == []
+    assert broker.store_ctx.get_order('c10').filled_qty == partial
+
+
+def __test_adoption_baseline_silently_advances_working_cursor__(tmp_path):
+    # Restart: a fill landed while the stream was DOWN (PUSH never saw it), so
+    # the durable cursor is stale (0) but the broker order already shows the
+    # executed volume the engine's net-position adoption folded in. The first
+    # get_position-driven baseline silently raises the cursor — no emit — so the
+    # first reconcile pass does not re-apply the adopted slice.
+    qty = volume_to_units(2000)
+    executed = volume_to_units(1000)
+    recon = _recon(orders=[_order(order_id=111, volume=2000, executed=1000)])
+    broker = _ReconcileBroker(recon)
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=qty)
+
+    broker._apply_adoption_baseline(recon)
+
+    assert broker._adoption_baselined is True
+    assert broker.store_ctx.get_order('c11').filled_qty == executed
+    # Same snapshot through the reconcile pass: no double-emit past the barrier.
+    assert _run(broker) == []
+
+
+def __test_adoption_baseline_vanished_order_open_position_marks_full__(tmp_path):
+    # Restart: a MARKET entry filled before the crash, so its order has already
+    # left order[] and only the open position remains (positions carry no
+    # order/COID link). The adoption counted it into the net, so the baseline
+    # marks the row fully filled — conservatively at row.qty — and emits nothing.
+    qty = volume_to_units(2000)
+    recon = _recon(positions=[_position(position_id=222, volume=2000)])
+    broker = _ReconcileBroker(recon)
+    _open(tmp_path, broker)
+    _seed_partial_working(broker, 'c12', order_id=111, qty=qty,
+                          filled=0.0, position_id=222)
+
+    broker._apply_adoption_baseline(recon)
+
+    assert broker.store_ctx.get_order('c12').filled_qty == qty
+
+
+def __test_adoption_baseline_is_one_shot__(tmp_path):
+    # The baseline must run exactly once (the startup adoption call). A later
+    # call with a higher executedVolume must NOT silently absorb a post-adoption
+    # fill — that would lose a fill the engine never adopted.
+    qty = volume_to_units(2000)
+    first = volume_to_units(500)
+    broker = _ReconcileBroker(_recon())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c13', order_id=111, qty=qty)
+
+    broker._apply_adoption_baseline(
+        _recon(orders=[_order(order_id=111, volume=2000, executed=500)]))
+    assert broker.store_ctx.get_order('c13').filled_qty == first
+
+    # A second snapshot at a higher executed volume is ignored (one-shot guard).
+    broker._apply_adoption_baseline(
+        _recon(orders=[_order(order_id=111, volume=2000, executed=1500)]))
+    assert broker.store_ctx.get_order('c13').filled_qty == first
+
+
+def __test_reconcile_filled_then_closed_retires_instead_of_phantom__(tmp_path):
+    # Surface (d): the entry filled then the position closed while the stream was
+    # down. The OPEN-filtered snapshot no longer carries the position, but the
+    # deal history does — both the opening deal (orderId match) and a closing
+    # deal carrying closePositionDetail.closedVolume on the same position. The
+    # row is retired through the terminal-close path, NOT promoted to a phantom
+    # open position, and no fill is emitted.
+    qty = volume_to_units(2000)
+    broker = _ReconcileBroker(
+        _recon(positions=[]),  # position 222 fully closed -> gone
+        deal_res=_deal_res(
+            _deal(deal_id=905, order_id=111, position_id=222, filled_volume=2000),
+            _close_deal(deal_id=906, order_id=999, position_id=222,
+                        closed_volume=2000),
+        ),
+    )
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c14', order_id=111, qty=qty)
+
+    events = _run(broker)
+
+    assert events == []  # no phantom ENTRY fill
+    row = broker.store_ctx.get_order('c14')
+    assert row is not None
+    assert row.state == 'closed'
+    # Retired out of the live set so the disappearance tracker never stamps it.
+    assert all(r.client_order_id != 'c14'
+               for r in broker.store_ctx.iter_live_orders())
+
+
+def __test_partial_vanished_position_linked_not_stamped_on_no_fill__(tmp_path):
+    # Surface (c): a partial-filled row whose order vanished and whose deal
+    # history returns a conclusive no-fill (the residual was cancelled). It
+    # still holds an open partial position (position_id linked, filled > 0), so
+    # it must NOT be stamped missing_pending — that would later raise a false
+    # UnexpectedCancelError against a live position.
+    qty = volume_to_units(2000)
+    partial = volume_to_units(1000)
+    broker = _ReconcileBroker(
+        _recon(positions=[_position(position_id=222, volume=1000)]),
+        deal_res=_deal_res(),  # conclusive: no new FILLED deal for this order
+    )
+    _open(tmp_path, broker)
+    _seed_partial_working(broker, 'c15', order_id=111, qty=qty,
+                          filled=partial, position_id=222)
+
+    assert _run(broker) == []
+    row = broker.store_ctx.get_order('c15')
+    assert row is not None
+    assert 'missing_pending_since' not in (row.extras or {})
+
+
+def __test_deal_bridge_from_ms_uses_submitted_at_anchor__(tmp_path):
+    # The deal-history window is a per-order since-cursor, not a fixed lookback:
+    # fromTimestamp derives from the row's submitted_at_ms anchor (minus a skew
+    # margin), so a fill never ages out of a 300s window.
+    qty = volume_to_units(2000)
+    anchor_ms = 1_700_000_000_000
+    broker = _ReconcileBroker(_recon(positions=[]), deal_res=_deal_res())
+    _open(tmp_path, broker)
+    broker.store_ctx.upsert_order(
+        'c16', symbol='EURUSD', side='buy', qty=qty, filled_qty=0.0,
+        state='confirmed', pine_entry_id='long', exchange_order_id='111',
+        extras={'order_id': '111', 'position_id': None,
+                'submitted_at_ms': anchor_ms},
+    )
+    broker.store_ctx.add_ref('c16', 'order_id', '111')
+
+    _run(broker)
+
+    req = broker._wire.requests[-1]
+    assert req.fromTimestamp == anchor_ms - 60_000

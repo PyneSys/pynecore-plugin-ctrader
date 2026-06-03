@@ -181,6 +181,8 @@ class _EventStreamMixin(_CTraderBase):
                 },
             )
             return None
+        if event_type in ('filled', 'partial') and leg_type is LegType.ENTRY:
+            self._advance_fill_cursor(order)
         if (event_type == 'filled' and order.closingOrder
                 and self._position_is_flat(message)):
             self._mark_position_closed(order.positionId)
@@ -255,6 +257,32 @@ class _EventStreamMixin(_CTraderBase):
             return None
         row = self.store_ctx.find_by_ref('order_id', str(order.orderId))
         return row.client_order_id if row is not None else None
+
+    def _advance_fill_cursor(self, order) -> None:
+        """Advance the entry row's durable ``filled_qty`` to the PUSH cumulative.
+
+        The reconcile snapshot diffs ``order.executedVolume`` against the row's
+        ``filled_qty`` cursor; if the PUSH path left the cursor stale, a
+        reconcile pass in the same ``watch_orders`` cycle would re-derive — and
+        re-emit — the slice the PUSH just reported (the engine defers the
+        matching ``record_fill`` to the next bar, so the store cursor is the only
+        in-flight de-dup signal). Writing the cumulative here, BEFORE the
+        OrderEvent is yielded / enqueued, makes the cursor the single shared
+        de-dup channel for the PUSH and reconcile paths and keeps it
+        restart-consistent. Monotonic: the cursor only grows and is clamped to
+        the order's own size (``set_filled`` writes the absolute value with no
+        max of its own).
+        """
+        if self.store_ctx is None or not order.orderId:
+            return
+        row = self.store_ctx.find_by_ref('order_id', str(order.orderId))
+        if row is None:
+            return
+        cumulative = min(
+            row.qty, max(row.filled_qty, volume_to_units(order.executedVolume)),
+        )
+        if cumulative > row.filled_qty + 1e-9:
+            self.store_ctx.set_filled(row.client_order_id, cumulative)
 
     def _link_position(self, order, coid: str | None) -> None:
         """Link an entry to its netted ``positionId`` once its order fills.

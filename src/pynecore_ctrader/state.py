@@ -104,6 +104,67 @@ class _StateMixin(_CTraderBase):
             )
         ))
 
+    def _apply_adoption_baseline(self, res: _oa.ProtoOAReconcileRes) -> None:
+        """Silently baseline live rows' ``filled_qty`` to the adoption snapshot.
+
+        The engine's startup ``reconcile`` adopts the broker's NET position
+        UNCONDITIONALLY and deal-independently (size + entry price), folding every
+        pre-restart fill into ``BrokerPosition.size``. The PUSH and reconcile
+        paths emit fills incrementally against each row's durable ``filled_qty``
+        cursor; if that cursor is still pre-restart while the adopted net already
+        counts the fill, the first post-restart emit would re-apply the
+        pre-restart slice on top of the adopted size (``BrokerPosition.record_fill``
+        has no ``dealId`` de-dup → double-count). So, once, on the first state
+        query the startup adoption drives — this runs from :meth:`get_position` /
+        :meth:`fetch_raw_positions`, the FIRST of which (per ``start_broker``) IS
+        the adoption call — advance every live entry row's cursor up to what the
+        adoption snapshot already reflects, and emit nothing. After this barrier
+        the PUSH / reconcile paths emit only genuinely new fills.
+
+        Per-order baseline (from the SAME snapshot the engine adopts, so the
+        barrier can never silently absorb a later post-adoption fill):
+
+        * order still in ``order[]`` -> its cumulative ``executedVolume``;
+        * order gone from ``order[]`` but its ``position_id`` is adopted-open ->
+          ``row.qty`` (it fully filled into the net — conservative, and exact for
+          the common MARKET entry that vanishes from ``order[]`` the instant it
+          fills);
+        * gone from both -> left untouched, so the deal-history bridge can retire
+          a filled-then-closed row or stamp a never-filled one.
+
+        Monotonic (``set_filled`` writes the absolute value with no max of its
+        own): only ever raises a cursor, clamped to the row's own size. A row
+        whose PUSH-advanced cursor already reflects the fill (the rare
+        ``drained_mutated_position`` startup, where a live fill was drained before
+        adoption and the engine kept the mutated size instead of adopting) is a
+        no-op here; the precise engine<->plugin coordination for that skip is the
+        M3 startup-recovery (2.2) milestone's, where the diff core runs at
+        ``connect`` under a single shared snapshot.
+        """
+        if self.store_ctx is None or self._adoption_baselined:
+            return
+        self._adoption_baselined = True
+        executed_by_order_id = {o.orderId: o.executedVolume for o in res.order}
+        open_position_ids = {
+            p.positionId for p in res.position
+            if p.positionStatus == _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+        }
+        for row in list(self.store_ctx.iter_live_orders()):
+            extras = row.extras or {}
+            order_id_str = extras.get('order_id')
+            baseline: float | None = None
+            if order_id_str and int(order_id_str) in executed_by_order_id:
+                baseline = volume_to_units(executed_by_order_id[int(order_id_str)])
+            else:
+                position_id = extras.get('position_id')
+                if position_id and position_id in open_position_ids:
+                    baseline = row.qty
+            if baseline is None:
+                continue
+            cumulative = min(row.qty, max(row.filled_qty, baseline))
+            if cumulative > row.filled_qty + 1e-9:
+                self.store_ctx.set_filled(row.client_order_id, cumulative)
+
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None:
         """Resolve ``symbol`` to its numeric ``symbolId``, fetching if needed.
 
@@ -197,6 +258,7 @@ class _StateMixin(_CTraderBase):
         if want_id is None:
             return []
         res = await self._reconcile()
+        self._apply_adoption_baseline(res)
         digits = self._symbol_rules[symbol].digits if symbol in self._symbol_rules else 5
         legs: list[PositionLeg] = []
         for position in res.position:
@@ -236,6 +298,7 @@ class _StateMixin(_CTraderBase):
             # position of another instrument under the requested symbol's name.
             return None
         res = await self._reconcile()
+        self._apply_adoption_baseline(res)
         for position in res.position:
             if position.positionStatus != _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue

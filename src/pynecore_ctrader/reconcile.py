@@ -54,12 +54,19 @@ from .messages import OpenApiModelMessages_pb2 as _model
 
 logger = logging.getLogger(__name__)
 
-#: How far back the deal-history bridge looks for the FILLED deal of a working
-#: order that vanished from ``order[]``. The order disappeared since the last
-#: successful pass, so a window generous enough to cover a multi-minute
-#: disconnect is sufficient for the runtime gap-fill; the startup recovery
-#: passes its own (wider) window.
+#: Fallback deal-history window (seconds) used ONLY when a row carries no
+#: ``submitted_at_ms`` since-anchor — the zero-row crash-before-persist case the
+#: M3 startup recovery (2.2) owns. Every row this loop persists carries the
+#: anchor, so the runtime path is a per-order since-cursor, NOT this fixed
+#: window: a fill never ages out of the lookback because the cursor reaches back
+#: to the order's own submit time.
 _DEAL_LOOKBACK_S = 300.0
+
+#: Safety margin subtracted from a row's ``submitted_at_ms`` when deriving the
+#: deal-history ``fromTimestamp``. ``submitted_at_ms`` is already a true lower
+#: bound (the broker-clock order-creation time, never after a fill), so this
+#: only absorbs clock granularity and the client-clock fallback skew.
+_SINCE_ANCHOR_SKEW_MS = 60_000
 
 #: ``maxRows`` per ``ProtoOADealListReq`` page.
 _DEAL_PAGE_MAX_ROWS = 1000
@@ -81,12 +88,20 @@ class _DealBridgeResult:
     :ivar fee: The summed commission across the deals.
     :ivar conclusive: ``True`` only when the whole window was read without a
         transport error (so a no-fill result deterministically means no fill).
+    :ivar closed_cents: Volume (cents) closed on this order's position over the
+        window, summed from every deal's ``closePositionDetail.closedVolume``
+        (closedVolume-primary closure evidence). ``0`` when nothing closed.
+    :ivar deal_ids: Every matching FILLED ``dealId``, so the shared
+        :attr:`_seen_deal_ids` de-dup spans an order that filled across several
+        partial deals (not just the most-recent one).
     """
     deal: '_model.ProtoOADeal | None'
     filled_cents: int
     avg_price: float | None
     fee: float
     conclusive: bool
+    closed_cents: int = 0
+    deal_ids: tuple[int, ...] = ()
 
 
 class _ReconcileMixin(_CTraderBase):
@@ -241,14 +256,30 @@ class _ReconcileMixin(_CTraderBase):
         """
         if self.store_ctx is None:
             return
-        bridge = await self._find_fill_deal(order_id, _DEAL_LOOKBACK_S)
+        extras = row.extras or {}
+        anchor = extras.get('submitted_at_ms')
+        if anchor:
+            from_ms = int(anchor) - _SINCE_ANCHOR_SKEW_MS
+        else:
+            # Zero-anchor fallback (the crash-before-persist row the M3 startup
+            # recovery owns): a wide fixed window, never the runtime path.
+            from_ms = int(epoch_time() * 1000) - int(_DEAL_LOOKBACK_S * 1000)
+        bridge = await self._find_fill_deal(order_id, from_ms)
         if bridge.deal is not None:
             event = self._promote_from_deal(row, bridge, open_positions, now_ts)
             if event is not None:
                 yield event
             return
-        if bridge.conclusive and 'missing_pending_since' not in (row.extras or {}):
-            patched = dict(row.extras or {})
+        # Conclusive no-fill: stamp the disappearance breadcrumb only on positive
+        # no-fill evidence. A row that already linked a ``position_id`` or carries
+        # any fill is a live (possibly partial) position — never a cancelled
+        # pending — so stamping ``missing_pending_since`` there would later raise
+        # a false ``UnexpectedCancelError`` against an open position (surface c).
+        if (bridge.conclusive
+                and not extras.get('position_id')
+                and row.filled_qty <= 1e-9
+                and 'missing_pending_since' not in extras):
+            patched = dict(extras)
             patched['missing_pending_since'] = now_ts
             self.store_ctx.upsert_order(row.client_order_id, extras=patched)
 
@@ -257,16 +288,42 @@ class _ReconcileMixin(_CTraderBase):
     ) -> OrderEvent | None:
         """Promote a working row to a filled position from its FILLED deals.
 
-        Idempotent against the PUSH path: when the ``dealId`` is already in the
-        shared :attr:`_seen_deal_ids` set the fill was applied live — still
-        ensure ``position_id`` is linked (set-once) but emit nothing. Otherwise
-        record the ``dealId``, advance the row, and emit the recovered fill.
+        Closure-aware (closedVolume-primary): when the order's ``positionId`` is
+        gone from the open snapshot and the deal history closed it, the order
+        filled-then-closed while the stream was down — the row is retired rather
+        than promoted, so no phantom open position is emitted (surface d). When
+        the position is still open the order's own cumulative fill is recovered
+        and the missed fill emitted.
+
+        Idempotent against the PUSH path: every recovered ``dealId`` already in
+        the shared :attr:`_seen_deal_ids` set was applied live, so the cursor /
+        ``position_id`` link are reconciled but nothing is emitted.
         """
         deal = bridge.deal
         if self.store_ctx is None or deal is None:
             return None
         position_id = deal.positionId or None
-        already_seen = deal.dealId in self._seen_deal_ids
+        position_open = bool(position_id) and position_id in open_positions
+        # Closure classification. A vanished order whose ``positionId`` is no
+        # longer open filled then closed during the stream gap. With positive
+        # closure evidence (a deal on the position carried
+        # ``closePositionDetail.closedVolume``) retire the row through the
+        # existing terminal-close writer instead of promoting a phantom open
+        # position; the engine's own ``reconcile()`` adoption / shrink-to-zero
+        # owns the position-size side. On ambiguity (position gone but no
+        # closing deal observed in the window) do nothing — never fabricate a
+        # retirement from missing evidence; the next pass or PUSH resolves it.
+        if position_id and not position_open:
+            if bridge.closed_cents > 0 and bridge.filled_cents > 0:
+                # Record the recovered deals on the shared de-dup channel BEFORE
+                # retiring: cTrader can replay or push an uncorrelated copy of the
+                # same execution after reconnect, and a sibling row sharing this
+                # position is retired off the SAME bridge deals — without this the
+                # PUSH path would re-emit a recovered deal as a fresh fill.
+                self._seen_deal_ids.update(bridge.deal_ids)
+                self._retire_filled_then_closed(
+                    row, deal, position_id, bridge.closed_cents)
+            return None
         # A working order that vanished after only a PARTIAL fill (residual
         # cancelled / expired while the stream was down) filled less than
         # ``row.qty``. The authoritative recovered size is THIS order's own
@@ -274,7 +331,10 @@ class _ReconcileMixin(_CTraderBase):
         # net open-position volume, which on a NETTING / pyramiding account is
         # shared across other entries and would overstate this order's fill.
         # Clamp into ``[row.filled_qty, row.qty]`` so it never regresses or
-        # overstates the strategy position past the order's own size.
+        # overstates the strategy position past the order's own size; the clamp
+        # is the monotonic guarantee (``mark_reconcile_filled`` writes the
+        # absolute value with no max of its own).
+        new_deal_ids = [d for d in bridge.deal_ids if d not in self._seen_deal_ids]
         recovered = volume_to_units(bridge.filled_cents)
         cumulative = min(row.qty, max(row.filled_qty, recovered))
         link_position = bool(position_id) and (row.extras or {}).get('position_id') is None
@@ -294,9 +354,11 @@ class _ReconcileMixin(_CTraderBase):
             )
             if link_position:
                 self._link_position_ref(row.client_order_id, position_id)
-        if already_seen:
+        if not new_deal_ids:
+            # Every recovered deal was already applied by the PUSH path — the
+            # cursor / position link are now consistent, so emit nothing.
             return None
-        self._seen_deal_ids.add(deal.dealId)
+        self._seen_deal_ids.update(new_deal_ids)
         # ``fill_price`` is what ``BrokerPosition.record_fill`` books the whole
         # recovered quantity at, so it must be the volume-weighted average across
         # the order's FILLED deals — a single deal's ``executionPrice`` would
@@ -305,7 +367,7 @@ class _ReconcileMixin(_CTraderBase):
         # the open position's broker-reported average when present.
         bridge_price = bridge.avg_price or deal.executionPrice or None
         avg = (open_positions[position_id].price
-               if position_id in open_positions else bridge_price)
+               if position_open else bridge_price)
         status = (OrderStatus.FILLED if cumulative >= row.qty - 1e-9
                   else OrderStatus.PARTIALLY_FILLED)
         return self._fill_event(
@@ -317,41 +379,89 @@ class _ReconcileMixin(_CTraderBase):
                        if deal.executionTimestamp else now_ts),
         )
 
+    def _retire_filled_then_closed(
+            self, row, deal, position_id: int, closed_cents: int,
+    ) -> None:
+        """Retire a row whose order filled then closed while the stream was down.
+
+        The position the order opened is gone from the live snapshot and the
+        deal history carried a ``closePositionDetail`` closing it, so promoting
+        the opening fill would leave a phantom local position against a broker
+        that is flat for it. Lands the row in ``closed`` through the existing
+        reconcile-path terminal writer and emits no fill — the entry is settled,
+        not live; the engine's own position reconcile owns the size side.
+
+        Flattens EVERY live row sharing ``position_id``, not just the one
+        observed: a NETTING / pyramiding account merges pyramid entries onto one
+        ``positionId``, so a proven close retires all of them (mirroring the PUSH
+        path's :meth:`_mark_position_closed`) — closing only the observed row
+        would leave sibling rows live or later mis-stamped against a flat broker.
+        Siblings are materialised before any write so the live-order scan is not
+        mutated mid-iteration.
+        """
+        if self.store_ctx is None:
+            return
+        pid_str = str(position_id)
+        siblings = [
+            r.client_order_id
+            for r in self.store_ctx.iter_live_orders()
+            if r.client_order_id != row.client_order_id
+            and ((r.extras or {}).get('position_id') == position_id
+                 or r.exchange_order_id == pid_str)
+        ]
+        DispatchJournal(self.store_ctx).apply_reconcile_outcome(
+            row.client_order_id,
+            ReconcileOutcome(
+                kind='terminal_close',
+                reason='bracket_natural_close_followup',
+                new_state='closed',
+                audit_event='reconcile_filled_then_closed_retired',
+                close_row=True,
+                audit_payload={'deal_id': deal.dealId, 'position_id': position_id,
+                               'closed_cents': closed_cents},
+                exchange_order_id=str(position_id),
+            ),
+        )
+        for coid in siblings:
+            self.store_ctx.close_order(coid)
+
     async def _find_fill_deal(
-            self, order_id: int, lookback_s: float,
+            self, order_id: int, from_ms: int,
     ) -> '_DealBridgeResult':
         """Return the FILLED-deal evidence for ``order_id`` and read completeness.
 
-        Walks the deal history back from now over ``lookback_s``, paging on
-        ``hasMore``, and aggregates EVERY FILLED deal of ``order_id`` in the
-        window — a single working order can fill across several partial deals, so
-        the per-order quantity is their summed ``filledVolume`` (in cents), never
-        a single deal's slice. The deals can fill at DIFFERENT prices, so the
-        booking price is their volume-weighted average (``avg_price``) and the
-        recovered commission is their sum (``fee``) — taking a single deal's
-        ``executionPrice`` / ``commission`` would mis-state the recovered fill's
-        P&L and fee accounting. ``conclusive`` is ``True`` only when the whole
-        window was consumed without a transport error — a failed or truncated
-        read returns an empty, non-conclusive result so the caller never
-        concludes a cancel from missing evidence.
+        Walks the deal history from ``from_ms`` (the order's own since-anchor)
+        up to now, paging on ``hasMore``, and aggregates EVERY FILLED deal of
+        ``order_id`` in the window — a single working order can fill across
+        several partial deals, so the per-order quantity is their summed
+        ``filledVolume`` (in cents), never a single deal's slice. The deals can
+        fill at DIFFERENT prices, so the booking price is their volume-weighted
+        average (``avg_price``) and the recovered commission is their sum
+        (``fee``). Alongside, it sums ``closePositionDetail.closedVolume`` per
+        position so the caller can tell a filled-then-closed order from a live
+        one (closedVolume-primary closure classification). ``conclusive`` is
+        ``True`` only when the whole window was consumed without a transport
+        error — a failed or truncated read returns an empty, non-conclusive
+        result so the caller never concludes a cancel (or a closure) from
+        missing evidence.
 
-        :return: a :class:`_DealBridgeResult` — ``deal`` is the most recent
-            matching FILLED ``ProtoOADeal`` (identity / timestamp) or ``None``;
-            ``filled_cents`` is the order's cumulative filled volume in cents;
-            ``avg_price`` is the volume-weighted execution price across those
-            deals (``None`` when nothing matched); ``fee`` is their summed
-            commission; ``conclusive`` reflects read completeness.
+        :param order_id: The broker order id whose fills to recover.
+        :param from_ms: The lower-bound ``fromTimestamp`` (ms) — the order's
+            ``submitted_at_ms`` anchor minus a skew margin, so a fill never ages
+            out of a fixed window.
+        :return: a :class:`_DealBridgeResult` — see its field docs.
         """
         wire = self._wire
         if wire is None or self._live_account_id is None:
             return _DealBridgeResult(None, 0, None, 0.0, False)
-        now_ms = int(epoch_time() * 1000)
-        from_ms = now_ms - int(lookback_s * 1000)
-        to_ms = now_ms
+        to_ms = int(epoch_time() * 1000)
         latest_deal: '_model.ProtoOADeal | None' = None
         filled_cents = 0
         weighted_price = 0.0
         fee = 0.0
+        deal_ids: list[int] = []
+        target_position_id: int | None = None
+        closed_by_position: dict[int, int] = {}
         try:
             while True:
                 res = cast(_oa.ProtoOADealListRes, await wire.send_request(
@@ -362,11 +472,18 @@ class _ReconcileMixin(_CTraderBase):
                     )
                 ))
                 for deal in res.deal:
+                    if deal.HasField('closePositionDetail'):
+                        closed_by_position[deal.positionId] = (
+                            closed_by_position.get(deal.positionId, 0)
+                            + deal.closePositionDetail.closedVolume)
                     if (deal.orderId == order_id
                             and deal.dealStatus == _model.ProtoOADealStatus.FILLED):
                         filled_cents += deal.filledVolume
                         weighted_price += deal.executionPrice * deal.filledVolume
                         fee += money_value(deal.commission, deal.moneyDigits)
+                        deal_ids.append(deal.dealId)
+                        if target_position_id is None:
+                            target_position_id = deal.positionId or None
                         if latest_deal is None:
                             latest_deal = deal
                 if not res.hasMore or not res.deal:
@@ -382,7 +499,12 @@ class _ReconcileMixin(_CTraderBase):
             )
             return _DealBridgeResult(None, 0, None, 0.0, False)
         avg_price = weighted_price / filled_cents if filled_cents else None
-        return _DealBridgeResult(latest_deal, filled_cents, avg_price, fee, True)
+        closed_cents = (closed_by_position.get(target_position_id, 0)
+                        if target_position_id is not None else 0)
+        return _DealBridgeResult(
+            latest_deal, filled_cents, avg_price, fee, True,
+            closed_cents, tuple(deal_ids),
+        )
 
     def _clear_missing_pending(self, row) -> None:
         """Drop a stale ``missing_pending_since`` breadcrumb (the row came back)."""
