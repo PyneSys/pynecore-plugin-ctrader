@@ -162,6 +162,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         #: set keeps the fill from being recorded twice. M2: unbounded (deal ids
         #: are unique and a session's fill volume is modest).
         self._seen_deal_ids: set[int] = set()
+        #: Client-order-ids whose grace-expired retire is currently deferred
+        #: because the final deal-history re-check was inconclusive (transport
+        #: down). Throttles the "deferring rather than concluding a false cancel"
+        #: warning to once per row until the re-check resolves. See
+        #: ``_ReconcileMixin._warn_inconclusive_grace_recheck``.
+        self._inconclusive_grace_warned: set[str] = set()
         #: Position ids whose pyramid-sharing was already audit-logged, so the
         #: ``ctrader_position_id_shared`` warning fires once per position per run
         #: rather than per linking entry. See :meth:`_link_position_ref`.
@@ -655,6 +661,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
     ) -> '_oa.ProtoOAReconcileRes': ...
 
     def _reconcile_snapshot(self) -> 'AsyncIterator[OrderEvent]': ...
+
+    def _emit_unexpected_cancellations(self) -> 'AsyncIterator[OrderEvent]': ...
+
+    async def _dispatch_order(
+            self, req, *, coid: str, context: str,
+    ) -> '_oa.ProtoOAExecutionEvent': ...
 
     async def _recover_in_flight_submissions(self) -> None: ...
 

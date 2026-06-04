@@ -1029,11 +1029,13 @@ class _ExecutionMixin(_CTraderBase):
         own leg would leave the other legs without the downtime stop and report
         the fail-safe healthy while part of the exposure is unprotected.
 
-        On a successful PUT the desired levels are fed straight back to the
-        engine's observed sink. M2 has no reconcile pass yet (M3), so the
-        actuator self-confirms its own push — enough to flip the fail-safe
-        ``DEGRADING -> HEALTHY``. The independent reconcile-based observation
-        (external-edit / restart detection) is M3.
+        The fail-safe ``DEGRADING -> HEALTHY`` confirmation is NOT done here:
+        the independent reconcile pass observes the broker's actually-carried
+        levels (:meth:`_feed_native_failsafe_observed`) and feeds the engine's
+        observed sink. Keeping the actuator out of the confirm path means the
+        PUT and its confirmation never race on the same thread, and an external
+        edit of the broker stop is detected (``-> UNKNOWN``) rather than masked
+        by the actuator echoing back its own desired levels.
 
         :param snapshot: Desired bracket triple + parent COID + generation.
         """
@@ -1077,17 +1079,6 @@ class _ExecutionMixin(_CTraderBase):
                      'trailing_stop': snapshot.trailing_stop,
                      'generation': snapshot.generation},
         )
-        sink = self.native_failsafe_observed_sink
-        if sink is not None:
-            # M2 self-confirm: the PUT succeeded (no raise), so the desired
-            # levels are now in place. cTrader has no relative trailing field,
-            # so only the absolute stop is fed back (trailing_stop stays None).
-            sink(
-                snapshot.parent_entry_dispatch_ref,
-                stop_level=snapshot.stop_level,
-                profit_level=snapshot.profit_level,
-                trailing_stop=None,
-            )
 
     async def _failsafe_leg_ids(
             self, snapshot: "NativeBracketSnapshot",

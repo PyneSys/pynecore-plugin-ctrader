@@ -11,6 +11,8 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.models import (
+    CancelDispositionOutcome,
+    CancelIntent,
     CapabilityLevel,
     CloseIntent,
     DispatchEnvelope,
@@ -24,7 +26,7 @@ from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 
 from pynecore_ctrader import CTrader, CTraderConfig
-from pynecore_ctrader.exceptions import map_error_code
+from pynecore_ctrader.exceptions import CTraderProtocolError, map_error_code
 from pynecore_ctrader.helpers import (
     money_value,
     quantize_volume,
@@ -522,3 +524,74 @@ def __test_map_error_code_generic_reject__():
     from pynecore.core.broker.exceptions import ExchangeOrderRejectedError
     err = map_error_code('SOMETHING_ELSE', 'bad order')
     assert isinstance(err, ExchangeOrderRejectedError)
+
+
+# === Cancel disposition idempotency (2.6) =================================
+# The engine's cancel-tentative state machine drives a working order's cancel
+# to resolution by RE-invoking execute_cancel_with_outcome each reconcile
+# cycle. Its M3 plugin contract is idempotency: re-cancelling an already
+# gone / already filled order must be a benign UNKNOWN (keep the tentative
+# armed), never an exception and never a false confirmed no-fill cancel.
+
+def _seed_working_entry(broker, *, pine_id='Long', order_id=111):
+    broker.store_ctx.upsert_order(
+        f'coid-{order_id}', symbol='EURUSD', side='buy', qty=10.0, filled_qty=0.0,
+        state='confirmed', pine_entry_id=pine_id, exchange_order_id=str(order_id),
+        extras={'order_id': str(order_id), 'position_id': None},
+    )
+    broker.store_ctx.add_ref(f'coid-{order_id}', 'order_id', str(order_id))
+
+
+def _cancel(broker, *, pine_id='Long'):
+    intent = CancelIntent(pine_id=pine_id, symbol='EURUSD')
+    return asyncio.run(broker.execute_cancel_with_outcome(_envelope(intent)))
+
+
+def __test_cancel_confirmed_when_broker_cancels__(tmp_path):
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED)
+    assert _cancel(broker) is CancelDispositionOutcome.CANCEL_CONFIRMED
+
+
+def __test_cancel_already_filled_when_broker_fills__(tmp_path):
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED)
+    assert _cancel(broker) is CancelDispositionOutcome.ALREADY_FILLED
+
+
+def __test_cancel_rejected_race_is_unknown_not_too_late__(tmp_path):
+    # ORDER_CANCEL_REJECTED is a cancel/modify race: the order may still be
+    # live or may have filled, so it maps to UNKNOWN (the cancel-tentative
+    # stays armed) — never a confirmed no-fill cancel that could double-open.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED)
+    assert _cancel(broker) is CancelDispositionOutcome.UNKNOWN
+
+
+def __test_cancel_not_found_is_unknown_not_raise__(tmp_path):
+    # Re-cancelling an already-gone order: a NOT_FOUND reject is a benign
+    # idempotent no-op (UNKNOWN keeps the tentative armed for a later fill /
+    # cancel signal), NOT an exception that would halt the retry loop.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    err = ExchangeOrderRejectedError("order gone")
+    err.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
+    broker._raise_on_dispatch = err
+    assert _cancel(broker) is CancelDispositionOutcome.UNKNOWN
+
+
+def __test_cancel_no_live_order_is_unknown_without_dispatch__(tmp_path):
+    # No live working row for the pine id (already cancelled / filled): the
+    # cancel is a no-op UNKNOWN and no cancel request is sent.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    assert _cancel(broker) is CancelDispositionOutcome.UNKNOWN
+    assert broker.sent == []

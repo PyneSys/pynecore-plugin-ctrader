@@ -18,6 +18,7 @@ import logging
 from time import time as epoch_time
 from typing import AsyncIterator
 
+from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.core.broker.models import (
     ExchangeOrder,
     LegType,
@@ -106,15 +107,26 @@ class _EventStreamMixin(_CTraderBase):
     async def _run_reconcile_pass(self) -> AsyncIterator[OrderEvent]:
         """Run one reconcile-snapshot pass, isolating transient failures.
 
-        A recoverable reconcile error — a transport hiccup on the snapshot or
-        the deal-history bridge request — is logged and swallowed so the PUSH
-        stream (the primary order-event source) is never torn down by the
-        gap-filler. ``asyncio.CancelledError`` is a ``BaseException`` and so
-        still propagates for a clean teardown.
+        Two sub-passes in order: :meth:`_reconcile_snapshot` (gap-fill missed
+        fills, stamp / clear ``missing_pending_since``), then
+        :meth:`_emit_unexpected_cancellations` (retire rows missing past the
+        grace window). A recoverable reconcile error — a transport hiccup on
+        the snapshot or the deal-history bridge request — is logged and
+        swallowed so the PUSH stream (the primary order-event source) is never
+        torn down by the gap-filler. A deliberate halt from the
+        disappearance-grace tracker (``on_unexpected_cancel='stop'`` ->
+        :class:`BrokerManualInterventionError`) is NOT a transient failure: it
+        propagates so the engine performs its graceful stop — swallowing it
+        would strand the strategy out of sync. ``asyncio.CancelledError`` is a
+        ``BaseException`` and so still propagates for a clean teardown.
         """
         try:
             async for event in self._reconcile_snapshot():
                 yield event
+            async for event in self._emit_unexpected_cancellations():
+                yield event
+        except BrokerManualInterventionError:
+            raise
         except Exception as exc:  # noqa: BLE001 - gap-filler must not kill the PUSH stream
             logger.warning("cTrader reconcile pass failed (transient): %s", exc)
 
