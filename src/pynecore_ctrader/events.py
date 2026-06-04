@@ -174,25 +174,34 @@ class _EventStreamMixin(_CTraderBase):
         pine_id, from_entry, leg_type = self._resolve_identity(order, deal)
         if (event_type in ('filled', 'partial') and leg_type is None
                 and self.store_ctx is not None):
-            # A fill that reverse-maps to no order this run placed is external
-            # activity (manual broker action, or another bot on the same
-            # account). The sync engine applies every fill-like event to
-            # ``BrokerPosition`` regardless of ``pine_id``, so emitting it would
-            # corrupt this strategy's local position. Drop it — mirroring
-            # :meth:`_order_error_to_event` and the reference-plugin
-            # external-order policy (see broker-plugin-responsibility-review.md).
-            # ``store_ctx is None`` (tests / persistence off) keeps the legacy
-            # emit path so identity-less fixtures still observe the event.
-            self.store_ctx.log_event(
-                'external_activity_ignored',
-                exchange_order_id=str(order.orderId) or None,
-                payload={
-                    'execution_type': event_type,
-                    'order_id': order.orderId,
-                    'position_id': order.positionId,
-                },
-            )
-            return None
+            # The order/position ref index could not reverse-map this fill.
+            # Before treating it as external, try the deterministic
+            # ``clientOrderId`` echo: a MARKET entry whose dispatch parked on an
+            # ambiguous timeout never recorded its refs, so :meth:`_resolve_identity`
+            # misses even though the order filled and the PUSH echoes our coid.
+            recovered_pine_id = self._recover_parked_entry_by_coid(order)
+            if recovered_pine_id is not None:
+                pine_id, from_entry, leg_type = recovered_pine_id, None, LegType.ENTRY
+            else:
+                # A fill that reverse-maps to no order this run placed is external
+                # activity (manual broker action, or another bot on the same
+                # account). The sync engine applies every fill-like event to
+                # ``BrokerPosition`` regardless of ``pine_id``, so emitting it would
+                # corrupt this strategy's local position. Drop it — mirroring
+                # :meth:`_order_error_to_event` and the reference-plugin
+                # external-order policy (see broker-plugin-responsibility-review.md).
+                # ``store_ctx is None`` (tests / persistence off) keeps the legacy
+                # emit path so identity-less fixtures still observe the event.
+                self.store_ctx.log_event(
+                    'external_activity_ignored',
+                    exchange_order_id=str(order.orderId) or None,
+                    payload={
+                        'execution_type': event_type,
+                        'order_id': order.orderId,
+                        'position_id': order.positionId,
+                    },
+                )
+                return None
         if event_type in ('filled', 'partial') and leg_type is LegType.ENTRY:
             self._advance_fill_cursor(order)
         if (event_type == 'filled' and order.closingOrder
@@ -262,6 +271,66 @@ class _EventStreamMixin(_CTraderBase):
         if order.closingOrder:
             return None, row.pine_entry_id, LegType.CLOSE
         return row.pine_entry_id, None, LegType.ENTRY
+
+    def _recover_parked_entry_by_coid(self, order) -> str | None:
+        """Reverse-map a parked entry fill the order/position ref index missed.
+
+        A MARKET entry whose dispatch ended in an ambiguous timeout is parked
+        with only its persist-first ``submitted`` -> ``disposition_unknown`` row:
+        the success-path ref recording (:meth:`_persist_entry`) never ran, so the
+        row carries no ``order_id`` / ``position_id`` alias and
+        :meth:`_resolve_identity` cannot reverse-map a later fill. When the order
+        in fact filled, cTrader echoes our deterministic ``clientOrderId`` on the
+        PUSH execution event (``ProtoOAOrder``), so the row is still recoverable by
+        its coid. This is the in-session counterpart of the startup
+        :meth:`~pynecore_ctrader.recovery._RecoveryMixin._confirm_recovered_entry`
+        path: mirror :meth:`_persist_entry`'s ref recording (so
+        :meth:`_advance_fill_cursor`, :meth:`_link_position` and the reconcile
+        snapshot reverse-map every later event), drop the now-resolved
+        ``pending_verifications`` park the sync engine left on the timeout (a
+        filled MARKET never re-surfaces in ``get_open_orders``, so
+        ``_verify_pending_dispatches`` would replay it forever), and return the
+        entry's Pine id so the fill is emitted instead of mis-dropped as external
+        — which would otherwise strand an unmanaged open position until the next
+        restart's recovery re-entry.
+
+        Entry path only: a close fill carries no ``clientOrderId``
+        (``ProtoOAClosePositionReq`` has no such field), so the ``closingOrder``
+        guard keeps a coid match from ever reclassifying a close as an entry.
+        """
+        if (self.store_ctx is None or not order.clientOrderId
+                or order.closingOrder):
+            return None
+        row = self.store_ctx.get_order(order.clientOrderId)
+        if row is None or row.pine_entry_id is None:
+            return None
+        coid = row.client_order_id
+        order_id = str(order.orderId)
+        position_id = order.positionId or 0
+        # Broker-clock since-anchor for the M3 deal-history bridge, exactly as
+        # :meth:`_persist_entry`; fall back to the client clock when the PUSH
+        # carried no order timestamp.
+        submitted_at_ms = order.utcLastUpdateTimestamp or int(epoch_time() * 1000)
+        extras = dict(row.extras or {})
+        extras['order_id'] = order_id
+        extras['position_id'] = position_id or None
+        extras['submitted_at_ms'] = submitted_at_ms
+        self.store_ctx.upsert_order(
+            coid,
+            state='confirmed',
+            filled_qty=volume_to_units(order.executedVolume),
+            exchange_order_id=(str(position_id) if position_id else order_id),
+            extras=extras,
+        )
+        self.store_ctx.add_ref(coid, 'order_id', order_id)
+        self._link_position_ref(coid, position_id)
+        self.store_ctx.record_unpark(coid)
+        self.store_ctx.log_event(
+            'recovered_parked_entry_by_coid', client_order_id=coid,
+            exchange_order_id=order_id, intent_key=row.intent_key,
+            payload={'position_id': position_id or None},
+        )
+        return row.pine_entry_id
 
     def _coid_for_order(self, order) -> str | None:
         """Best-effort BrokerStore lookup of the client-order-id for an order."""

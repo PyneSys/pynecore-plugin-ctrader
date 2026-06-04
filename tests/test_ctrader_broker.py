@@ -24,6 +24,11 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
+from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
+    create_entry_order_row,
+    mark_disposition_unknown,
+)
 
 from pynecore_ctrader import CTrader, CTraderConfig
 from pynecore_ctrader.exceptions import CTraderProtocolError, map_error_code
@@ -354,6 +359,83 @@ def __test_translate_skips_non_lifecycle__():
     broker = _FakeBroker()
     out = broker._translate_exec_event(_exec_event(_model.ProtoOAExecutionType.SWAP))
     assert out is None
+
+
+# === Parked-entry fill recovery by clientOrderId echo =====================
+
+def __test_translate_recovers_parked_entry_fill_by_coid__(tmp_path):
+    # A MARKET entry that PARKED on an ambiguous timeout (disposition_unknown, no
+    # order_id/position_id ref recorded) but in fact FILLED: the PUSH fill echoes
+    # our coid, so it must be attributed to THIS entry — not mis-dropped as
+    # external, which would strand an unmanaged open position until the next
+    # restart's recovery re-entry.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='pine1', pine_entry_id='pine1',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    mark_disposition_unknown(broker.store_ctx, coid='c1')
+    broker.store_ctx.record_park('c1', 'pine1')
+    assert 'c1' in broker.store_ctx.replay()[1]
+
+    order = _make_order(order_id=111, executed=1000, position_id=222,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    order.clientOrderId = 'c1'
+    deal = _model.ProtoOADeal(dealId=5, filledVolume=1000, executionPrice=1.2345)
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order, deal=deal))
+
+    # Recovered (not dropped) and attributed to the parked entry.
+    assert out is not None
+    assert out.event_type == 'filled'
+    assert out.pine_id == 'pine1'
+    assert out.leg_type is LegType.ENTRY
+    # Broker refs backfilled so every LATER event + the reconcile snapshot can
+    # reverse-map, and the durable fill cursor advanced.
+    assert broker.store_ctx.find_by_ref('order_id', '111') is not None
+    assert broker.store_ctx.find_by_ref('position_id', '222') is not None
+    row = broker.store_ctx.get_order('c1')
+    assert row.state == 'confirmed'
+    assert row.filled_qty == 10.0
+    # The now-resolved park is dropped (a filled MARKET never re-surfaces in
+    # get_open_orders, so it would otherwise be replayed forever).
+    assert 'c1' not in broker.store_ctx.replay()[1]
+
+
+def __test_translate_external_fill_without_coid_still_dropped__(tmp_path):
+    # A fill that reverse-maps to no row this run placed (no coid echo, no ref)
+    # stays external — the coid fallback must not weaken the external-drop policy.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    order = _make_order(order_id=999, executed=1000, position_id=888,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order))
+    assert out is None
+
+
+def __test_translate_closing_fill_with_coid_not_recovered_as_entry__(tmp_path):
+    # The closingOrder guard keeps a coid match from ever reclassifying a close
+    # fill as an entry (a close carries no ProtoOAClosePositionReq clientOrderId,
+    # but lock the guard regardless).
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c2', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='pine2', pine_entry_id='pine2',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    mark_disposition_unknown(broker.store_ctx, coid='c2')
+    order = _make_order(order_id=222, executed=1000, position_id=333,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+                        closing=True)
+    order.clientOrderId = 'c2'
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order))
+    assert out is None
+    assert broker.store_ctx.find_by_ref('order_id', '222') is None
 
 
 # === state mapping ========================================================
