@@ -457,6 +457,26 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
             # account. A NETTING account leaves ``position_port`` None and keeps
             # the cheaper single-position ``execute_*`` path.
             self.position_port = self
+        # Persist-first crash recovery: resolve any dispatch row a crash left
+        # pending (submitted / disposition_unknown / server_ref_seen) against the
+        # broker's authoritative view, and retire startup orphans — BEFORE the
+        # engine's startup reconcile adopts the net position. Runs here (not the
+        # runner) so a HEDGED or NETTING account recovers identically; a no-op
+        # without persistence or a live connection.
+        #
+        # ONLY before the one-time startup adoption baseline. Recovery confirms a
+        # recovered fill WITHOUT emitting an OrderEvent and seeds
+        # ``_seen_deal_ids`` — that is only safe because the engine's startup
+        # ``reconcile`` adoption (which fires once, after this first ``connect``)
+        # folds the broker net into ``BrokerPosition.size``. ``connect`` is also
+        # re-entered on every live reconnect (``live_runner`` calls it again),
+        # where the engine does NOT re-run adoption; running recovery there would
+        # seed a fill into ``_seen_deal_ids`` (suppressing the PUSH replay) yet
+        # never apply it to the in-memory position. The periodic
+        # ``_reconcile_snapshot`` gap-filler — which DOES emit OrderEvents — owns
+        # the post-reconnect resolution instead.
+        if not self._adoption_baselined:
+            await self._recover_in_flight_submissions()
         # Reuse the demux queues across reconnects rather than replacing them.
         # ``watch_orders`` is consumed by ONE long-lived ``async for`` that
         # captures ``self._exec_events`` once and is never re-invoked on
@@ -635,6 +655,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
     ) -> '_oa.ProtoOAReconcileRes': ...
 
     def _reconcile_snapshot(self) -> 'AsyncIterator[OrderEvent]': ...
+
+    async def _recover_in_flight_submissions(self) -> None: ...
 
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...
 

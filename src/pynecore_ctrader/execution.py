@@ -52,6 +52,13 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
+    create_entry_order_row,
+    mark_disposition_unknown,
+    mark_rejected,
+)
 from pynecore.core.plugin import override
 
 from ._base import _CTraderBase
@@ -315,6 +322,10 @@ class _ExecutionMixin(_CTraderBase):
         )
         self._reject_out_of_range_entry(intent, rules, qty)
         volume = quantize_volume(qty, rules.step_volume)
+        qty_units = volume_to_units(volume)
+        entry_kind = (ENTRY_KIND_POSITION
+                      if intent.order_type == OrderType.MARKET
+                      else ENTRY_KIND_WORKING)
 
         req = _oa.ProtoOANewOrderReq(
             ctidTraderAccountId=self._live_account_id,
@@ -345,9 +356,55 @@ class _ExecutionMixin(_CTraderBase):
             req.stopPrice = round_price(intent.stop, rules.digits)
             req.timeInForce = _model.ProtoOATimeInForce.GOOD_TILL_CANCEL
 
-        event = await self._dispatch_order(req, coid=coid, context="entry")
+        # Persist-first: write the ``submitted`` row + audit BEFORE the wire send,
+        # so a crash between send and ack leaves a recoverable dispatch row keyed
+        # on the deterministic coid. ``_dispatch_order`` maps the wire failure
+        # modes to the broker taxonomy; the two terminal/pending classes advance
+        # the row in lock-step with the journal contract — a timeout / post-send
+        # drop is ``OrderDispositionUnknownError`` -> ``disposition_unknown`` for
+        # recovery, a definitive reject (incl. margin) is
+        # ``ExchangeOrderRejectedError`` -> ``rejected``. A pre-send
+        # ``ExchangeConnectionError`` / rate-limit propagates with the row left
+        # ``submitted`` (the order never reached the wire) for the next sync.
+        if self.store_ctx is not None:
+            create_entry_order_row(
+                self.store_ctx,
+                coid=coid,
+                symbol=intent.symbol,
+                side=intent.side,
+                qty=qty_units,
+                intent_key=intent.intent_key,
+                pine_entry_id=intent.pine_id,
+                kind=entry_kind,
+                order_type=intent.order_type.value,
+            )
+            self.store_ctx.log_event(
+                'dispatch_submitted', client_order_id=coid,
+                intent_key=intent.intent_key,
+                payload={'kind': entry_kind, 'order_type': intent.order_type.value},
+            )
+
+        try:
+            event = await self._dispatch_order(req, coid=coid, context="entry")
+        except OrderDispositionUnknownError as exc:
+            if self.store_ctx is not None:
+                mark_disposition_unknown(self.store_ctx, coid=coid)
+                self.store_ctx.log_event(
+                    'disposition_unknown', client_order_id=coid,
+                    intent_key=intent.intent_key,
+                    payload={'phase': 'submit', 'reason': str(exc)},
+                )
+            raise
+        except ExchangeOrderRejectedError as exc:
+            if self.store_ctx is not None:
+                mark_rejected(self.store_ctx, coid=coid)
+                self.store_ctx.log_event(
+                    'rejected', client_order_id=coid,
+                    intent_key=intent.intent_key,
+                    payload={'phase': 'submit', 'reason': str(exc)},
+                )
+            raise
         order = event.order
-        qty_units = volume_to_units(volume)
         filled = volume_to_units(order.executedVolume)
         self._persist_entry(coid, intent, order, qty_units, filled)
 

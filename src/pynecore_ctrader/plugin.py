@@ -17,7 +17,7 @@ from .config import CTraderConfig
 from .events import _EventStreamMixin
 from .execution import _ExecutionMixin
 from .provider import _ProviderMixin
-from .reconcile import _ReconcileMixin
+from .recovery import _RecoveryMixin
 from .state import _StateMixin
 
 if TYPE_CHECKING:
@@ -28,7 +28,7 @@ __all__ = ['CTrader', 'CTraderConfig']
 
 class CTrader(
     _EventStreamMixin,
-    _ReconcileMixin,
+    _RecoveryMixin,
     _ExecutionMixin,
     _StateMixin,
     _ProviderMixin,

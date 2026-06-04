@@ -153,8 +153,27 @@ class _StateMixin(_CTraderBase):
             extras = row.extras or {}
             order_id_str = extras.get('order_id')
             baseline: float | None = None
+            if extras.get('recovered_inconclusive'):
+                # In-flight recovery matched this row by coid but the deal-history
+                # read was inconclusive, so it stayed ``submitted`` with
+                # ``filled_qty`` unadvanced and NO ``dealId`` seeded into the shared
+                # de-dup. The refs it recorded would match this baseline's
+                # ``executedVolume`` (or, once shed from ``order[]``, the
+                # adopted-open ``position_id``) and silently raise the cursor — the
+                # later PUSH / reconcile replay of that same fill would then pass the
+                # deal-id filter and be applied a second time. Leave it untouched;
+                # the runtime reconcile re-entry advances it once, with the deal ids.
+                continue
             if order_id_str and int(order_id_str) in executed_by_order_id:
                 baseline = volume_to_units(executed_by_order_id[int(order_id_str)])
+            elif extras.get('recovered_partial_terminal'):
+                # In-flight recovery confirmed this row as a partially-filled
+                # TERMINAL LIMIT/STOP (cancelled / expired residual): the order is
+                # gone from ``order[]`` but only ``row.filled_qty`` actually filled
+                # into the adopted net, not ``row.qty``. The ``vanished order on an
+                # adopted-open position fully filled`` rule below would clobber that
+                # partial, so leave the recovered cursor untouched.
+                continue
             else:
                 position_id = extras.get('position_id')
                 if position_id and position_id in open_position_ids:

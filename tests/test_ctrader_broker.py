@@ -5,7 +5,11 @@ import asyncio
 
 import pytest
 
-from pynecore.core.broker.exceptions import OrderSkippedByPlugin
+from pynecore.core.broker.exceptions import (
+    ExchangeOrderRejectedError,
+    OrderDispositionUnknownError,
+    OrderSkippedByPlugin,
+)
 from pynecore.core.broker.models import (
     CapabilityLevel,
     CloseIntent,
@@ -16,6 +20,8 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.run_identity import RunIdentity
+from pynecore.core.broker.storage import BrokerStore
 
 from pynecore_ctrader import CTrader, CTraderConfig
 from pynecore_ctrader.exceptions import map_error_code
@@ -51,12 +57,21 @@ class _FakeBroker(CTrader):
         self.sent: list = []
         self._canned_event: _oa.ProtoOAExecutionEvent | None = None
         self._reconcile_res = reconcile
+        self._raise_on_dispatch: Exception | None = None
+        self.coid_at_dispatch: str | None = None
+        self.state_at_dispatch: str | None = None
 
     async def _get_symbol_rules(self, symbol: str) -> _SymbolRules:
         return _RULES
 
     async def _dispatch_order(self, req, *, coid, context):
         self.sent.append(req)
+        self.coid_at_dispatch = coid
+        if self.store_ctx is not None:
+            row = self.store_ctx.get_order(coid)
+            self.state_at_dispatch = row.state if row is not None else None
+        if self._raise_on_dispatch is not None:
+            raise self._raise_on_dispatch
         if self._canned_event is not None:
             return self._canned_event
         return _exec_event(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
@@ -197,6 +212,63 @@ def __test_entry_above_max_volume_skipped__():
     with pytest.raises(OrderSkippedByPlugin):
         asyncio.run(broker.execute_entry(_envelope(intent)))
     assert broker.sent == []
+
+
+# === execute_entry: persist-first dispatch rows ===========================
+
+def _open_store(tmp_path, broker) -> None:
+    """Attach an in-memory-backed BrokerStore run context to ``broker``."""
+    store = BrokerStore(tmp_path / "broker.sqlite", plugin_name=broker.plugin_name)
+    identity = RunIdentity(
+        strategy_id="persist", symbol="EURUSD", timeframe="60",
+        account_id="persist-account",
+    )
+    broker.store_ctx = store.open_run(identity, script_source="// persist")
+
+
+def _only_live_order(broker):
+    rows = list(broker.store_ctx.iter_live_orders())
+    assert len(rows) == 1
+    return rows[0]
+
+
+def __test_entry_persists_submitted_before_wire_send__(tmp_path):
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    intent = EntryIntent(pine_id="Long", symbol="EURUSD", side="buy",
+                         qty=10.0, order_type=OrderType.MARKET)
+    asyncio.run(broker.execute_entry(_envelope(intent)))
+    # The dispatch row already existed in ``submitted`` at the instant the
+    # wire send ran — persist-first ordering, not persist-after-ack.
+    assert broker.state_at_dispatch == 'submitted'
+    # ... and the ack promoted that same row to ``confirmed``.
+    assert _only_live_order(broker).state == 'confirmed'
+
+
+def __test_entry_timeout_marks_disposition_unknown__(tmp_path):
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    broker._raise_on_dispatch = OrderDispositionUnknownError(
+        "cTrader entry timed out; disposition unknown", client_order_id="x",
+    )
+    intent = EntryIntent(pine_id="Long", symbol="EURUSD", side="buy",
+                         qty=10.0, order_type=OrderType.MARKET)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.execute_entry(_envelope(intent)))
+    # The order may have reached the broker — keep the row for recovery.
+    assert _only_live_order(broker).state == 'disposition_unknown'
+
+
+def __test_entry_reject_marks_rejected__(tmp_path):
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    broker._raise_on_dispatch = ExchangeOrderRejectedError("cTrader rejected the order")
+    intent = EntryIntent(pine_id="Long", symbol="EURUSD", side="buy",
+                         qty=10.0, order_type=OrderType.MARKET)
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.execute_entry(_envelope(intent)))
+    # Definitive reject — the persist-first row lands terminal.
+    assert _only_live_order(broker).state == 'rejected'
 
 
 # === execute_exit / close: bracket + position close =======================
