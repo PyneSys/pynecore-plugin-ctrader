@@ -45,8 +45,26 @@ class CTraderWireError(ProviderError):
     """
 
 
+#: cTrader ``errorCode`` strings (the enum *names* the API returns) that mean a
+#: server-side connectivity / availability fault rather than a permanent,
+#: user-actionable error. A request that fails with one of these may well
+#: succeed once the broker's routing or maintenance window recovers, so the
+#: long-running ``--broker`` / ``--live`` startup waits and retries instead of
+#: halting. Kept deliberately narrow — auth, symbol and business-rule codes are
+#: NOT here, so they keep failing fast. ``CANT_ROUTE_REQUEST`` is the code
+#: Pepperstone returns while a broker backend is in maintenance.
+_CONNECTION_CLASS_CODES = frozenset({
+    'CANT_ROUTE_REQUEST',         # common: "Connection to Server is lost"
+    'TIMEOUT_ERROR',              # common: server-side execution timeout
+    'SERVER_IS_UNDER_MAINTENANCE',
+    'CH_SERVER_NOT_REACHABLE',    # "Trading service is not available"
+})
+
+
 class CTraderConnectionError(CTraderWireError):
     """The connection is not established or was lost."""
+
+    retryable: bool = True
 
 
 class CTraderRequestSentConnectionError(CTraderConnectionError):
@@ -66,6 +84,8 @@ class CTraderRequestSentConnectionError(CTraderConnectionError):
 class CTraderTimeoutError(CTraderWireError):
     """A request did not receive its correlated response in time."""
 
+    retryable: bool = True
+
 
 class CTraderProtocolError(CTraderWireError):
     """The server answered a request with an error response.
@@ -78,6 +98,16 @@ class CTraderProtocolError(CTraderWireError):
         self.error_code = error_code
         self.description = description
         super().__init__(f"{error_code}: {description}" if description else error_code)
+
+    @property
+    def retryable(self) -> bool:
+        """Whether this error is a transient server-side connectivity fault.
+
+        ``True`` only for the connectivity / maintenance codes in
+        :data:`_CONNECTION_CLASS_CODES`; auth, symbol and business-rule
+        rejections stay permanent so they fail fast.
+        """
+        return self.error_code in _CONNECTION_CLASS_CODES
 
 
 def _build_payload_type_map() -> dict[int, type[Message]]:

@@ -608,6 +608,45 @@ def __test_map_error_code_generic_reject__():
     assert isinstance(err, ExchangeOrderRejectedError)
 
 
+def __test_protocol_error_connection_class_is_retryable__():
+    """Server-side connectivity/maintenance codes mark the error transient."""
+    from pynecore.core.plugin import is_retryable_provider_error
+    for code in ('CANT_ROUTE_REQUEST', 'SERVER_IS_UNDER_MAINTENANCE',
+                 'CH_SERVER_NOT_REACHABLE', 'TIMEOUT_ERROR'):
+        err = CTraderProtocolError(code, 'broker maintenance')
+        assert err.retryable is True, code
+        assert is_retryable_provider_error(err) is True, code
+
+
+def __test_protocol_error_permanent_codes_not_retryable__():
+    """Symbol / auth / business rejections stay permanent: no retry."""
+    from pynecore.core.plugin import is_retryable_provider_error
+    for code in ('SYMBOL_NOT_FOUND', 'CH_CLIENT_AUTH_FAILURE', 'NOT_ENOUGH_MONEY'):
+        err = CTraderProtocolError(code)
+        assert err.retryable is False, code
+        assert is_retryable_provider_error(err) is False, code
+
+
+def __test_connection_and_timeout_errors_are_retryable__():
+    """Wire-level connection drops and timeouts are always transient."""
+    from pynecore.core.plugin import is_retryable_provider_error
+    from pynecore_ctrader.wire import CTraderConnectionError, CTraderTimeoutError
+    assert is_retryable_provider_error(CTraderConnectionError("lost")) is True
+    assert is_retryable_provider_error(CTraderTimeoutError("no reply")) is True
+
+
+def __test_protocol_error_retryable_survives_provider_error_wrap__():
+    """A wrapped CANT_ROUTE_REQUEST is still recognised as retryable."""
+    from pynecore.core.plugin import ProviderError, is_retryable_provider_error
+    try:
+        try:
+            raise CTraderProtocolError('CANT_ROUTE_REQUEST', 'maintenance')
+        except CTraderProtocolError as inner:
+            raise ProviderError("warmup download failed") from inner
+    except ProviderError as outer:
+        assert is_retryable_provider_error(outer) is True
+
+
 # === Cancel disposition idempotency (2.6) =================================
 # The engine's cancel-tentative state machine drives a working order's cancel
 # to resolution by RE-invoking execute_cancel_with_outcome each reconcile
