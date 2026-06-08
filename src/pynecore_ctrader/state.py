@@ -94,10 +94,12 @@ class _StateMixin(_CTraderBase):
         :return: The ``ProtoOAReconcileRes`` for the live account.
         :raises CTraderConnectionError: If the live connection is not open.
         """
-        wire = self._wire
-        if wire is None or self._live_account_id is None:
+        if self._wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
-        return cast(_oa.ProtoOAReconcileRes, await wire.send_request(
+        # Route through ``_account_request`` so a mid-session account de-auth is
+        # transparently re-authorized and the (idempotent) snapshot retried,
+        # rather than raising a raw protocol error that crashes the dispatch.
+        return cast(_oa.ProtoOAReconcileRes, await self._account_request(
             _oa.ProtoOAReconcileReq(
                 ctidTraderAccountId=self._live_account_id,
                 returnProtectionOrders=return_protection_orders,
@@ -206,7 +208,7 @@ class _StateMixin(_CTraderBase):
         wire = self._wire
         if wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
-        await self._fetch_light_symbols(wire, self._live_account_id)
+        await self._fetch_light_symbols(wire, self._live_account_id, recover=True)
         return self._symbols_by_name.get(symbol)
 
     async def get_open_orders(
@@ -348,22 +350,24 @@ class _StateMixin(_CTraderBase):
         wire = self._wire
         if wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
-        res = cast(_oa.ProtoOATraderRes, await wire.send_request(
+        res = cast(_oa.ProtoOATraderRes, await self._account_request(
             _oa.ProtoOATraderReq(ctidTraderAccountId=self._live_account_id)
         ))
         trader = res.trader
         money_digits = trader.moneyDigits
         balance = money_value(trader.balance, money_digits)
-        currency = await self._deposit_asset_name(wire, trader.depositAssetId)
+        currency = await self._deposit_asset_name(trader.depositAssetId)
         return {currency: balance}
 
-    async def _deposit_asset_name(self, wire, asset_id: int) -> str:
+    async def _deposit_asset_name(self, asset_id: int) -> str:
         """Resolve the deposit-asset name from the asset list (best-effort).
 
         Falls back to the stringified asset id when the list does not contain
-        the asset, so :meth:`get_balance` always returns a usable key.
+        the asset, so :meth:`get_balance` always returns a usable key. Routed
+        through :meth:`_account_request` so a mid-session de-auth on this
+        account-scoped read is recovered, not leaked as a raw protocol error.
         """
-        res = cast(_oa.ProtoOAAssetListRes, await wire.send_request(
+        res = cast(_oa.ProtoOAAssetListRes, await self._account_request(
             _oa.ProtoOAAssetListReq(ctidTraderAccountId=self._live_account_id)
         ))
         for asset in res.asset:

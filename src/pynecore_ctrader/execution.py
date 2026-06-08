@@ -107,11 +107,11 @@ class _ExecutionMixin(_CTraderBase):
         if wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
         if symbol not in self._symbols_by_name:
-            await self._fetch_light_symbols(wire, self._live_account_id)
+            await self._fetch_light_symbols(wire, self._live_account_id, recover=True)
         symbol_id = self._symbols_by_name.get(symbol)
         if symbol_id is None:
             raise ExchangeOrderRejectedError(f"cTrader: unknown symbol {symbol!r}")
-        detail_res = cast(_oa.ProtoOASymbolByIdRes, await wire.send_request(
+        detail_res = cast(_oa.ProtoOASymbolByIdRes, await self._account_request(
             _oa.ProtoOASymbolByIdReq(
                 ctidTraderAccountId=self._live_account_id, symbolId=[symbol_id],
             )
@@ -192,11 +192,14 @@ class _ExecutionMixin(_CTraderBase):
         :param context: Short label for the ambiguous-timeout message.
         :return: The acknowledging ``ProtoOAExecutionEvent``.
         """
-        wire = self._wire
-        if wire is None:
-            raise CTraderConnectionError("live connection not established")
         try:
-            message = await wire.send_request(req)
+            # ``_account_request`` transparently re-authorizes a mid-session
+            # account de-auth and re-sends once. That is safe here: an
+            # auth-loss error is a definitive server *rejection* (the response
+            # proves the order never executed), so re-sending the same
+            # ``client_order_id`` cannot duplicate. A failed recovery surfaces
+            # as ``ExchangeConnectionError`` (the reconnect path), not a reject.
+            message = await self._account_request(req)
         except CTraderProtocolError as exc:
             raise map_protocol_error(exc) from exc
         except CTraderTimeoutError as exc:

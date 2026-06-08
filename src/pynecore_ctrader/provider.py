@@ -142,12 +142,18 @@ class _ProviderMixin(_CTraderBase):
         return cast(list[str], self._run(self._authed_session(work)))
 
     async def _fetch_light_symbols(
-        self, wire, account_id: int
+        self, wire, account_id: int, *, recover: bool = False
     ) -> list[_model.ProtoOALightSymbol]:
-        """Fetch the account's light-symbol list and cache name -> id."""
-        response = await wire.send_request(
-            _oa.ProtoOASymbolsListReq(ctidTraderAccountId=account_id)
-        )
+        """Fetch the account's light-symbol list and cache name -> id.
+
+        :param recover: When ``True`` (the live order / state paths, where
+            ``wire`` is the persistent connection) route the account-scoped
+            request through :meth:`_account_request` so a mid-session de-auth is
+            recovered instead of leaking a raw protocol error. The one-shot CLI
+            paths leave it ``False`` (they run on a private, just-authed wire).
+        """
+        req = _oa.ProtoOASymbolsListReq(ctidTraderAccountId=account_id)
+        response = await (self._account_request(req) if recover else wire.send_request(req))
         response = cast(_oa.ProtoOASymbolsListRes, response)
         symbols = list(response.symbol)
         self._symbols_by_name = {s.symbolName: s.symbolId for s in symbols}

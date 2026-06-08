@@ -31,14 +31,21 @@ from typing import TYPE_CHECKING, cast
 
 from google.protobuf.message import Message
 
+from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.types.ohlcv import OHLCV
 
 from . import auth, helpers, session
 from .config import CTraderConfig
+from .exceptions import is_account_auth_lost, is_client_auth_lost, is_token_invalid
 from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
-from .wire import CTraderProtocolError, WireClient
+from .wire import (
+    CTraderConnectionError,
+    CTraderProtocolError,
+    CTraderTimeoutError,
+    WireClient,
+)
 
 if TYPE_CHECKING:
     from pynecore.core.broker.models import (
@@ -51,6 +58,16 @@ if TYPE_CHECKING:
     from .models import _SymbolRules
 
 logger = logging.getLogger(__name__)
+
+#: Hard ceiling on a single mid-session account re-authorization (token refresh
+#: + app/account auth round-trips). A recovery that overruns is cancelled —
+#: releasing :attr:`_reauth_lock` (so a stalled re-auth cannot wedge the lock
+#: and cascade-stall every subsequent operational call) and surfacing a
+#: recoverable ``ExchangeConnectionError`` the engine parks. Bounds the lock
+#: hold and the re-auth phase only, NOT the whole dispatch round-trip (the
+#: original failing send and the post-recovery retry have their own wire
+#: timeouts) — it is the lock-cascade guard, not a dispatch-deadline guarantee.
+_REAUTH_TIMEOUT = 20.0
 
 
 class _CTraderBase(BrokerPlugin[CTraderConfig]):
@@ -180,6 +197,23 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         #: is never re-emitted on top of the adopted size. See
         #: ``_StateMixin._apply_adoption_baseline``.
         self._adoption_baselined: bool = False
+        #: Serializes mid-session account re-authorization. cTrader can drop
+        #: this channel's account session while the socket stays up (another
+        #: connection claimed the account, a server-side recycle). Every
+        #: operational coroutine runs on ONE broker event loop, so concurrent
+        #: dispatch / state-query / reconcile-pass calls could each observe the
+        #: loss and each re-send ``ProtoOAAccountAuthReq``; this lock plus the
+        #: generation counter collapse that into a single re-auth. Built here
+        #: (sync, off-loop); ``asyncio.Lock`` binds to the running loop on first
+        #: await, always the broker loop.
+        self._reauth_lock = asyncio.Lock()
+        #: Bumped on every successful re-auth. A caller captures it before
+        #: awaiting the lock; if it changed once the lock is held, another
+        #: caller already re-won the session and this one skips its own re-auth.
+        self._reauth_generation: int = 0
+        #: Background task for an event-triggered (proactive) re-auth, so the
+        #: event router never blocks on the handshake; one in flight at a time.
+        self._reauth_task: asyncio.Task | None = None
 
     # --- credentials --------------------------------------------------------
 
@@ -266,6 +300,309 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
                 _oa.ProtoOAAccountAuthReq(ctidTraderAccountId=account_id, accessToken=token)
             )
         await self._token_call(wire, call)
+
+    # --- mid-session account re-authorization recovery ----------------------
+
+    async def _send_account_auth(self, wire: WireClient) -> None:
+        """Re-send ``ProtoOAAccountAuthReq`` for the resolved live account.
+
+        ``ALREADY_LOGGED_IN`` means the channel already holds this account's
+        session (it was re-won, or never lost from the wire's view) — a success,
+        not a failure. Any other protocol error propagates.
+
+        :param wire: The live, application-authenticated connection.
+        """
+        try:
+            await wire.send_request(_oa.ProtoOAAccountAuthReq(
+                ctidTraderAccountId=self._live_account_id,
+                accessToken=self._tokens.access_token,
+            ))
+        except CTraderProtocolError as exc:
+            if exc.error_code == 'ALREADY_LOGGED_IN':
+                return
+            raise
+
+    async def _refresh_and_persist(self, wire: WireClient) -> None:
+        """Refresh the access token on the socket and persist the rotated pair.
+
+        Shielded from the recovery budget's cancellation: the outer
+        :data:`_REAUTH_TIMEOUT` (20s) is shorter than the wire request timeout
+        (:data:`~pynecore_ctrader.helpers.REQUEST_TIMEOUT`, 30s), so an unshielded
+        refresh could be cancelled mid-flight after its
+        ``ProtoOARefreshTokenReq`` was sent. If the response then arrives carrying
+        a *rotated* refresh token, dropping it would leave the on-disk refresh
+        token stale and break every later auth until a manual re-consent. The
+        shield lets the in-flight refresh finish and assign+save the rotated pair
+        even when the budget cancels the surrounding re-auth; the refresh stays
+        bounded by the wire's own request timeout, so the shield cannot run
+        unbounded and re-wedge the lock.
+
+        :param wire: The live, application-authenticated connection.
+        """
+        async def refresh() -> None:
+            self._tokens = await auth.refresh_via_socket(wire, self._tokens.refresh_token)
+            session.save_session(self._tokens, demo=self._demo)
+
+        task = asyncio.ensure_future(refresh())
+        # When the await below completes normally its result/exception is already
+        # retrieved by that frame. When the budget cancels it, the task keeps
+        # running detached to persist a rotated token; this callback retrieves a
+        # late detached failure so it does not surface as an unhandled-task
+        # warning (the next operational request re-drives recovery anyway).
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        await asyncio.shield(task)
+
+    async def _reauth_account(
+        self, *, force_refresh: bool = False, reauth_app: bool = False,
+        seen_generation: int | None = None,
+    ) -> None:
+        """Re-win the account session on the LIVE wire (mid-session recovery).
+
+        Targets the already-resolved :attr:`_live_account_id` with a direct
+        ``ProtoOAAccountAuthReq`` — NOT :meth:`_full_handshake`, which would
+        re-enumerate accounts and could mutate the plugin identity. The access
+        token is kept (it is usually still valid); a token refresh is a fallback
+        used only when ``force_refresh`` is set (a token-invalidated push) or the
+        re-auth itself reports a token error. When the loss is an APPLICATION
+        (client) channel loss, the application is re-authenticated first
+        (``reauth_app``, or on demand if the account auth reports a client
+        error) — an account cannot be authorized on a de-authenticated client.
+
+        Serialized by :attr:`_reauth_lock`; the generation check collapses a
+        burst of concurrent callers into one re-auth: a caller that observed the
+        loss passes the generation it saw, and skips its own re-auth if another
+        caller already bumped it.
+
+        :param force_refresh: Refresh the access token before re-authorizing.
+        :param reauth_app: Re-send ``ProtoOAApplicationAuthReq`` first (client
+            channel loss).
+        :param seen_generation: The :attr:`_reauth_generation` the caller saw
+            before awaiting; ``None`` to always attempt (proactive path).
+        :raises CTraderConnectionError: If the live connection is gone.
+        :raises CTraderProtocolError: If the re-auth (and its fallbacks) fails.
+        """
+        async with self._reauth_lock:
+            if seen_generation is not None and seen_generation != self._reauth_generation:
+                # Another caller already re-won the session since the loss was seen.
+                return
+            wire = self._wire
+            if wire is None or self._live_account_id is None:
+                raise CTraderConnectionError("live connection not established")
+            if reauth_app:
+                await self._app_auth(wire)
+            if force_refresh and self._tokens.refresh_token:
+                try:
+                    await self._refresh_and_persist(wire)
+                except CTraderProtocolError as exc:
+                    # ``ProtoOARefreshTokenReq`` needs an application-authenticated
+                    # socket. A token-invalid loss can coincide with the client
+                    # channel also being de-authenticated (or it goes between the
+                    # push and this re-auth), so the refresh itself is rejected as
+                    # a client-auth loss. Re-authenticate the application once,
+                    # then refresh — otherwise this would surface as a needless
+                    # ``ExchangeConnectionError`` (heavy full reconnect) for a loss
+                    # the in-place re-auth can restore.
+                    if not reauth_app and is_client_auth_lost(exc.error_code):
+                        reauth_app = True
+                        await self._app_auth(wire)
+                        await self._refresh_and_persist(wire)
+                    else:
+                        raise
+            try:
+                await self._send_account_auth(wire)
+            except CTraderProtocolError as exc:
+                # The account auth itself reports the token is invalid: refresh
+                # once on the socket and re-auth with the fresh token.
+                if (not force_refresh and self._tokens.refresh_token
+                        and is_token_invalid(exc.error_code)):
+                    await self._refresh_and_persist(wire)
+                    await self._send_account_auth(wire)
+                # The account auth is rejected because the application channel is
+                # de-authenticated: re-authenticate the application, then re-auth.
+                elif not reauth_app and is_client_auth_lost(exc.error_code):
+                    await self._app_auth(wire)
+                    await self._send_account_auth(wire)
+                else:
+                    raise
+            self._reauth_generation += 1
+            logger.info("cTrader account re-authorized on the live connection")
+
+    async def _recover_account_session(
+        self, exc: CTraderProtocolError, seen_generation: int,
+    ) -> None:
+        """Re-win the account session after an auth-loss error, or surface it.
+
+        On failure — or if the recovery overruns :data:`_REAUTH_TIMEOUT` — the
+        loss is raised as the recoverable :class:`ExchangeConnectionError` so the
+        engine's reconnect/reconcile path takes over rather than a raw protocol
+        error crashing the run. The bounded wait cancels a stalled recovery so it
+        releases :attr:`_reauth_lock` (preventing a lock-cascade stall) instead
+        of holding it indefinitely. The caller retries its (idempotent) request
+        once this returns normally; for an order write the original send was a
+        definitive rejection (nothing executed), so surfacing the loss here
+        without the retry is safe — the next bar re-dispatches.
+
+        :param exc: The auth-loss protocol error that triggered recovery.
+        :param seen_generation: The :attr:`_reauth_generation` the caller read
+            BEFORE issuing the request that lost the session — passed through to
+            :meth:`_reauth_account` for single-flight coalescing. Captured at
+            issue time (not here) so a request whose auth-loss arrives late, after
+            a concurrent caller already re-won the session and bumped the
+            generation, still observes the stale value and coalesces instead of
+            launching a redundant second recovery.
+        :raises ExchangeConnectionError: If the session could not be re-won.
+        """
+        try:
+            await asyncio.wait_for(
+                self._reauth_account(
+                    force_refresh=is_token_invalid(exc.error_code),
+                    reauth_app=is_client_auth_lost(exc.error_code),
+                    seen_generation=seen_generation,
+                ),
+                timeout=_REAUTH_TIMEOUT,
+            )
+        except (CTraderProtocolError, CTraderConnectionError, CTraderTimeoutError,
+                asyncio.TimeoutError) as reauth_exc:
+            raise ExchangeConnectionError(
+                "cTrader account authorization was lost and could not be restored"
+            ) from reauth_exc
+
+    @staticmethod
+    def _account_auth_loss(message: Message) -> CTraderProtocolError | None:
+        """Return the auth-loss error a *successful* response actually carries.
+
+        An account de-auth on an order WRITE is not always raised as a
+        ``ProtoOAErrorRes`` (which :meth:`WireClient.send_request` maps to
+        :class:`CTraderProtocolError`): cTrader answers the failed
+        ``ProtoOANewOrderReq`` with a *correlated* reject — either a
+        ``ProtoOAOrderErrorEvent`` or a ``ProtoOAExecutionEvent`` with
+        ``executionType == ORDER_REJECTED`` / a set ``errorCode`` — whose code is
+        the loss (``ACCOUNT_NOT_AUTHORIZED`` / ``CH_CLIENT_NOT_AUTHENTICATED``).
+        Either comes back as the request's normal return value, so without this
+        check it would skip recovery and be mapped to a permanent reject —
+        dropping a live order the session could re-win. Normalize it into the
+        same :class:`CTraderProtocolError` the recovery path keys on (the reject
+        is definitive, so a re-send after re-auth cannot duplicate).
+
+        :param message: A response returned (not raised) by ``send_request``.
+        :return: The synthesized protocol error, or ``None`` if not an auth loss.
+        """
+        if isinstance(message, _oa.ProtoOAOrderErrorEvent):
+            error_code, description = message.errorCode, message.description
+        elif isinstance(message, _oa.ProtoOAExecutionEvent) and message.errorCode:
+            error_code, description = message.errorCode, ""
+        else:
+            return None
+        if not is_account_auth_lost(error_code, description):
+            return None
+        return CTraderProtocolError(error_code, description)
+
+    async def _account_request(self, req: Message) -> Message:
+        """Send an account-scoped request, recovering from a mid-session de-auth.
+
+        On an "account not authorized" error the socket is still up (only this
+        channel's account session was dropped), so the session is re-won on the
+        same wire and the request is retried once. A failed recovery surfaces as
+        :class:`ExchangeConnectionError`, never a raw protocol error.
+
+        The loss arrives two ways and both are recovered: as a raised
+        :class:`CTraderProtocolError` (an error RESPONSE), or — for an order
+        write — as a correlated ``ProtoOAOrderErrorEvent`` *returned* by
+        ``send_request`` (see :meth:`_account_auth_loss`).
+
+        The request is re-sent verbatim, so use this ONLY for requests that are
+        safe to repeat: idempotent reads, and order WRITES whose auth-loss was a
+        definitive server *rejection* (an error response proves nothing
+        executed, so re-sending the same ``client_order_id`` cannot duplicate).
+
+        :param req: The request message; re-sent unchanged on retry.
+        :return: The successful response.
+        :raises ExchangeConnectionError: If the session could not be re-won.
+        """
+        wire = self._wire
+        if wire is None:
+            raise CTraderConnectionError("live connection not established")
+        # Capture the re-auth generation BEFORE issuing the request: if this send
+        # loses the session and its rejection arrives late — after a concurrent
+        # caller already re-won the session and bumped the generation — recovery
+        # must still see this pre-send value so it coalesces into the completed
+        # re-auth rather than launching a redundant second one (which, on a
+        # client-channel loss, would re-app-auth an already-authenticated channel).
+        seen_generation = self._reauth_generation
+        try:
+            response = await wire.send_request(req)
+            loss = self._account_auth_loss(response)
+            if loss is None:
+                return response
+            exc = loss
+        except CTraderProtocolError as protocol_exc:
+            if not is_account_auth_lost(protocol_exc.error_code, protocol_exc.description):
+                raise
+            exc = protocol_exc
+        await self._recover_account_session(exc, seen_generation)
+        wire = self._wire
+        if wire is None:
+            raise ExchangeConnectionError(
+                "cTrader live connection not established") from exc
+        try:
+            response = await wire.send_request(req)
+        except CTraderProtocolError as retry_exc:
+            # The session was re-won, but the re-sent request hit a fresh
+            # auth-loss — the very condition being handled (another
+            # connection / server recycle) can recur immediately. Surface it
+            # as the recoverable connection error the engine parks, never a
+            # raw protocol error that crashes the run. Non-auth protocol
+            # errors (a genuine reject) still propagate to the caller's map.
+            if is_account_auth_lost(retry_exc.error_code, retry_exc.description):
+                raise ExchangeConnectionError(
+                    "cTrader account authorization could not be restored"
+                ) from retry_exc
+            raise
+        # A retry that comes back as another correlated auth-loss order event
+        # (not raised) is the same recurring loss — surface it as recoverable.
+        if self._account_auth_loss(response) is not None:
+            raise ExchangeConnectionError(
+                "cTrader account authorization could not be restored") from exc
+        return response
+
+    def _schedule_reauth(self, *, force_refresh: bool, reauth_app: bool = False) -> None:
+        """Proactively re-win the account session off a server de-auth push.
+
+        Runs as a background task so the event router never blocks on the
+        handshake, and coalesces a burst of pushes into one in-flight re-auth.
+        Failures are swallowed (logged): the next operational request retries
+        and surfaces an unrecovered loss as :class:`ExchangeConnectionError`.
+
+        :param force_refresh: Refresh the token first (token-invalidated push).
+        :param reauth_app: Re-authenticate the application channel first
+            (client-disconnect push — all account sessions are terminated).
+        """
+        if self._reauth_task is not None and not self._reauth_task.done():
+            return
+        self._reauth_task = asyncio.create_task(
+            self._proactive_reauth(force_refresh=force_refresh, reauth_app=reauth_app),
+            name="ctrader-reauth",
+        )
+
+    async def _proactive_reauth(self, *, force_refresh: bool, reauth_app: bool = False) -> None:
+        """Background re-auth body: best-effort, never raises to the router.
+
+        Bounded by :data:`_REAUTH_TIMEOUT` for the same reason the reactive path
+        is: this task holds :attr:`_reauth_lock` while it runs, and a slow cTrader
+        (app auth / token refresh / account auth round-trips, each up to the wire
+        request timeout) would otherwise wedge the lock far beyond the recovery
+        budget — stalling every foreground :meth:`_account_request` that hits an
+        auth loss and waits on the same lock, so they keep parking even though the
+        socket is up. An overrun is cancelled (releasing the lock) and logged; the
+        next operational request retries and surfaces an unrecovered loss.
+        """
+        try:
+            await asyncio.wait_for(
+                self._reauth_account(force_refresh=force_refresh, reauth_app=reauth_app),
+                timeout=_REAUTH_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 - proactive; error path owns recovery
+            logger.warning("cTrader proactive re-authorization failed: %s", exc)
 
     async def _broker_name(self, wire: WireClient, account_id: int) -> str:
         """Fetch the broker whitelabel slug for an authorized account.
@@ -504,12 +841,27 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         wire = self._wire
         self._wire = None
         self._live_account_id = None
+        # Stop the event router FIRST: its de-auth branches schedule a re-auth
+        # task with no await between the check and ``create_task``, so once the
+        # router is gone no new re-auth task can appear. THEN sweep the re-auth
+        # slot — covering both an in-flight task and any the router spawned
+        # during its own cancellation. Reversing the order would let a queued
+        # de-auth push spawn a fresh, unsupervised re-auth task during the
+        # router's teardown await.
         task = self._event_router_task
         self._event_router_task = None
         if task is not None:
             task.cancel()
             try:
                 await task
+            except asyncio.CancelledError:
+                pass
+        reauth_task = self._reauth_task
+        self._reauth_task = None
+        if reauth_task is not None and not reauth_task.done():
+            reauth_task.cancel()
+            try:
+                await reauth_task
             except asyncio.CancelledError:
                 pass
         if wire is not None:
@@ -569,7 +921,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
 
         Unsolicited messages neither surface consumes (e.g. symbol-change
         events) are dropped; execution events are never dropped — the order
-        queue is unbounded and ``watch_orders`` empties it eagerly.
+        queue is unbounded and ``watch_orders`` empties it eagerly. The server's
+        de-authorization pushes (account-disconnect / token-invalidated /
+        client-disconnect) proactively schedule a re-auth so the session is
+        re-won before the next request would fail — handled non-blockingly so
+        the queue keeps draining.
         """
         spot = self._spot_events
         execq = self._exec_events
@@ -593,6 +949,36 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
                                  or message.ctidTraderAccountId
                                  == self._live_account_id)):
                         execq.put_nowait(message)
+                elif isinstance(message, _oa.ProtoOAAccountDisconnectEvent):
+                    # The account's session was dropped on this channel while the
+                    # socket stays up; re-send ProtoOAAccountAuthReq to re-win it.
+                    if message.ctidTraderAccountId == self._live_account_id:
+                        logger.warning(
+                            "cTrader pushed account-disconnect; "
+                            "re-authorizing the live session")
+                        self._schedule_reauth(force_refresh=False)
+                elif isinstance(message, _oa.ProtoOAAccountsTokenInvalidatedEvent):
+                    # The access token is no longer valid for these accounts;
+                    # refresh the token before re-authorizing. ctidTraderAccountIds
+                    # is a repeated field — match by membership.
+                    if self._live_account_id in message.ctidTraderAccountIds:
+                        logger.warning(
+                            "cTrader pushed token-invalidated (%s); refreshing "
+                            "the token and re-authorizing", message.reason or "")
+                        self._schedule_reauth(force_refresh=True)
+                elif isinstance(message, _oa.ProtoOAClientDisconnectEvent):
+                    # Channel-wide disconnect (no account id): the server
+                    # cancelled the APPLICATION connection, so ALL account
+                    # sessions are terminated. Re-authenticate the application
+                    # first, then the account — a bare account re-auth would be
+                    # rejected on a de-authenticated client. If recovery keeps
+                    # failing (e.g. an admin block) the loss surfaces on the next
+                    # operational request and the transport reconnect takes over.
+                    logger.warning(
+                        "cTrader pushed client-disconnect (%s); re-authenticating "
+                        "the application and re-authorizing the session",
+                        message.reason or "")
+                    self._schedule_reauth(force_refresh=False, reauth_app=True)
         except asyncio.CancelledError:
             raise
 
@@ -652,7 +1038,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
     # ``self.<name>`` against another's implementation without analyser
     # warnings. The real method always wins at runtime via the MRO.
 
-    async def _fetch_light_symbols(self, wire, account_id: int) -> list: ...
+    async def _fetch_light_symbols(
+        self, wire, account_id: int, *, recover: bool = False,
+    ) -> list: ...
 
     async def _get_symbol_rules(self, symbol: str) -> '_SymbolRules': ...
 
