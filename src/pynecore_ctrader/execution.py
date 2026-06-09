@@ -193,13 +193,17 @@ class _ExecutionMixin(_CTraderBase):
         :return: The acknowledging ``ProtoOAExecutionEvent``.
         """
         try:
-            # ``_account_request`` transparently re-authorizes a mid-session
+            # ``_account_request_raw`` transparently re-authorizes a mid-session
             # account de-auth and re-sends once. That is safe here: an
             # auth-loss error is a definitive server *rejection* (the response
             # proves the order never executed), so re-sending the same
             # ``client_order_id`` cannot duplicate. A failed recovery surfaces
             # as ``ExchangeConnectionError`` (the reconnect path), not a reject.
-            message = await self._account_request(req)
+            # The ``_raw`` variant is used so a wire connection loss / timeout
+            # reaches the disposition-unknown classifiers below unconverted —
+            # the converting ``_account_request`` would mask the post-write
+            # ambiguity and risk the engine duplicating an accepted order.
+            message = await self._account_request_raw(req)
         except CTraderProtocolError as exc:
             raise map_protocol_error(exc) from exc
         except CTraderTimeoutError as exc:

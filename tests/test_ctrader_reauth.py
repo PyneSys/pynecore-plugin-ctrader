@@ -5,7 +5,10 @@ import asyncio
 
 import pytest
 
-from pynecore.core.broker.exceptions import ExchangeConnectionError
+from pynecore.core.broker.exceptions import (
+    ExchangeConnectionError,
+    OrderDispositionUnknownError,
+)
 
 from pynecore_ctrader import CTrader, CTraderConfig
 from pynecore_ctrader import auth
@@ -16,7 +19,12 @@ from pynecore_ctrader.exceptions import (
 )
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
-from pynecore_ctrader.wire import CTraderProtocolError
+from pynecore_ctrader.wire import (
+    CTraderConnectionError,
+    CTraderProtocolError,
+    CTraderRequestSentConnectionError,
+    CTraderTimeoutError,
+)
 
 
 # === Fakes ================================================================
@@ -335,6 +343,51 @@ def __test_dispatch_order_unrecoverable_surfaces_connection_error__():
     req = _oa.ProtoOANewOrderReq(ctidTraderAccountId=999, clientOrderId='abc')
 
     with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker._dispatch_order(req, coid='abc', context='entry'))
+
+
+# === Connection loss (socket drop, not de-auth) ===========================
+
+
+def __test_read_connection_loss_after_send_surfaces_exchange_connection_error__():
+    # The reported crash: the net drops mid-sync, so a reconcile READ raises the
+    # wire's CTraderRequestSentConnectionError. It must surface as the recoverable
+    # ExchangeConnectionError the engine parks (retry next bar) — NOT a raw wire
+    # error that escapes the broker_sync park and crashes the run. No re-auth is
+    # attempted: the socket is gone, not the account session.
+    wire = _ReauthWire().script(
+        _oa.ProtoOAReconcileReq, CTraderRequestSentConnectionError("connection lost"),
+    )
+    broker = _ReauthBroker(wire)
+
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker._reconcile())
+    assert wire.account_auth_calls == 0
+
+
+def __test_read_pre_write_drop_and_timeout_surface_exchange_connection_error__():
+    # A clean pre-write CTraderConnectionError and a wire CTraderTimeoutError on an
+    # idempotent read are equally recoverable — both park as ExchangeConnectionError.
+    for wire_error in (CTraderConnectionError("not connected"),
+                       CTraderTimeoutError("no response within 30s")):
+        wire = _ReauthWire().script(_oa.ProtoOAReconcileReq, wire_error)
+        broker = _ReauthBroker(wire)
+        with pytest.raises(ExchangeConnectionError):
+            asyncio.run(broker._reconcile())
+
+
+def __test_order_dispatch_connection_loss_after_send_stays_disposition_unknown__():
+    # The write path must NOT be converted to ExchangeConnectionError by the read
+    # wrapper: a drop AFTER an order write was sent is ambiguous (cTrader may hold
+    # it), so it stays OrderDispositionUnknownError. A blanket connection error
+    # here would let the engine re-dispatch and duplicate the order.
+    wire = _ReauthWire().script(
+        _oa.ProtoOANewOrderReq, CTraderRequestSentConnectionError("connection lost"),
+    )
+    broker = _ReauthBroker(wire)
+    req = _oa.ProtoOANewOrderReq(ctidTraderAccountId=999, clientOrderId='abc')
+
+    with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker._dispatch_order(req, coid='abc', context='entry'))
 
 

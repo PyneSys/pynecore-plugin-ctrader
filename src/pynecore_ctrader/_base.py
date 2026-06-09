@@ -498,12 +498,44 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         return CTraderProtocolError(error_code, description)
 
     async def _account_request(self, req: Message) -> Message:
+        """Send an account-scoped request, parking a transient connection loss.
+
+        Wraps :meth:`_account_request_raw` (mid-session de-auth re-auth + single
+        retry) and translates a wire-level connection loss / timeout into the
+        recoverable :class:`ExchangeConnectionError` the engine parks. A net drop
+        during the per-bar broker sync — the reconcile / balance reads and the
+        symbol-rule / open-position prefetch — then retries on the next bar
+        instead of crashing the run with a raw ``CTraderConnectionError``
+        (including its :class:`CTraderRequestSentConnectionError` subclass).
+
+        The order-SEND path calls :meth:`_account_request_raw` directly: it must
+        see the raw ``CTraderTimeoutError`` / ``CTraderRequestSentConnectionError``
+        to classify an ambiguous post-write drop as disposition-unknown — a
+        blanket ``ExchangeConnectionError`` here would let the engine retry and
+        duplicate an order cTrader may already hold. Reads are idempotent, so the
+        conversion carries no such ambiguity.
+
+        :param req: The request message; re-sent unchanged on retry.
+        :return: The successful response.
+        :raises ExchangeConnectionError: On an unrecovered connection loss.
+        """
+        try:
+            return await self._account_request_raw(req)
+        except (CTraderConnectionError, CTraderTimeoutError) as exc:
+            raise ExchangeConnectionError(str(exc) or "connection lost") from exc
+
+    async def _account_request_raw(self, req: Message) -> Message:
         """Send an account-scoped request, recovering from a mid-session de-auth.
 
         On an "account not authorized" error the socket is still up (only this
         channel's account session was dropped), so the session is re-won on the
         same wire and the request is retried once. A failed recovery surfaces as
         :class:`ExchangeConnectionError`, never a raw protocol error.
+
+        A wire-level connection loss / timeout is propagated raw (NOT mapped to
+        ``ExchangeConnectionError``) so the order-send path can classify a
+        post-write drop as disposition-unknown; read / prefetch callers go
+        through the converting :meth:`_account_request` instead.
 
         The loss arrives two ways and both are recovered: as a raised
         :class:`CTraderProtocolError` (an error RESPONSE), or — for an order
