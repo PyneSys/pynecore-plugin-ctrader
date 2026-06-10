@@ -29,6 +29,7 @@ from pynecore.types.ohlcv import OHLCV
 from . import auth
 from ._base import _CTraderBase
 from .config import CTraderConfig
+from .helpers import VOLUME_SCALE
 from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
 from .wire import CTraderConnectionError
@@ -229,6 +230,13 @@ class _ProviderMixin(_CTraderBase):
         if basecurrency is not None and measurement and measurement != basecurrency:
             basecurrency = None
 
+        # ``stepVolume`` / ``minVolume`` are centi-units (helpers.VOLUME_SCALE):
+        # the step is the order quantity grid (TV's mincontract), the minimum
+        # is the fallback for brokers that omit the step. 0.0 lets the provider
+        # chain fall back to volume analysis / heuristics.
+        raw_step = detail.stepVolume or detail.minVolume
+        mincontract = raw_step / VOLUME_SCALE if raw_step else 0.0
+
         return SymInfo(
             prefix='CTRADER',
             description=light.description or light.symbolName,
@@ -244,6 +252,7 @@ class _ProviderMixin(_CTraderBase):
             # point value is 1.0. ``detail.lotSize`` is the lot volume in
             # centi-units (order sizing), not a Pine point value.
             pointvalue=1.0,
+            mincontract=mincontract,
             timezone=self.timezone,
             opening_hours=opening_hours,
             session_starts=session_starts,
