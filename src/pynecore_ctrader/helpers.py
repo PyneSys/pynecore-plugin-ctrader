@@ -34,6 +34,14 @@ MAX_MESSAGE_LENGTH = 15_000_000
 #: further under the limit.
 HEARTBEAT_INTERVAL = 10.0
 
+#: Declare the connection dead after this many seconds without ANY inbound
+#: traffic. The proto comments designate the server's ``ProtoHeartbeatEvent``
+#: pushes as the connection-health criterion; their cadence is undocumented
+#: (~25-30 s observed on an otherwise idle connection), so 90 s — roughly
+#: three missed server heartbeats — flags a half-open socket (router / NAT
+#: drop) that plain TCP writability checks never notice.
+INBOUND_IDLE_TIMEOUT = 90.0
+
 #: Default timeout, in seconds, for a request awaiting its correlated response.
 REQUEST_TIMEOUT = 30.0
 

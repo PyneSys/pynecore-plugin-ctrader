@@ -140,6 +140,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
 
         # Live-streaming state (filled by ``watch_ohlcv``).
         self._subscribed_symbols: set[str] = set()
+        #: The ``(symbol, timeframe)`` the live feed should be subscribed to.
+        #: Recorded by the first successful subscribe and NEVER cleared on
+        #: reconnect — it is the desired-subscription record, not connection
+        #: state — so ``on_reconnect`` can replay the subscription on the
+        #: fresh wire outside the framework's ``watch_ohlcv`` timeout budget.
+        self._live_subscription: tuple[str, str] | None = None
         self._watch_symbol_id: int | None = None
         self._pending_bars: deque[OHLCV] = deque()
         self._current_bar: OHLCV | None = None
@@ -185,6 +191,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         #: warning to once per row until the re-check resolves. See
         #: ``_ReconcileMixin._warn_inconclusive_grace_recheck``.
         self._inconclusive_grace_warned: set[str] = set()
+        #: Consecutive failed reconcile passes. Rate-limits the transient-
+        #: failure warning (the pass runs every ~5 s, so a network outage
+        #: would otherwise warn 12×/minute) and lets the recovery line report
+        #: how many passes the outage cost. See
+        #: ``_EventStreamMixin._run_reconcile_pass``.
+        self._reconcile_fail_streak: int = 0
         #: Position ids whose pyramid-sharing was already audit-logged, so the
         #: ``ctrader_position_id_shared`` warning fires once per position per run
         #: rather than per linking entry. See :meth:`_link_position_ref`.
@@ -814,6 +826,33 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         that demultiplexes the shared ``wire.events`` queue into the spot and
         execution streams.
         """
+        # Subscriptions are CONNECTION-scoped server state: a fresh TCP
+        # session starts with no spot / live-trendbar subscriptions, whatever
+        # the previous connection held. Clearing the guard set makes the
+        # subscription replay (``on_reconnect`` / the lazy subscribe in
+        # ``watch_ohlcv``) re-send SubscribeSpots + SubscribeLiveTrendbar on
+        # the new wire — without it a reconnect leaves the data feed
+        # permanently silent while ``is_connected`` reports healthy. Quotes
+        # queued by the previous connection are dropped along with the
+        # per-bar bid/ask accumulators. The bar-in-progress state
+        # (``_current_bar`` / ``_current_bar_ts`` / ``_pending_bars``) is
+        # cleared too: if the outage crossed a timeframe boundary, the first
+        # trendbar on the fresh subscription would otherwise see its newer
+        # timestamp finalize the stale pre-disconnect partial as a CLOSED bar
+        # (with no fresh spot close), emitting incomplete OHLCV for the
+        # boundary instead of leaving it to be backfilled / synthesized. Runs
+        # BEFORE the first ``await`` so a connect() that fails mid-handshake
+        # can never leave the previous connection's subscription state looking
+        # current.
+        self._subscribed_symbols.clear()
+        if self._spot_events is not None:
+            while not self._spot_events.empty():
+                self._spot_events.get_nowait()
+        self._last_bid = None
+        self._ask_bar = None
+        self._current_bar = None
+        self._current_bar_ts = None
+        self._pending_bars.clear()
         self._wire = self._make_wire()
         await self._wire.connect()
         # ``_full_handshake`` also latches the plugin-qualified

@@ -16,7 +16,6 @@ All cTrader trendbar prices are integers in units of 1/100000; the low carries
 the absolute price and open/high/close are non-negative deltas above it.
 """
 import logging
-from collections import deque
 from datetime import datetime, time, timedelta, timezone
 from typing import Callable, cast
 from zoneinfo import ZoneInfo
@@ -32,7 +31,7 @@ from .config import CTraderConfig
 from .helpers import VOLUME_SCALE
 from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
-from .wire import CTraderConnectionError
+from .wire import CTraderConnectionError, CTraderProtocolError
 
 logger = logging.getLogger(__name__)
 
@@ -498,6 +497,64 @@ class _ProviderMixin(_CTraderBase):
 
     # --- live OHLCV ---------------------------------------------------------
 
+    async def _subscribe_live(self, symbol: str, timeframe: str) -> None:
+        """Subscribe spot quotes + live trendbars for the watched symbol.
+
+        Tolerant of a half-completed earlier attempt: ``watch_ohlcv`` runs
+        under the framework's ``asyncio.wait_for`` budget, so a subscribe
+        request can reach the server while the coroutine is cancelled
+        awaiting the response — the server-side subscription then exists
+        with no local record, and the blind replay here would otherwise be
+        rejected with ``ALREADY_SUBSCRIBED`` (cTrader subscribes are not
+        idempotent). That state is exactly what we want, so the error is
+        treated as success (mirroring ``ALREADY_LOGGED_IN`` in
+        ``_send_account_auth``). On success the ``(symbol, timeframe)`` pair
+        is recorded in ``_live_subscription`` so :meth:`on_reconnect` can
+        replay it on a fresh connection.
+
+        :param symbol: The cTrader symbol name.
+        :param timeframe: Timeframe in TradingView format.
+        :raises CTraderConnectionError: If the live connection is not open.
+        """
+        wire = self._wire
+        if wire is None or self._live_account_id is None:
+            raise CTraderConnectionError("live connection not established")
+        symbol_id = await self._resolve_symbol_id(wire, self._live_account_id)
+        period = _model.ProtoOATrendbarPeriod.Value(self.to_exchange_timeframe(timeframe))
+        for request in (
+            _oa.ProtoOASubscribeSpotsReq(
+                ctidTraderAccountId=self._live_account_id, symbolId=[symbol_id],
+            ),
+            _oa.ProtoOASubscribeLiveTrendbarReq(
+                ctidTraderAccountId=self._live_account_id, period=period,
+                symbolId=symbol_id,
+            ),
+        ):
+            try:
+                await wire.send_request(request)
+            except CTraderProtocolError as exc:
+                if exc.error_code != 'ALREADY_SUBSCRIBED':
+                    raise
+        self._subscribed_symbols.add(symbol)
+        self._watch_symbol_id = symbol_id
+        self._live_subscription = (symbol, timeframe)
+
+    @override
+    async def on_reconnect(self) -> None:
+        """Replay the live subscription on the fresh connection.
+
+        Subscriptions are connection-scoped server state, and the lazy
+        subscribe in :meth:`watch_ohlcv` runs under the framework's
+        ``asyncio.wait_for`` budget — which pins at its 50 ms floor during
+        the post-outage synth catch-up, far too short for the subscribe
+        round-trips. The framework awaits this hook OUTSIDE any timeout
+        right after a successful ``connect()``, so the replay gets a full
+        request budget here and the first ``watch_ohlcv`` call finds
+        ``_subscribed_symbols`` already populated.
+        """
+        if self._live_subscription is not None:
+            await self._subscribe_live(*self._live_subscription)
+
     @override
     async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
         """Return the next live OHLCV update from the spot/trendbar feed.
@@ -518,16 +575,7 @@ class _ProviderMixin(_CTraderBase):
             raise CTraderConnectionError("live connection not established")
 
         if symbol not in self._subscribed_symbols:
-            symbol_id = await self._resolve_symbol_id(wire, self._live_account_id)
-            period = _model.ProtoOATrendbarPeriod.Value(self.to_exchange_timeframe(timeframe))
-            await wire.send_request(_oa.ProtoOASubscribeSpotsReq(
-                ctidTraderAccountId=self._live_account_id, symbolId=[symbol_id],
-            ))
-            await wire.send_request(_oa.ProtoOASubscribeLiveTrendbarReq(
-                ctidTraderAccountId=self._live_account_id, period=period, symbolId=symbol_id,
-            ))
-            self._subscribed_symbols.add(symbol)
-            self._watch_symbol_id = symbol_id
+            await self._subscribe_live(symbol, timeframe)
 
         spot_events = self._spot_events
         if spot_events is None:

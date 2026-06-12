@@ -119,6 +119,14 @@ class _EventStreamMixin(_CTraderBase):
         propagates so the engine performs its graceful stop — swallowing it
         would strand the strategy out of sync. ``asyncio.CancelledError`` is a
         ``BaseException`` and so still propagates for a clean teardown.
+
+        The transient-failure warning is rate-limited on the failure streak:
+        the pass runs every ~5 s, so a plain network outage would otherwise
+        repeat the same line 12×/minute for its whole duration. The first
+        failure of a streak warns, then one reminder every 60 failures
+        (~5 minutes); the rest log at DEBUG. The line that closes the streak
+        ("recovered after N failed passes") is WARNING again so the recovery
+        is visible at the same console level as the failure it answers.
         """
         try:
             async for event in self._reconcile_snapshot():
@@ -128,7 +136,19 @@ class _EventStreamMixin(_CTraderBase):
         except BrokerManualInterventionError:
             raise
         except Exception as exc:  # noqa: BLE001 - gap-filler must not kill the PUSH stream
-            logger.warning("cTrader reconcile pass failed (transient): %s", exc)
+            self._reconcile_fail_streak += 1
+            streak = self._reconcile_fail_streak
+            log = (logger.warning if streak == 1 or streak % 60 == 0
+                   else logger.debug)
+            log("cTrader reconcile pass failed (transient, %d consecutive): %s",
+                streak, exc)
+        else:
+            if self._reconcile_fail_streak:
+                logger.warning(
+                    "cTrader reconcile recovered after %d failed pass(es)",
+                    self._reconcile_fail_streak,
+                )
+                self._reconcile_fail_streak = 0
 
     def _translate_exec_event(self, message) -> OrderEvent | None:
         """Translate one execution / order-error message into an OrderEvent.

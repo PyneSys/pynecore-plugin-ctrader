@@ -13,7 +13,11 @@ A single persistent connection that speaks the cTrader wire protocol:
   awaits the response carrying it; unsolicited messages (spot/execution events,
   and any response with no matching pending request) go to :attr:`WireClient.events`.
 - Keepalive: an idle-aware heartbeat task sends a ``ProtoHeartbeatEvent`` after a
-  period of send-inactivity, and inbound heartbeats are echoed.
+  period of send-inactivity, and inbound heartbeats are echoed. The same task
+  watches inbound inactivity: the server heartbeats an idle connection, so a
+  stretch of total inbound silence past
+  :data:`~pynecore_ctrader.helpers.INBOUND_IDLE_TIMEOUT` means a dead (often
+  half-open) socket and the connection is closed so the owner can reconnect.
 
 Reconnection is intentionally *not* handled here: the
 :class:`~pynecore.core.plugin.LiveProviderPlugin` base owns that, driving
@@ -172,6 +176,7 @@ class WireClient:
         self._pending: dict[str, asyncio.Future[Message]] = {}
         self._msg_id = 0
         self._last_send = 0.0
+        self._last_recv = 0.0
         self._send_lock = asyncio.Lock()
         #: Queue of unsolicited inbound messages (events and orphan responses).
         self.events: asyncio.Queue[Message] = asyncio.Queue()
@@ -187,7 +192,9 @@ class WireClient:
         self._reader, self._writer = await asyncio.open_connection(
             self._host, self._port, ssl=ssl_context
         )
-        self._last_send = asyncio.get_running_loop().time()
+        now = asyncio.get_running_loop().time()
+        self._last_send = now
+        self._last_recv = now
         self._recv_task = asyncio.create_task(self._recv_loop(), name="ctrader-wire-recv")
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(), name="ctrader-wire-heartbeat"
@@ -330,6 +337,7 @@ class WireClient:
                         f"inbound frame {length} > {helpers.MAX_MESSAGE_LENGTH}",
                     )
                 body = await reader.readexactly(length)
+                self._last_recv = asyncio.get_running_loop().time()
                 envelope = _common.ProtoMessage()
                 envelope.ParseFromString(body)
                 if envelope.payloadType == _HEARTBEAT_TYPE:
@@ -366,12 +374,30 @@ class WireClient:
         self.events.put_nowait(message)
 
     async def _heartbeat_loop(self) -> None:
-        """Send a heartbeat after each period of send-inactivity (ping cadence)."""
+        """Send a heartbeat after each period of send-inactivity (ping cadence).
+
+        Doubles as the inbound-inactivity watchdog: the server heartbeats an
+        otherwise idle connection, so total inbound silence past
+        :data:`~pynecore_ctrader.helpers.INBOUND_IDLE_TIMEOUT` means the
+        connection is dead even when the socket still reports writable — the
+        half-open-TCP case (router restart, NAT timeout) where sends keep
+        "succeeding" into the void. The socket is closed so
+        :attr:`is_connected` flips to ``False`` and the owning provider's
+        reconnect machinery takes over.
+        """
         interval = helpers.HEARTBEAT_INTERVAL
         loop = asyncio.get_running_loop()
         try:
             while True:
                 await asyncio.sleep(interval)
+                inbound_idle = loop.time() - self._last_recv
+                if inbound_idle >= helpers.INBOUND_IDLE_TIMEOUT:
+                    logger.warning(
+                        "cTrader wire: no inbound traffic for %.0fs; "
+                        "closing dead connection", inbound_idle,
+                    )
+                    self._close_writer()
+                    return
                 if loop.time() - self._last_send >= interval:
                     try:
                         await self._send_message(_common.ProtoHeartbeatEvent())
