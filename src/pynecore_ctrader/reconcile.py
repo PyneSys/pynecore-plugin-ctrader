@@ -473,6 +473,13 @@ class _ReconcileMixin(_CTraderBase):
             # cursor / position link are now consistent, so emit nothing.
             return None
         self._seen_deal_ids.update(new_deal_ids)
+        if cumulative - row.filled_qty <= 1e-9:
+            # The recovered deals are new to ``_seen_deal_ids`` (now seeded) but
+            # the cumulative they sum to is already covered by the durable cursor
+            # (a prior PUSH / reconcile counted this progress). Emitting here
+            # would yield a zero-qty fill that ``record_fill`` ignores while the
+            # engine still runs its post-fill side effects — seed the ids and stop.
+            return None
         # ``fill_price`` is what ``BrokerPosition.record_fill`` books the whole
         # recovered quantity at, so it must be the volume-weighted average across
         # the order's FILLED deals — a single deal's ``executionPrice`` would

@@ -340,6 +340,9 @@ def __test_translate_entry_fill__():
     assert out.fill_price == 1.2345
     assert out.fill_qty == 10.0
     assert out.fee == 0.12
+    # The broker-native dealId is stamped as the canonical fill_id so the
+    # engine's duplicate-fill gate can drop a redelivered copy of this fill.
+    assert out.fill_id == "5"
 
 
 @pytest.mark.parametrize("exec_type,expected", [
@@ -402,6 +405,84 @@ def __test_translate_recovers_parked_entry_fill_by_coid__(tmp_path):
     # The now-resolved park is dropped (a filled MARKET never re-surfaces in
     # get_open_orders, so it would otherwise be replayed forever).
     assert 'c1' not in broker.store_ctx.replay()[1]
+
+
+def __test_translate_suppresses_push_already_counted_by_reconcile__(tmp_path):
+    """A PUSH entry fill whose cumulative the reconcile working-row path already
+    counted (durable cursor ahead) is suppressed — not re-applied — while later
+    genuine progress still emits.
+
+    The reconcile working-row path advances the filled_qty cursor from
+    order.executedVolume but cannot enumerate deals, so it never seeds
+    _seen_deal_ids; a delayed PUSH for that same slice would otherwise double-
+    apply in record_fill. The cursor snapshot at event entry catches it.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='pine1', pine_entry_id='pine1',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    # Reconcile already counted 6 units of the entry: order_id ref + cursor at 6.
+    broker.store_ctx.add_ref('c1', 'order_id', '111')
+    broker.store_ctx.set_filled('c1', 6.0)
+
+    # Delayed PUSH for that same 6-unit progress (executedVolume=600 == cursor).
+    order = _make_order(order_id=111, executed=600, position_id=222,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+    deal = _model.ProtoOADeal(dealId=7, filledVolume=600, executionPrice=1.2345)
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_PARTIAL_FILL, order=order, deal=deal))
+    assert out is None  # suppressed — reconcile already counted this cumulative
+    assert 7 in broker._seen_deal_ids  # recorded so a later PUSH replay is caught too
+
+    # A genuinely new slice (cumulative 6 -> 10) still emits its delta.
+    order2 = _make_order(order_id=111, executed=1000, position_id=222,
+                         status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    deal2 = _model.ProtoOADeal(dealId=8, filledVolume=400, executionPrice=1.2360)
+    out2 = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order2, deal=deal2))
+    assert out2 is not None
+    assert out2.event_type == 'filled'
+    assert out2.fill_qty == 4.0
+    assert out2.fill_id == "8"
+
+
+def __test_translate_malformed_push_does_not_burn_dealid__(tmp_path):
+    """A malformed PUSH (no executionPrice, which record_fill ignores) must not
+    burn its dealId or advance the cursor, so a corrected redelivery carrying the
+    same dealId still applies.
+
+    The plugin records a dealId and touches the fill cursor only for a fill it
+    will actually apply (mirrors the engine's _is_duplicate_fill gate).
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='pine1', pine_entry_id='pine1',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    broker.store_ctx.add_ref('c1', 'order_id', '111')
+
+    order = _make_order(order_id=111, executed=1000, position_id=222,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    # Malformed: dealId present but no execution price -> record_fill ignores it.
+    bad_deal = _model.ProtoOADeal(dealId=9, filledVolume=1000, executionPrice=0.0)
+    broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order, deal=bad_deal))
+    assert 9 not in broker._seen_deal_ids
+    assert broker.store_ctx.get_order('c1').filled_qty == 0.0  # cursor not advanced
+
+    # Corrected redelivery with the SAME dealId -> applied (not dropped/suppressed).
+    good_deal = _model.ProtoOADeal(dealId=9, filledVolume=1000, executionPrice=1.2345)
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order, deal=good_deal))
+    assert out is not None
+    assert out.event_type == 'filled'
+    assert out.fill_qty == 10.0
+    assert out.fill_id == "9"
 
 
 def __test_translate_external_fill_without_coid_still_dropped__(tmp_path):

@@ -167,24 +167,46 @@ class _EventStreamMixin(_CTraderBase):
             return None
 
         order = message.order
+        # Snapshot the entry fill cursor BEFORE recovery / fill processing
+        # mutates it (e.g. _recover_parked_entry_by_coid sets filled_qty as a
+        # side effect), so the ENTRY-fill suppress below can tell a reconcile
+        # pass that already counted this cumulative — cursor ahead at event
+        # entry — from this event's own first-time recording.
+        prior_entry_filled = self._entry_fill_cursor(order)
         deal = message.deal if message.HasField('deal') else None
-        if deal is not None:
+        if deal is not None and deal.dealId in self._seen_deal_ids:
             # The dispatch path re-injects the correlated fill that
             # ``send_request`` consumed; cTrader may ALSO push an uncorrelated
-            # copy. Both carry the same ``dealId`` — record the fill once.
-            if deal.dealId in self._seen_deal_ids:
-                return None
-            self._seen_deal_ids.add(deal.dealId)
+            # copy. Both carry the same ``dealId`` — drop the second. The id is
+            # recorded below, only for a fill we will actually apply.
+            return None
         exch_order = self._order_from_proto(order)
 
         fill_price: float | None = None
         fill_qty: float | None = None
+        fill_id: str | None = None
         fee = 0.0
         fee_currency = ''
         timestamp = epoch_time()
         if deal is not None:
             fill_price = deal.executionPrice or None
             fill_qty = volume_to_units(deal.filledVolume)
+            # ``dealId`` is the broker-native per-execution id. It is canonical
+            # across the PUSH copy and the correlated dispatch-response copy of
+            # the same fill (both carry it; ``_seen_deal_ids`` above drops the
+            # second locally), so the engine's duplicate-fill gate keys on it as
+            # a final backstop if the local dedup ever misses (e.g. ``deal``
+            # delivered without passing this branch). The cumulative-only
+            # reconcile/bridge paths cannot reproduce a single dealId per emitted
+            # slice and intentionally leave ``fill_id`` unset, relying on the
+            # persisted ``filled_qty`` cursor instead.
+            fill_id = str(deal.dealId)
+            # Remember the dealId only for a fill we will actually apply, so a
+            # malformed delivery (no volume / price, which record_fill ignores)
+            # does not burn the id and drop a corrected redelivery carrying the
+            # same dealId. Mirrors the engine's _is_duplicate_fill gate.
+            if (fill_qty or 0.0) > 0.0 and (fill_price or 0.0) > 0.0:
+                self._seen_deal_ids.add(deal.dealId)
             fee = money_value(deal.commission, deal.moneyDigits)
             if deal.executionTimestamp:
                 timestamp = deal.executionTimestamp / 1000.0
@@ -222,7 +244,24 @@ class _EventStreamMixin(_CTraderBase):
                     },
                 )
                 return None
-        if event_type in ('filled', 'partial') and leg_type is LegType.ENTRY:
+        if (event_type in ('filled', 'partial') and leg_type is LegType.ENTRY
+                and (fill_qty or 0.0) > 0.0 and (fill_price or 0.0) > 0.0):
+            # Only a fill record_fill will actually apply touches the cursor:
+            # a malformed slice (no volume / price) must neither advance the
+            # cursor (it would desync the watermark and suppress a corrected
+            # redelivery) nor be suppressed by it.
+            if (prior_entry_filled is not None
+                    and volume_to_units(order.executedVolume)
+                    <= prior_entry_filled + 1e-9):
+                # A reconcile working-row pass already counted this entry-fill
+                # cumulative straight from ``order.executedVolume`` (the cursor
+                # was ahead at event entry). That path cannot enumerate deals, so
+                # it never seeded ``_seen_deal_ids`` — and the dealId guard above
+                # only catches a PUSH-vs-PUSH replay. Re-emitting the slice would
+                # double-apply it in ``record_fill``. The dealId is now in
+                # ``_seen_deal_ids`` (added above), so any later copy of this
+                # same deal is caught by that guard too.
+                return None
             self._advance_fill_cursor(order)
         if (event_type == 'filled' and order.closingOrder
                 and self._position_is_flat(message)):
@@ -241,6 +280,7 @@ class _EventStreamMixin(_CTraderBase):
             leg_type=leg_type,
             fee=fee,
             fee_currency=fee_currency,
+            fill_id=fill_id,
         )
 
     def _order_from_proto(self, order) -> ExchangeOrder:
@@ -358,6 +398,21 @@ class _EventStreamMixin(_CTraderBase):
             return None
         row = self.store_ctx.find_by_ref('order_id', str(order.orderId))
         return row.client_order_id if row is not None else None
+
+    def _entry_fill_cursor(self, order) -> float | None:
+        """Snapshot the entry row's durable ``filled_qty`` cursor by order id.
+
+        Returns ``None`` when no cursor is resolvable (store off, no order id,
+        or the row is not reverse-mapped by ``order_id`` yet — e.g. a parked
+        entry recovered by ``clientOrderId`` only). Read BEFORE this event
+        mutates any row state so the caller can tell a reconcile pass that
+        already counted this cumulative (cursor ahead) from this event's own
+        first-time recording.
+        """
+        if self.store_ctx is None or not order.orderId:
+            return None
+        row = self.store_ctx.find_by_ref('order_id', str(order.orderId))
+        return row.filled_qty if row is not None else None
 
     def _advance_fill_cursor(self, order) -> None:
         """Advance the entry row's durable ``filled_qty`` to the PUSH cumulative.
