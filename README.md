@@ -7,9 +7,10 @@ since they all speak the same Open API.
 
 ## Status
 
-Early development. The first milestone is the **data provider**
-(`LiveProviderPlugin`): OAuth2 authentication, symbol mapping, and historical
-plus live OHLCV. Live order execution (`BrokerPlugin`) follows.
+Both the **data provider** (`LiveProviderPlugin`) and **live order execution**
+(`BrokerPlugin`) are implemented: OAuth2 authentication, symbol mapping,
+historical plus live OHLCV, and position-based order routing with server-side
+stop-loss / take-profit / trailing stop.
 
 ## Architecture
 
@@ -22,9 +23,10 @@ plus live OHLCV. Live order execution (`BrokerPlugin`) follows.
   client id and secret; the end user grants account access in the browser and
   the plugin stores the refreshable access token.
 - **Market data**: historical trendbars and live spot/trendbar subscriptions.
-- **Order model** (later milestone): position-based with server-side
-  stop-loss / take-profit / trailing stop as position attributes; netting
-  (one-way) accounts.
+- **Order model**: position-based with server-side stop-loss / take-profit /
+  trailing stop as position attributes. Netting (one-way) accounts use the
+  direct execution path; hedging accounts run through PyneCore's one-way
+  emulation layer, so Pine one-way semantics hold on both.
 
 ## License
 
