@@ -16,12 +16,14 @@ All cTrader trendbar prices are integers in units of 1/100000; the low carries
 the absolute price and open/high/close are non-negative deltas above it.
 """
 import logging
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable, cast
 from zoneinfo import ZoneInfo
 
 from pynecore.core.plugin import override, Broker
-from pynecore.core.syminfo import SymInfo, SymInfoInterval, SymInfoSession
+from pynecore.core.syminfo import (
+    SymInfo, SymInfoInterval, SymInfoScheduleVariant, SymInfoSession,
+)
 from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
@@ -37,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 #: cTrader prices are integers in units of 1/100000 of the quote currency.
 _PRICE_SCALE = 100000.0
+
+#: How far back the weekly schedule is re-rendered when building the
+#: effective-dated session history (DST-correct backtest sessions).
+_SCHEDULE_HISTORY_YEARS = 5
 
 #: TradingView timeframe -> ``ProtoOATrendbarPeriod`` enum name.
 _TV_TO_PERIOD = {
@@ -209,9 +215,8 @@ class _ProviderMixin(_CTraderBase):
         mintick = 10 ** -digits
         pricescale = 10 ** digits
 
-        opening_hours, session_starts, session_ends = self._schedule_to_sessions(
-            list(detail.schedule), detail.scheduleTimeZone
-        )
+        opening_hours, session_starts, session_ends, session_schedules = \
+            self._schedule_to_sessions(list(detail.schedule), detail.scheduleTimeZone)
 
         # ``basecurrency`` must be a genuine currency: PyneCore treats the
         # ``(basecurrency, currency)`` tuple strictly as an FX pair for
@@ -256,23 +261,38 @@ class _ProviderMixin(_CTraderBase):
             opening_hours=opening_hours,
             session_starts=session_starts,
             session_ends=session_ends,
+            session_schedules=session_schedules,
         )
 
     def _schedule_to_sessions(
         self, schedule: list[_model.ProtoOAInterval], schedule_tz: str
-    ) -> tuple[list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]]:
+    ) -> tuple[list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession],
+               list[SymInfoScheduleVariant]]:
         """Map cTrader's weekly schedule to PyneCore sessions.
 
         Each :class:`ProtoOAInterval` is given in seconds from Sunday 00:00 in
-        ``schedule_tz`` (start inclusive, end exclusive). The interval is anchored
-        on the current week's Sunday (so the active DST offset applies), shifted
-        into ``self.timezone`` and split at local midnight so a session that
-        straddles midnight matches candles on both local weekdays — the same
-        shape the session checker expects.
+        ``schedule_tz`` (start inclusive, end exclusive). An interval is anchored
+        on a week's Sunday, shifted into ``self.timezone`` and split at local
+        midnight so a session that straddles midnight matches candles on both
+        local weekdays — the same shape the session checker expects.
+
+        The rendered wall-clock times depend on the UTC-offset relationship of
+        the two zones at that instant, so weeks on opposite sides of a DST
+        transition render an hour apart. Anchoring everything on the current
+        week would bake the current offsets into all of history; instead every
+        week of the past :data:`_SCHEDULE_HISTORY_YEARS` years is rendered on
+        its own Sunday anchor and each change opens a new effective-dated
+        :class:`SymInfoScheduleVariant`. The flat lists are the current week's
+        rendering (== the newest variant); when every week renders identically
+        (both zones keep the same offset relationship year-round) the history
+        is empty. Future transitions are deliberately not emitted: the flat
+        fields feed live-session checks and must mirror "now", and the info is
+        re-fetched on every data update anyway.
 
         :param schedule: The weekly trading intervals.
         :param schedule_tz: The IANA zone the intervals are expressed in.
-        :return: ``(opening_hours, session_starts, session_ends)``.
+        :return: ``(opening_hours, session_starts, session_ends,
+            session_schedules)``.
         """
         try:
             src = ZoneInfo(schedule_tz) if schedule_tz else ZoneInfo('UTC')
@@ -280,33 +300,53 @@ class _ProviderMixin(_CTraderBase):
             src = ZoneInfo('UTC')
         dst = ZoneInfo(self.timezone)
 
-        now_src = datetime.now(src)
-        days_since_sunday = (now_src.weekday() + 1) % 7
-        sunday = datetime.combine(
-            (now_src - timedelta(days=days_since_sunday)).date(), time(0, 0), tzinfo=src
-        )
+        def render_week(sunday_date: date) -> tuple[
+                list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]]:
+            sunday = datetime.combine(sunday_date, time(0, 0), tzinfo=src)
+            opening_hours: list[SymInfoInterval] = []
+            session_starts: list[SymInfoSession] = []
+            session_ends: list[SymInfoSession] = []
+            for interval in schedule:
+                start_dt = (sunday + timedelta(seconds=interval.startSecond)).astimezone(dst)
+                end_dt = (sunday + timedelta(seconds=interval.endSecond)).astimezone(dst)
+                if end_dt <= start_dt:
+                    continue
+                session_starts.append(
+                    SymInfoSession(day=start_dt.weekday(), time=start_dt.time()))
+                session_ends.append(SymInfoSession(day=end_dt.weekday(), time=end_dt.time()))
+                cursor = start_dt
+                while cursor < end_dt:
+                    day_end = datetime.combine(cursor.date(), time(23, 59, 59), tzinfo=dst)
+                    seg_end = min(end_dt, day_end)
+                    opening_hours.append(SymInfoInterval(
+                        day=cursor.weekday(), start=cursor.time(), end=seg_end.time(),
+                    ))
+                    cursor = datetime.combine(
+                        (cursor + timedelta(days=1)).date(), time(0, 0), tzinfo=dst
+                    )
+            return opening_hours, session_starts, session_ends
 
-        opening_hours: list[SymInfoInterval] = []
-        session_starts: list[SymInfoSession] = []
-        session_ends: list[SymInfoSession] = []
-        for interval in schedule:
-            start_dt = (sunday + timedelta(seconds=interval.startSecond)).astimezone(dst)
-            end_dt = (sunday + timedelta(seconds=interval.endSecond)).astimezone(dst)
-            if end_dt <= start_dt:
-                continue
-            session_starts.append(SymInfoSession(day=start_dt.weekday(), time=start_dt.time()))
-            session_ends.append(SymInfoSession(day=end_dt.weekday(), time=end_dt.time()))
-            cursor = start_dt
-            while cursor < end_dt:
-                day_end = datetime.combine(cursor.date(), time(23, 59, 59), tzinfo=dst)
-                seg_end = min(end_dt, day_end)
-                opening_hours.append(SymInfoInterval(
-                    day=cursor.weekday(), start=cursor.time(), end=seg_end.time(),
+        now_src = datetime.now(src)
+        this_sunday = (now_src - timedelta(days=(now_src.weekday() + 1) % 7)).date()
+
+        variants: list[SymInfoScheduleVariant] = []
+        prev: tuple | None = None
+        for weeks_back in range(_SCHEDULE_HISTORY_YEARS * 52, -1, -1):
+            week_sunday = this_sunday - timedelta(days=7 * weeks_back)
+            rendered = render_week(week_sunday)
+            if rendered != prev:
+                anchor = datetime.combine(week_sunday, time(0, 0), tzinfo=src)
+                variants.append(SymInfoScheduleVariant(
+                    effective_from=anchor.astimezone(dst).date(),
+                    opening_hours=rendered[0],
+                    session_starts=rendered[1],
+                    session_ends=rendered[2],
                 ))
-                cursor = datetime.combine(
-                    (cursor + timedelta(days=1)).date(), time(0, 0), tzinfo=dst
-                )
-        return opening_hours, session_starts, session_ends
+                prev = rendered
+
+        newest = variants[-1]
+        history = variants if len(variants) > 1 else []
+        return newest.opening_hours, newest.session_starts, newest.session_ends, history
 
     # --- historical OHLCV ---------------------------------------------------
 
