@@ -99,7 +99,15 @@ def quantize_volume(units: float, step_volume: int) -> int:
     """
     raw = units * VOLUME_SCALE
     if step_volume > 0:
-        return int(round(raw / step_volume) * step_volume)
+        quantized = int(round(raw / step_volume) * step_volume)
+        if quantized == 0 and raw > 0:
+            # A nonzero accepted request must never emit a zero-volume
+            # order. Reachable only on a venue quoting
+            # ``minVolume < stepVolume / 2`` (the min/max gate runs on the
+            # raw centi-units BEFORE quantization) — snap up to the
+            # smallest venue-valid multiple instead.
+            return step_volume
+        return quantized
     return int(round(raw))
 
 

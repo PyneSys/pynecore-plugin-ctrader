@@ -133,6 +133,19 @@ def __test_quantize_volume_snaps_to_step__():
     assert quantize_volume(7.0, 0) == 700
 
 
+def __test_quantize_volume_never_rounds_nonzero_to_zero__():
+    """A nonzero request below step/2 snaps UP to one step, never to 0.
+
+    Reachable only on a venue quoting ``minVolume < stepVolume / 2`` (the
+    min/max gate runs on the raw centi-units before quantization); a
+    zero-volume ``ProtoOANewOrderReq`` must never be emitted.
+    """
+    # 4 units -> 400 centi, below step/2 of 1000 -> snapped up, not to 0.
+    assert quantize_volume(4.0, 1000) == 1000
+    # A genuinely zero request stays zero.
+    assert quantize_volume(0.0, 1000) == 0
+
+
 def __test_volume_round_trip__():
     assert volume_to_units(1000) == 10.0
     assert volume_to_units(2500) == 25.0
