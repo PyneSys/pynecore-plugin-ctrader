@@ -42,6 +42,7 @@ from pynecore.core.broker.idempotency import (
     KIND_MODIFY_EXIT,
 )
 from pynecore.core.broker.models import (
+    BracketAttachRejectContext,
     CancelDispositionOutcome,
     CancelIntent,
     CloseIntent,
@@ -462,6 +463,15 @@ class _ExecutionMixin(_CTraderBase):
         # it avoids client-skew; fall back to the client clock when the ack
         # carried no timestamp. The bridge subtracts its own safety skew.
         submitted_at_ms = order.utcLastUpdateTimestamp or int(epoch_time() * 1000)
+        # ``upsert_order`` REPLACES the extras blob, so merge on top of the
+        # persist-first row's extras — losing ``kind`` there would blind the
+        # working-row discriminator in
+        # :meth:`get_residual_orders_after_bracket_attach_reject`.
+        existing = self.store_ctx.get_order(coid)
+        extras = dict(existing.extras or {}) if existing is not None else {}
+        extras.update({'order_id': order_id,
+                       'position_id': position_id or None,
+                       'submitted_at_ms': submitted_at_ms})
         self.store_ctx.upsert_order(
             coid,
             symbol=intent.symbol,
@@ -472,9 +482,7 @@ class _ExecutionMixin(_CTraderBase):
             intent_key=intent.intent_key,
             pine_entry_id=intent.pine_id,
             exchange_order_id=(str(position_id) if position_id else order_id),
-            extras={'order_id': order_id,
-                    'position_id': position_id or None,
-                    'submitted_at_ms': submitted_at_ms},
+            extras=extras,
         )
         self.store_ctx.add_ref(coid, 'order_id', order_id)
         # FIFO-pin the shared netted position alias (NETTING merges pyramid
@@ -638,9 +646,10 @@ class _ExecutionMixin(_CTraderBase):
         NETTING position has no single entry client-order-id, so a stable
         surrogate (symbol + ``from_entry``) keys the defensive ``CloseIntent``
         across retries. Protective levels are position attributes, so no
-        residual TP/SL order entities are left behind — the base
-        :meth:`get_residual_orders_after_bracket_attach_reject` (empty list)
-        is correct and no override is needed.
+        residual TP/SL order entities are left behind; the unfilled remainder
+        of a partially filled parent LIMIT / STOP working order DOES survive
+        the reject, though — see
+        :meth:`get_residual_orders_after_bracket_attach_reject`.
         """
         position_side = 'buy' if intent.side == 'sell' else 'sell'
         surrogate_coid = f"__pyne_orphan__{intent.symbol}__{intent.from_entry}"
@@ -658,6 +667,78 @@ class _ExecutionMixin(_CTraderBase):
             exit_id=intent.pine_id,
             error_code=code,
         )
+
+    @override
+    def get_residual_orders_after_bracket_attach_reject(
+            self, context: BracketAttachRejectContext,
+    ) -> list[str]:
+        """Enumerate the partial-fill remainder of the parent working order.
+
+        cTrader protective levels are position attributes, so a rejected
+        bracket attach leaves no separate TP/SL order entities behind. The one
+        residual class is the unfilled remainder of a partially filled parent
+        LIMIT / STOP entry: the rejected ``ProtoOAAmendPositionSLTPReq``
+        references only the ``positionId`` and does not touch the order, so
+        cTrader keeps the working order live — after the defensive close its
+        remainder could fill into an unmanaged position.
+
+        Enumeration is keyed on the parent Pine entry id: every live
+        BrokerStore row for ``context.from_entry`` still in the ``working``
+        kind yields its broker ``orderId``. Safe to call repeatedly — a
+        promoted / terminal row drops out of the live set between calls, and a
+        stale row is harmless because :meth:`cancel_broker_order_ref`
+        normalizes an already-gone order to a no-op. Store-only (no wire
+        round-trip): the engine calls this synchronously from the recovery
+        path.
+        """
+        if self.store_ctx is None or context.from_entry is None:
+            return []
+        refs: list[str] = []
+        for row in self.store_ctx.iter_live_orders(symbol=context.symbol):
+            if row.pine_entry_id != context.from_entry:
+                continue
+            extras = row.extras or {}
+            if extras.get('kind') != ENTRY_KIND_WORKING:
+                continue
+            order_id = extras.get('order_id')
+            if order_id:
+                refs.append(str(order_id))
+        return refs
+
+    @override
+    async def cancel_broker_order_ref(self, ref: str) -> None:
+        """Cancel a residual working order by its raw cTrader ``orderId``.
+
+        Honours the base idempotency contract: an already filled / cancelled
+        order (``*_NOT_FOUND``) is a benign no-op; wire trouble surfaces from
+        :meth:`_dispatch_order` as :class:`ExchangeConnectionError` /
+        :class:`OrderDispositionUnknownError` for the engine's retry loop; any
+        other reject propagates and halts. ``ORDER_CANCEL_REJECTED`` arrives
+        as a non-error execution event (a cancel/fill race — the order is
+        still live and may yet fill), so it is raised as
+        :class:`OrderDispositionUnknownError` to keep the engine retrying
+        instead of declaring the recovery complete.
+        """
+        coid = f"__pyne_residual_cancel__{ref}"
+        try:
+            event = await self._dispatch_order(
+                _oa.ProtoOACancelOrderReq(
+                    ctidTraderAccountId=self._live_account_id, orderId=int(ref),
+                ),
+                coid=coid, context="residual cancel",
+            )
+        except ExchangeOrderRejectedError as exc:
+            if isinstance(exc.__cause__, CTraderProtocolError) and is_not_found(
+                    exc.__cause__.error_code):
+                return
+            raise
+        if (event.executionType
+                == _model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED):
+            raise OrderDispositionUnknownError(
+                f"cTrader residual cancel for order {ref} was rejected by a "
+                f"cancel/fill race; the order may still be live",
+                client_order_id=coid,
+            )
 
     # --- PositionPort transport surface (core one-way emulation) -----------
     #

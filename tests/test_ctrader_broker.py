@@ -11,6 +11,7 @@ from pynecore.core.broker.exceptions import (
     OrderSkippedByPlugin,
 )
 from pynecore.core.broker.models import (
+    BracketAttachRejectContext,
     CancelDispositionOutcome,
     CancelIntent,
     CapabilityLevel,
@@ -19,13 +20,13 @@ from pynecore.core.broker.models import (
     EntryIntent,
     ExitIntent,
     LegType,
-    OrderStatus,
     OrderType,
 )
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
     create_entry_order_row,
     mark_disposition_unknown,
 )
@@ -797,3 +798,115 @@ def __test_cancel_no_live_order_is_unknown_without_dispatch__(tmp_path):
     _open_store(tmp_path, broker)
     assert _cancel(broker) is CancelDispositionOutcome.UNKNOWN
     assert broker.sent == []
+
+
+# === Bracket-attach-reject residual cleanup ================================
+# A rejected ProtoOAAmendPositionSLTPReq references only the positionId, so
+# the unfilled remainder of a partially filled parent LIMIT/STOP stays live
+# on the broker — without enumeration + cancel it could fill into an
+# unmanaged position after the defensive close.
+
+def _reject_context(*, from_entry: str | None = 'Long', symbol='EURUSD'):
+    return BracketAttachRejectContext(
+        intent_key='exit-key', position_coid='coid-parent',
+        position_side='buy', qty=10.0, symbol=symbol, from_entry=from_entry,
+    )
+
+
+def _dispatch_limit_entry(broker, *, pine_id='Long', order_id=111):
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=order_id,
+                          order_type=_model.ProtoOAOrderType.LIMIT),
+    )
+    intent = EntryIntent(pine_id=pine_id, symbol='EURUSD', side='buy',
+                         qty=10.0, order_type=OrderType.LIMIT, limit=1.20)
+    asyncio.run(broker.execute_entry(_envelope(intent)))
+
+
+def __test_persist_entry_preserves_kind_in_extras__(tmp_path):
+    # upsert_order REPLACES the extras blob — the confirm-time persist must
+    # merge, or the working/position discriminator written by the
+    # persist-first row is lost.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _dispatch_limit_entry(broker)
+    row = _only_live_order(broker)
+    assert row.extras['kind'] == ENTRY_KIND_WORKING
+    assert row.extras['order_id'] == '111'
+
+
+def __test_residual_enumerates_partial_filled_working_parent__(tmp_path):
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _dispatch_limit_entry(broker, order_id=111)
+    coid = broker.coid_at_dispatch
+    assert coid is not None
+    # Partial-fill progress recorded — the row stays live and working-kind.
+    broker.store_ctx.set_filled(coid, 4.0)
+    refs = broker.get_residual_orders_after_bracket_attach_reject(
+        _reject_context())
+    assert refs == ['111']
+    # Repeated enumeration with the same context is stable (idempotency).
+    assert broker.get_residual_orders_after_bracket_attach_reject(
+        _reject_context()) == ['111']
+
+
+def __test_residual_skips_market_entry_and_other_pine_ids__(tmp_path):
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    # MARKET parent -> position kind, nothing cancellable.
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_FILLED,
+        order=_make_order(order_id=222, executed=1000, position_id=555),
+    )
+    intent = EntryIntent(pine_id='Long', symbol='EURUSD', side='buy',
+                         qty=10.0, order_type=OrderType.MARKET)
+    asyncio.run(broker.execute_entry(_envelope(intent)))
+    # A live working order under a DIFFERENT pine id is a managed sibling the
+    # engine owns — the residual sweep must not touch it.
+    _dispatch_limit_entry(broker, pine_id='Other', order_id=333)
+    assert broker.get_residual_orders_after_bracket_attach_reject(
+        _reject_context()) == []
+
+
+def __test_residual_empty_without_store_or_from_entry__(tmp_path):
+    broker = _FakeBroker()
+    assert broker.get_residual_orders_after_bracket_attach_reject(
+        _reject_context()) == []
+    _open_store(tmp_path, broker)
+    _dispatch_limit_entry(broker)
+    assert broker.get_residual_orders_after_bracket_attach_reject(
+        _reject_context(from_entry=None)) == []
+
+
+def __test_cancel_broker_order_ref_sends_cancel_request__():
+    broker = _FakeBroker()
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_CANCELLED)
+    asyncio.run(broker.cancel_broker_order_ref('111'))
+    cancels = [r for r in broker.sent
+               if isinstance(r, _oa.ProtoOACancelOrderReq)]
+    assert len(cancels) == 1
+    assert cancels[0].orderId == 111
+
+
+def __test_cancel_broker_order_ref_not_found_is_noop__():
+    # Already filled / cancelled residual: the base idempotency contract
+    # requires a silent no-op, never an exception.
+    broker = _FakeBroker()
+    err = ExchangeOrderRejectedError("order gone")
+    err.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
+    broker._raise_on_dispatch = err
+    asyncio.run(broker.cancel_broker_order_ref('111'))
+
+
+def __test_cancel_broker_order_ref_cancel_rejected_raises_unknown__():
+    # ORDER_CANCEL_REJECTED is a non-error execution event: the order is
+    # still live and may fill — raise disposition-unknown so the engine's
+    # residual loop retries instead of declaring the recovery complete.
+    broker = _FakeBroker()
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.cancel_broker_order_ref('111'))
