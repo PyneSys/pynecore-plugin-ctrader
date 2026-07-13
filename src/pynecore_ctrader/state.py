@@ -78,6 +78,9 @@ class _StateMixin(_CTraderBase):
             watch_orders=CapabilityLevel.NATIVE,
             fetch_position=CapabilityLevel.NATIVE,
             idempotency=CapabilityLevel.PARTIAL_NATIVE,
+            # CFD venue: a SELL on a flat or smaller-long book opens/flips
+            # to a short position natively.
+            short_selling=CapabilityLevel.NATIVE,
         )
 
     async def _reconcile(
