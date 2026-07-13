@@ -36,12 +36,16 @@ recovery is the M3 startup-recovery's job, not this loop's.
 import logging
 from dataclasses import dataclass
 from time import time as epoch_time
-from typing import AsyncIterator, cast
+from typing import TYPE_CHECKING, AsyncIterator, cast
 
+from pynecore.core.broker.disappearance import (
+    DisappearanceTracker,
+    MissingConfirmation,
+    MissingResolution,
+)
 from pynecore.core.broker.exceptions import (
     BrokerError,
     ExchangeOrderRejectedError,
-    UnexpectedCancelError,
 )
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.models import (
@@ -56,6 +60,9 @@ from ._base import _CTraderBase
 from .helpers import money_value, volume_to_units
 from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
+
+if TYPE_CHECKING:
+    from pynecore.core.broker.storage import OrderRow
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +117,12 @@ class _DealBridgeResult:
     :ivar deal_ids: Every matching FILLED ``dealId``, so the shared
         :attr:`_seen_deal_ids` de-dup spans an order that filled across several
         partial deals (not just the most-recent one).
+    :ivar closing_deal_ids: ``dealId`` of every deal that closed volume on the
+        resolved target position (``closePositionDetail``). These usually
+        belong to a DIFFERENT order (a native TP/SL or an external close), so
+        they are absent from :ivar:`deal_ids` — yet a closure concluded from
+        them must seed the de-dup channel too, or a late PUSH replay of the
+        closing execution would re-book against the retired position.
     """
     deal: '_model.ProtoOADeal | None'
     filled_cents: int
@@ -118,6 +131,7 @@ class _DealBridgeResult:
     conclusive: bool
     closed_cents: int = 0
     deal_ids: tuple[int, ...] = ()
+    closing_deal_ids: tuple[int, ...] = ()
 
 
 class _ReconcileMixin(_CTraderBase):
@@ -173,8 +187,9 @@ class _ReconcileMixin(_CTraderBase):
             position_id = extras.get('position_id')
             if position_id and row.filled_qty >= row.qty - 1e-9:
                 # A fully-filled row whose order has left ``order[]`` is a settled
-                # position: only track its disappearance.
-                self._reconcile_position_row(row, int(position_id), open_positions, now_ts)
+                # position: only its disappearance matters, and that is the core
+                # tracker's concern — ``tracked_refs`` maps it to the
+                # ``positions`` namespace for the presence feed below.
                 continue
             if not order_id_str:
                 continue
@@ -188,6 +203,16 @@ class _ReconcileMixin(_CTraderBase):
             async for event in self._recover_vanished_working_row(
                     row, int(order_id_str), open_positions, now_ts):
                 yield event
+        # Presence diff for the settled-position rows: stamp when the position
+        # vanished from ``position[]``, clear the moment it is back. Runs AFTER
+        # the row walk so a filled-then-closed retirement in this same pass
+        # lands before its row could be stamped. Working rows are deliberately
+        # NOT presence-tracked here — their disappearance from ``order[]`` is
+        # ambiguous (fill vs cancel) and only the deal-history bridge above may
+        # stamp them, on positive no-fill evidence.
+        self._disappearance_tracker().observe_presence(
+            {'positions': {str(pid) for pid in open_positions}}, now_ts,
+        )
         self._feed_native_failsafe_observations(open_positions, protection_by_position)
 
     def _feed_native_failsafe_observations(
@@ -263,32 +288,155 @@ class _ReconcileMixin(_CTraderBase):
             trailing_stop=None,
         )
 
-    def _reconcile_position_row(
-            self, row, position_id: int, open_positions: dict, now_ts: float,
-    ) -> None:
-        """Track disappearance of an already-promoted position row.
+    def _disappearance_tracker(self) -> DisappearanceTracker:
+        """The lazily-built core disappearance tracker for this instance.
 
-        Clears any stale ``missing_pending_since`` when the position is back in
-        the snapshot; stamps it once when the position has vanished from
-        ``position[]``. Stamping is unconditional — the close-versus-cancel
-        decision is deferred to :meth:`_emit_unexpected_cancellations`, which at
-        grace expiry re-reads the deal history: a vanished position whose deals
-        show a close (``closedVolume > 0``) is booked as a natural / external
-        close, NOT a synthetic cancel, while one gone with no close evidence is
-        the genuine unexpected disappearance. Stamping only here.
+        Built on first use because its inputs — ``store_ctx``,
+        ``on_unexpected_cancel``, ``quarantine_sink`` — are injected after
+        ``__init__``. Venue wiring:
+
+        * Presence tracking covers ONLY settled position rows (fully
+          filled, ``position_id`` linked): a position gone from
+          ``position[]`` is stamped unconditionally, the close-versus-
+          cancel decision deferred to the grace-expiry re-verification.
+          Working rows return an empty ref set — their disappearance from
+          ``order[]`` is ambiguous (fill vs cancel) and only the snapshot
+          bridge (:meth:`_recover_vanished_working_row`) may stamp them,
+          on positive no-fill evidence; the shared
+          ``missing_pending_since`` key feeds both into the same grace
+          protocol.
+        * ``confirm_missing`` wraps the deal-history bridge — see
+          :meth:`_confirm_missing_via_deal_history`.
+        * A :data:`MissingResolution.CLOSED` verdict retires every live
+          sibling sharing the position id (a NETTING / pyramiding account
+          merges pyramid entries onto one ``positionId``), and the
+          backing deal ids are seeded into :attr:`_seen_deal_ids` so a
+          replayed PUSH copy of a recovered execution can never re-book.
         """
-        if self.store_ctx is None:
-            return
+        tracker = self._disappearance
+        if tracker is None:
+            assert self.store_ctx is not None
+            tracker = DisappearanceTracker(
+                self.store_ctx,
+                grace_s=_MISSING_PENDING_GRACE_S,
+                policy=self.on_unexpected_cancel,
+                tracked_refs=self._tracked_position_refs,
+                confirm_missing=self._confirm_missing_via_deal_history,
+                cancel_siblings=self._cancel_sibling_working_orders,
+                request_quarantine=self.quarantine_sink,
+                sibling_coids=self._closed_position_siblings,
+                register_executions=self._register_recovered_deals,
+                cancelled_event_factory=self._cancelled_event,
+            )
+            self._disappearance = tracker
+        return tracker
+
+    @staticmethod
+    def _tracked_position_refs(row: 'OrderRow') -> set[tuple[str, str]]:
+        """Presence refs for the tracker: settled position rows only."""
         extras = row.extras or {}
-        present = position_id in open_positions
-        if present:
-            if 'missing_pending_since' in extras:
-                self._clear_missing_pending(row)
-            return
-        if 'missing_pending_since' not in extras:
-            patched = dict(extras)
-            patched['missing_pending_since'] = now_ts
-            self.store_ctx.upsert_order(row.client_order_id, extras=patched)
+        position_id = extras.get('position_id')
+        if position_id and row.filled_qty >= row.qty - 1e-9:
+            return {('positions', str(position_id))}
+        return set()
+
+    async def _confirm_missing_via_deal_history(
+            self, row: 'OrderRow',
+    ) -> MissingConfirmation:
+        """Grace-expiry re-verification against a fresh deal-history read.
+
+        The ``missing_pending_since`` stamp records that the row's broker
+        counterpart had vanished at SOME earlier pass — not that it is
+        still conclusively gone now. Classify from fresh evidence:
+
+        * INCONCLUSIVE (deal-history transport down): never conclude a
+          cancel from a truncated read — the tracker keeps the stamp and
+          waits, throttling the warning to once per row.
+        * FILLED-then-CLOSED (``closedVolume > 0``): a native TP / SL or
+          external close fired while the stream was down — the tracker
+          books the terminal CLOSE, never a synthetic entry-cancel. A
+          working row needs the bridge to prove its own fill
+          (``filled_cents``); a fully-filled position row already
+          establishes its fill, so a close on its KNOWN position id is
+          enough even when the entry fill aged out of the bridge window
+          (the ``close_position_id`` fallback).
+        * A zero-fill working order that FILLED during the gap: it
+          demonstrably opened a position, so it is NOT a cancel — the
+          tracker clears the now-false premise and the next
+          :meth:`_reconcile_snapshot` pass promotes it against the full
+          snapshot. No fill data is returned here: the snapshot bridge
+          owns the promotion (and its dedup seeding), keeping this path
+          book-free.
+        * CONCLUSIVE no-fill / no-close: the genuine unexpected
+          disappearance — the tracker retires it as a synthetic cancel
+          and applies the ``on_unexpected_cancel`` policy.
+        """
+        extras = row.extras or {}
+        order_id_str = extras.get('order_id')
+        position_id = extras.get('position_id')
+        if order_id_str:
+            anchor = extras.get('submitted_at_ms')
+            if anchor:
+                from_ms = int(anchor) - _SINCE_ANCHOR_SKEW_MS
+            else:
+                from_ms = int(epoch_time() * 1000) - int(_DEAL_LOOKBACK_S * 1000)
+            bridge = await self._find_fill_deal(
+                int(order_id_str), from_ms,
+                close_position_id=int(position_id) if position_id else None)
+            if not bridge.conclusive:
+                return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+            if bridge.closed_cents > 0 and (bridge.filled_cents > 0
+                                            or position_id is not None):
+                close_pid = (bridge.deal.positionId if bridge.deal is not None
+                             else int(position_id))
+                # Register the entry fills AND the closing deals: the
+                # closure is concluded from the closing evidence, whose
+                # deals usually belong to a DIFFERENT order (native TP/SL,
+                # external close) — a late PUSH replay of either must be
+                # suppressed after the retire.
+                evidence = dict.fromkeys(
+                    (*bridge.deal_ids, *bridge.closing_deal_ids))
+                return MissingConfirmation(
+                    MissingResolution.CLOSED,
+                    position_ref=str(close_pid),
+                    execution_ids=tuple(str(d) for d in evidence),
+                )
+            if position_id is None and bridge.filled_cents > 0:
+                return MissingConfirmation(MissingResolution.FILLED)
+        return MissingConfirmation(MissingResolution.CANCELLED)
+
+    def _closed_position_siblings(
+            self, row: 'OrderRow', confirmation: MissingConfirmation,
+    ) -> list[str]:
+        """Live rows sharing the CLOSED verdict's position id.
+
+        A NETTING / pyramiding account merges pyramid entries onto one
+        ``positionId``, so a proven close retires all of them (mirroring
+        the PUSH path's ``_mark_position_closed``) — closing only the
+        observed row would leave sibling rows live or later mis-stamped
+        against a flat broker.
+        """
+        pid_ref = confirmation.position_ref
+        if not pid_ref or self.store_ctx is None:
+            return []
+        return [
+            r.client_order_id
+            for r in self.store_ctx.iter_live_orders()
+            if r.client_order_id != row.client_order_id
+            and (str((r.extras or {}).get('position_id') or '') == pid_ref
+                 or r.exchange_order_id == pid_ref)
+        ]
+
+    def _register_recovered_deals(
+            self, _row: 'OrderRow', deal_ids: tuple[str, ...],
+    ) -> None:
+        """Seed recovered deal ids into the shared PUSH-path dedup set.
+
+        cTrader can replay (or push an uncorrelated copy of) an execution
+        after reconnect; a deal the grace-expiry verdict was concluded
+        from must never re-book as a fresh fill.
+        """
+        self._seen_deal_ids.update(int(d) for d in deal_ids)
 
     def _reconcile_working_row(
             self, row, order, open_positions: dict, now_ts: float,
@@ -418,8 +566,11 @@ class _ReconcileMixin(_CTraderBase):
                 # retiring: cTrader can replay or push an uncorrelated copy of the
                 # same execution after reconnect, and a sibling row sharing this
                 # position is retired off the SAME bridge deals — without this the
-                # PUSH path would re-emit a recovered deal as a fresh fill.
+                # PUSH path would re-emit a recovered deal as a fresh fill. The
+                # closing deals usually belong to a DIFFERENT order (native
+                # TP/SL, external close), so they must be seeded explicitly too.
                 self._seen_deal_ids.update(bridge.deal_ids)
+                self._seen_deal_ids.update(bridge.closing_deal_ids)
                 self._retire_filled_then_closed(
                     row, deal, position_id, bridge.closed_cents)
             return None
@@ -594,6 +745,7 @@ class _ReconcileMixin(_CTraderBase):
         deal_ids: list[int] = []
         target_position_id: int | None = None
         closed_by_position: dict[int, int] = {}
+        closing_ids_by_position: dict[int, list[int]] = {}
         try:
             while True:
                 res = cast(_oa.ProtoOADealListRes, await wire.send_request(
@@ -608,6 +760,12 @@ class _ReconcileMixin(_CTraderBase):
                         closed_by_position[deal.positionId] = (
                             closed_by_position.get(deal.positionId, 0)
                             + deal.closePositionDetail.closedVolume)
+                        # Only a deal that actually closed volume is closure
+                        # EVIDENCE — a zero-volume detail must not enter the
+                        # dedup channel or the forensic audit.
+                        if deal.closePositionDetail.closedVolume > 0:
+                            closing_ids_by_position.setdefault(
+                                deal.positionId, []).append(deal.dealId)
                     if (deal.orderId == order_id
                             and deal.dealStatus == _model.ProtoOADealStatus.FILLED):
                         filled_cents += deal.filledVolume
@@ -635,16 +793,17 @@ class _ReconcileMixin(_CTraderBase):
                          else close_position_id)
         closed_cents = (closed_by_position.get(closed_target, 0)
                         if closed_target is not None else 0)
+        closing_ids = (tuple(closing_ids_by_position.get(closed_target, ()))
+                       if closed_target is not None else ())
         return _DealBridgeResult(
             latest_deal, filled_cents, avg_price, fee, True,
-            closed_cents, tuple(deal_ids),
+            closed_cents, tuple(deal_ids), closing_ids,
         )
 
     def _clear_missing_pending(self, row) -> None:
         """Drop a stale ``missing_pending_since`` breadcrumb (the row came back)."""
         if self.store_ctx is None:
             return
-        self._inconclusive_grace_warned.discard(row.client_order_id)
         patched = {k: v for k, v in (row.extras or {}).items()
                    if k != 'missing_pending_since'}
         self.store_ctx.upsert_order(row.client_order_id, extras=patched)
@@ -652,170 +811,33 @@ class _ReconcileMixin(_CTraderBase):
     async def _emit_unexpected_cancellations(self) -> AsyncIterator[OrderEvent]:
         """Retire bot-owned rows missing past the grace window, as cancels.
 
-        :meth:`_reconcile_snapshot` stamps ``missing_pending_since`` on a
-        confirmed row whose broker counterpart has vanished from BOTH ``order[]``
-        and ``position[]``, and clears the stamp the moment the row reappears. A
-        fill in flight can flicker out of both for one snapshot, so the
-        disappearance is only treated as a candidate for retirement once the
-        grace window (:data:`_MISSING_PENDING_GRACE_S`) has elapsed.
+        Drives the core tracker's grace-expiry protocol. A row stamped
+        ``missing_pending_since`` (by the presence feed for settled
+        positions, or by the snapshot bridge's positive no-fill evidence
+        for working orders) is only acted on once the grace window
+        (:data:`_MISSING_PENDING_GRACE_S`) has elapsed, and never blindly:
+        each expired row is re-verified against a fresh deal-history read
+        — see :meth:`_confirm_missing_via_deal_history` for the
+        close-versus-fill-versus-cancel classification. A genuine no-fill
+        / no-close disappearance is retired (``rejected``) with a
+        synthetic ``cancelled`` event — so the engine's ``_route_event``
+        clears it from ``_order_mapping`` and re-syncs the strategy
+        position, exactly as a live ``ORDER_CANCELLED`` PUSH event would —
+        and the configured ``on_unexpected_cancel`` policy is applied
+        (``stop`` / ``stop_and_cancel`` latch the engine quarantine;
+        ``halt``, or an unwired quarantine sink, raises
+        :class:`UnexpectedCancelError` through the reconcile pass).
 
-        Past the window the disappearance is NOT retired blindly: the stamp only
-        records that the counterpart had vanished at SOME earlier pass, not that
-        it is still conclusively gone now. So each expired row is re-verified
-        against a fresh deal-history read before any irreversible action — see
-        :meth:`_reverify_expired_missing_row` for the close-versus-fill-versus-
-        cancel classification. A genuine no-fill / no-close disappearance is
-        retired (``rejected``) with a synthetic ``cancelled`` event — so the
-        engine's ``_route_event`` clears it from ``_order_mapping`` and re-syncs
-        the strategy position, exactly as a live ``ORDER_CANCELLED`` PUSH event
-        would — and the configured ``on_unexpected_cancel`` policy is applied.
-
-        Runs as a separate pass AFTER :meth:`_reconcile_snapshot` (which owns the
-        stamping and the reappearance-clear). A no-op when persistence is off.
+        Runs as a separate pass AFTER :meth:`_reconcile_snapshot`. The
+        presence namespaces are passed as ``None`` (fetch-failed marker)
+        so this pass never stamps or clears — the snapshot pass owns
+        presence. A no-op when persistence is off.
         """
         if self.store_ctx is None:
             return
-        now_ts = epoch_time()
-        for row in list(self.store_ctx.iter_live_orders()):
-            since: float | None = (row.extras or {}).get('missing_pending_since')
-            if since is None:
-                continue
-            if (now_ts - float(since)) < _MISSING_PENDING_GRACE_S:
-                continue
-            async for event in self._reverify_expired_missing_row(row, now_ts):
-                yield event
-
-    async def _reverify_expired_missing_row(
-            self, row, now_ts: float,
-    ) -> AsyncIterator[OrderEvent]:
-        """Re-confirm a grace-expired disappearance before the irreversible retire.
-
-        The ``missing_pending_since`` stamp records that the row's broker
-        counterpart had vanished at SOME earlier pass — not that it is still
-        conclusively gone now. Re-read the deal history one last time and act on
-        the fresh evidence:
-
-        * INCONCLUSIVE (deal-history transport down): never conclude a cancel
-          from a truncated read — keep the stamp and wait. A transport outage is
-          recoverable; a false cancel strands real exposure. (Throttled so a
-          sustained outage does not spam the log.)
-        * FILLED-then-CLOSED (``closedVolume > 0``): a native TP / SL or external
-          close fired while the stream was down — book the terminal CLOSE through
-          the existing closure writer, NEVER a synthetic entry-cancel. A working
-          row needs the bridge to prove its own fill (``filled_cents``); a fully-
-          filled position row already establishes its fill, so a close on its
-          KNOWN position id is enough even if the entry fill aged out of the
-          bridge window. This is the deterministic classification that supersedes
-          the old (never-written) ``natural_close_at`` guard.
-        * A zero-fill working order that FILLED during the gap: it demonstrably
-          opened a position, so it is NOT a cancel. Clear the now-false missing-
-          pending premise (as :meth:`_promote_from_deal` does on a proven fill)
-          and let the next :meth:`_reconcile_snapshot` pass promote it against the
-          full snapshot — never cancel a filled order, and never re-bridge the
-          same row every cadence forever.
-        * CONCLUSIVE no-fill / no-close (a zero-fill working order that never
-          filled, or a filled position gone with no close the deal history can
-          see): the genuine unexpected disappearance — retire as a synthetic
-          cancel and apply the ``on_unexpected_cancel`` policy.
-        """
-        if self.store_ctx is None:
-            return
-        extras = row.extras or {}
-        order_id_str = extras.get('order_id')
-        position_id = extras.get('position_id')
-        if order_id_str:
-            anchor = extras.get('submitted_at_ms')
-            if anchor:
-                from_ms = int(anchor) - _SINCE_ANCHOR_SKEW_MS
-            else:
-                from_ms = int(epoch_time() * 1000) - int(_DEAL_LOOKBACK_S * 1000)
-            bridge = await self._find_fill_deal(
-                int(order_id_str), from_ms,
-                close_position_id=int(position_id) if position_id else None)
-            if not bridge.conclusive:
-                # A deal-history outage must never become a false cancel: keep
-                # the stamp, defer the retire, and let a later pass resolve it.
-                self._warn_inconclusive_grace_recheck(row)
-                return
-            if bridge.closed_cents > 0 and (bridge.filled_cents > 0
-                                            or position_id is not None):
-                # Filled then closed while the stream was down (a native TP / SL
-                # or external close) — book the close, not a cancel. A working row
-                # needs the bridge to prove its fill; a position row's fill is
-                # already established by its own state, so a close on its known
-                # position id suffices even when the entry fill aged out.
-                #
-                # ``closedVolume`` is also set for a PARTIAL close, so this is a
-                # TERMINAL close only because the full-close evidence is
-                # ``closed_cents > 0`` AND the position's prior fresh absence from
-                # ``position[]``: a position row is here only after pass 1 saw it
-                # missing for the whole grace window. A partial close leaves the
-                # position OPEN in ``position[]``, which clears the stamp in pass 1
-                # — so a still-open position never reaches this branch.
-                self._seen_deal_ids.update(bridge.deal_ids)
-                close_pid = (bridge.deal.positionId if bridge.deal is not None
-                             else int(position_id))
-                self._retire_filled_then_closed(
-                    row, bridge.deal, close_pid, bridge.closed_cents)
-                self._inconclusive_grace_warned.discard(row.client_order_id)
-                return
-            if position_id is None and bridge.filled_cents > 0:
-                # A zero-fill working order that demonstrably filled during the gap
-                # is a live position, never a cancel. Clear the now-false missing-
-                # pending premise and exit the grace-retire path; the normal
-                # snapshot bridge (:meth:`_recover_vanished_working_row`) then owns
-                # it — promoting when the position appears, or retiring it as a
-                # close when a close deal later surfaces. Never cancel a filled
-                # order, and never re-enter the grace recheck on a stale stamp.
-                self._clear_missing_pending(row)
-                self._inconclusive_grace_warned.discard(row.client_order_id)
-                return
-        # Genuine unexpected disappearance.
-        self._inconclusive_grace_warned.discard(row.client_order_id)
-        order_id = extras.get('order_id')
-        DispatchJournal(self.store_ctx).apply_reconcile_outcome(
-            row.client_order_id,
-            ReconcileOutcome(
-                kind='terminal_close',
-                reason='missing_pending_grace_expired',
-                new_state='rejected',
-                audit_event='unexpected_cancel',
-                close_row=True,
-                audit_payload={'missing_since': extras.get('missing_pending_since'),
-                               'grace': _MISSING_PENDING_GRACE_S},
-                exchange_order_id=(str(order_id) if order_id
-                                   else str(position_id) if position_id
-                                   else None),
-            ),
-        )
-        yield self._cancelled_event(row, now_ts)
-        await self._apply_unexpected_cancel_policy(row)
-
-    def _warn_inconclusive_grace_recheck(self, row) -> None:
-        """Defer a grace-expired retire whose final deal-history re-check could
-        not confirm a no-fill (the read was inconclusive — transport down).
-
-        Concluding a cancel from a truncated read would strand real exposure, so
-        the row keeps its ``missing_pending_since`` stamp and waits for a later
-        pass. The warning is throttled to once per row until the re-check
-        resolves, so a sustained outage does not spam the log every reconcile
-        cadence.
-        """
-        coid = row.client_order_id
-        if coid in self._inconclusive_grace_warned:
-            return
-        self._inconclusive_grace_warned.add(coid)
-        logger.warning(
-            "cTrader grace-expired row %r left un-retired: deal-history re-check "
-            "inconclusive (transport down) — deferring rather than concluding a "
-            "false cancel", coid,
-        )
-        if self.store_ctx is not None:
-            self.store_ctx.log_event(
-                'missing_pending_recheck_inconclusive',
-                client_order_id=coid,
-                exchange_order_id=(row.extras or {}).get('order_id'),
-            )
+        async for event in self._disappearance_tracker().observe(
+                {'positions': None}, epoch_time()):
+            yield event
 
     def _cancelled_event(self, row, now_ts: float) -> OrderEvent:
         """Build the synthetic cancelled event for a vanished bot-owned row.
@@ -840,48 +862,6 @@ class _ReconcileMixin(_CTraderBase):
             fill_price=None, fill_qty=None, timestamp=now_ts,
             pine_id=row.pine_entry_id, from_entry=row.from_entry,
             leg_type=LegType.ENTRY, fee=0.0,
-        )
-
-    async def _apply_unexpected_cancel_policy(self, row) -> None:
-        """Apply the ``on_unexpected_cancel`` policy for a vanished bot order.
-
-        - ``stop`` (default): raise :class:`UnexpectedCancelError` — the sync
-          engine halts via its graceful manual-intervention path.
-        - ``stop_and_cancel``: a best-effort ``ProtoOACancelOrderReq`` sweep
-          over the other bot-owned working orders in the same symbol, then
-          raise.
-        - ``re_place``: no-op + audit — the engine re-dispatches the protective
-          order on the next diff cycle.
-        - ``ignore``: no-op + audit; only safe when external cancels are an
-          expected part of the operational workflow.
-        """
-        if self.on_unexpected_cancel == 'ignore':
-            if self.store_ctx is not None:
-                self.store_ctx.log_event(
-                    'unexpected_cancel_ignored',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                )
-            return
-        if self.on_unexpected_cancel == 're_place':
-            if self.store_ctx is not None:
-                self.store_ctx.log_event(
-                    'unexpected_cancel_re_place',
-                    client_order_id=row.client_order_id,
-                    exchange_order_id=row.exchange_order_id,
-                )
-            return
-        if self.on_unexpected_cancel == 'stop_and_cancel':
-            await self._cancel_sibling_working_orders(row)
-        raise UnexpectedCancelError(
-            f"Bot-owned cTrader order disappeared unexpectedly: "
-            f"coid={row.client_order_id!r} "
-            f"order_id={(row.extras or {}).get('order_id')!r}",
-            context={
-                'client_order_id': row.client_order_id,
-                'symbol': row.symbol,
-                'policy': self.on_unexpected_cancel,
-            },
         )
 
     async def _cancel_sibling_working_orders(self, row) -> None:

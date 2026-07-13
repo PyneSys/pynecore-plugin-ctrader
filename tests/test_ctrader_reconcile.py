@@ -543,6 +543,34 @@ def __test_reconcile_filled_then_closed_retires_instead_of_phantom__(tmp_path):
     # Retired out of the live set so the disappearance tracker never stamps it.
     assert all(r.client_order_id != 'c14'
                for r in broker.store_ctx.iter_live_orders())
+    assert 'missing_pending_since' not in (row.extras or {})
+    # BOTH the entry fill (905) and the closing deal (906 — a DIFFERENT
+    # order, 999) are on the de-dup channel: the retire was concluded from
+    # them, so a late PUSH replay of either must not re-book.
+    assert {905, 906} <= broker._seen_deal_ids
+
+
+def __test_bridge_excludes_zero_volume_close_detail_ids__(tmp_path):
+    # A deal can carry closePositionDetail with closedVolume == 0 (an ack that
+    # closed nothing). It contributes nothing to the closure volume and must
+    # NOT enter the dedup/evidence channel — only deals that actually closed
+    # volume back a CLOSED verdict.
+    broker = _ReconcileBroker(
+        _recon(),
+        deal_res=_deal_res(
+            _close_deal(deal_id=907, order_id=999, position_id=222,
+                        closed_volume=0),
+            _close_deal(deal_id=908, order_id=999, position_id=222,
+                        closed_volume=1000),
+        ),
+    )
+    _open(tmp_path, broker)
+
+    bridge = asyncio.run(broker._find_fill_deal(111, 0, close_position_id=222))
+
+    assert bridge.conclusive
+    assert bridge.closed_cents == 1000
+    assert bridge.closing_deal_ids == (908,)
 
 
 def __test_partial_vanished_position_linked_not_stamped_on_no_fill__(tmp_path):
@@ -786,6 +814,11 @@ def __test_grace_expired_position_close_wins_over_cancel_aged_fill__(tmp_path):
     assert events == []
     assert err is None
     assert 'c8' not in _live_coids(broker)
+    # The closing deal belongs to a DIFFERENT order (999, not the entry's
+    # 111), yet it is the evidence the retire was concluded from — it must
+    # be on the de-dup channel so a late PUSH replay of the close cannot
+    # re-book against the retired position.
+    assert 901 in broker._seen_deal_ids
 
 
 def __test_grace_expired_working_filled_clears_stamp__(tmp_path):
@@ -848,6 +881,30 @@ def __test_partial_close_still_open_position_not_terminal_closed__(tmp_path):
     assert 'c9' in _live_coids(broker)            # still live, not terminal-closed
     row = broker.store_ctx.get_order('c9')
     assert 'missing_pending_since' not in (row.extras or {})  # stamp cleared by pass 1
+
+
+def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
+    # With the runner-wired quarantine sink present, the default 'stop' policy
+    # latches the engine quarantine instead of raising: the event stream (and
+    # the process) stays alive while trading is stopped engine-side.
+    qty = volume_to_units(2000)
+    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+    latched: list[tuple[str, dict]] = []
+    broker.quarantine_sink = lambda reason, context: latched.append(
+        (reason, context))
+    _open(tmp_path, broker)
+    _seed_position(broker, 'q1', position_id=222, qty=qty,
+                   extras={'missing_pending_since': 0.0})
+
+    events, err = _drive_tracker(broker)
+
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    assert err is None                      # no halt: the process stays alive
+    assert 'q1' not in _live_coids(broker)  # row still retired
+    assert len(latched) == 1
+    reason, context = latched[0]
+    assert 'q1' in reason
+    assert context['policy'] == 'stop'
 
 
 def __test_policy_ignore_retires_without_halting__(tmp_path):

@@ -114,7 +114,8 @@ class _EventStreamMixin(_CTraderBase):
         the snapshot or the deal-history bridge request — is logged and
         swallowed so the PUSH stream (the primary order-event source) is never
         torn down by the gap-filler. A deliberate halt from the
-        disappearance-grace tracker (``on_unexpected_cancel='stop'`` ->
+        disappearance-grace tracker (``on_unexpected_cancel='halt'``, or a
+        quarantining policy with no engine sink wired ->
         :class:`BrokerManualInterventionError`) is NOT a transient failure: it
         propagates so the engine performs its graceful stop — swallowing it
         would strand the strategy out of sync. ``asyncio.CancelledError`` is a

@@ -48,6 +48,7 @@ from .wire import (
 )
 
 if TYPE_CHECKING:
+    from pynecore.core.broker.disappearance import DisappearanceTracker
     from pynecore.core.broker.models import (
         DispatchEnvelope,
         ExchangeOrder,
@@ -185,12 +186,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         #: set keeps the fill from being recorded twice. M2: unbounded (deal ids
         #: are unique and a session's fill volume is modest).
         self._seen_deal_ids: set[int] = set()
-        #: Client-order-ids whose grace-expired retire is currently deferred
-        #: because the final deal-history re-check was inconclusive (transport
-        #: down). Throttles the "deferring rather than concluding a false cancel"
-        #: warning to once per row until the re-check resolves. See
-        #: ``_ReconcileMixin._warn_inconclusive_grace_recheck``.
-        self._inconclusive_grace_warned: set[str] = set()
+        #: Core disappearance state machine (stamp / clear / grace /
+        #: dual-signal). Built lazily by
+        #: ``_ReconcileMixin._disappearance_tracker`` — construction reads
+        #: ``store_ctx``, ``on_unexpected_cancel`` and ``quarantine_sink``,
+        #: all injected after ``__init__``.
+        self._disappearance: 'DisappearanceTracker | None' = None
         #: Consecutive failed reconcile passes. Rate-limits the transient-
         #: failure warning (the pass runs every ~5 s, so a network outage
         #: would otherwise warn 12×/minute) and lets the recovery line report
