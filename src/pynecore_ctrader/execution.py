@@ -175,6 +175,7 @@ class _ExecutionMixin(_CTraderBase):
 
     async def _dispatch_order(
             self, req, *, coid: str, context: str,
+            predecessor_cancel_ids: tuple[str, ...] | None = None,
     ) -> _oa.ProtoOAExecutionEvent:
         """Send an order request and return its acknowledging execution event.
 
@@ -191,6 +192,10 @@ class _ExecutionMixin(_CTraderBase):
         :param req: The concrete order request message.
         :param coid: The client-order-id, for disposition-unknown correlation.
         :param context: Short label for the ambiguous-timeout message.
+        :param predecessor_cancel_ids: Modify-shape declaration forwarded onto
+            the :class:`OrderDispositionUnknownError` raises — atomic amend
+            call sites pass ``()`` so the engine's parked-modify handling
+            treats a CANCELLED push as a genuine external cancel.
         :return: The acknowledging ``ProtoOAExecutionEvent``.
         """
         try:
@@ -211,6 +216,7 @@ class _ExecutionMixin(_CTraderBase):
             raise OrderDispositionUnknownError(
                 f"cTrader {context} timed out; disposition unknown",
                 client_order_id=coid, cause=exc,
+                predecessor_cancel_ids=predecessor_cancel_ids,
             ) from exc
         except CTraderRequestSentConnectionError as exc:
             # The request bytes reached (or may have reached) the wire before the
@@ -220,6 +226,7 @@ class _ExecutionMixin(_CTraderBase):
             raise OrderDispositionUnknownError(
                 f"cTrader {context} connection lost after send; disposition unknown",
                 client_order_id=coid, cause=exc,
+                predecessor_cancel_ids=predecessor_cancel_ids,
             ) from exc
         except CTraderConnectionError as exc:
             raise ExchangeConnectionError(str(exc) or "connection lost") from exc
@@ -1047,7 +1054,8 @@ class _ExecutionMixin(_CTraderBase):
             req.limitPrice = round_price(intent.limit, rules.digits)
         elif intent.order_type is OrderType.STOP and intent.stop is not None:
             req.stopPrice = round_price(intent.stop, rules.digits)
-        await self._dispatch_order(req, coid=coid, context="amend entry")
+        await self._dispatch_order(req, coid=coid, context="amend entry",
+                                   predecessor_cancel_ids=())
         qty_units = volume_to_units(volume)
         return [ExchangeOrder(
             id=str(order_id), symbol=intent.symbol, side=intent.side,
@@ -1089,7 +1097,8 @@ class _ExecutionMixin(_CTraderBase):
             rules=rules,
         )
         await self._dispatch_order(req, coid=new.client_order_id(KIND_MODIFY_EXIT),
-                                   context="amend bracket")
+                                   context="amend bracket",
+                                   predecessor_cancel_ids=())
         return self._build_bracket_legs(intent, new, position_id, rules)
 
     # --- native fail-safe actuator + observed feed (§2.6.7) ----------------
