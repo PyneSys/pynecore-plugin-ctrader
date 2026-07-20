@@ -152,6 +152,18 @@ class _ReconcileMixin(_CTraderBase):
         """
         if self.store_ctx is None:
             return
+        if self._wire is None or self._live_account_id is None:
+            # Live connection not established — a teardown (``disconnect`` set
+            # ``_wire = None``) or a reconnect in flight. Honour the documented
+            # no-op contract instead of letting ``_reconcile`` raise
+            # ``CTraderConnectionError("live connection not established")``:
+            # ``_run_reconcile_pass`` would book that as a transient failure and
+            # spam the fail-streak warning every ~5 s for the whole outage
+            # (e.g. a connection lost while the market-closed reconnect gate is
+            # deferring recovery), which reads as "never recovers". The reconnect
+            # path — or the terminal shutdown — owns recovery; the next pass runs
+            # normally once the wire is back.
+            return
         res = await self._reconcile(return_protection_orders=True)
         orders_by_id = {o.orderId: o for o in res.order}
         open_positions = {

@@ -1138,6 +1138,35 @@ def __test_reconcile_pass_propagates_unexpected_cancel_halt__(tmp_path):
     assert 'c6' not in _live_coids(broker)
 
 
+def __test_reconcile_pass_noop_when_live_connection_down__(tmp_path):
+    # Regression: after a connection loss (or a teardown that set _wire = None,
+    # e.g. the restart-adoption run that cancelled its adopted STOP while the
+    # market-closed reconnect gate deferred recovery), the reconcile snapshot
+    # must honour its documented no-op contract instead of raising
+    # CTraderConnectionError("live connection not established"). Left to raise,
+    # _run_reconcile_pass books it as a transient failure and spams the fail
+    # streak every pass ("never recovers") until the process is killed. With the
+    # real (un-stubbed) _reconcile and _wire = None it must yield nothing, not
+    # raise, and leave the transient-failure streak untouched at zero.
+    broker = CTrader(symbol=None, config=_make_config())
+    broker._live_account_id = None
+    broker._wire = None
+    _open(tmp_path, broker)
+    _seed_working(broker, 'w-down', order_id=700, qty=volume_to_units(2000))
+
+    async def collect():
+        events: list = []
+        async for e in broker._run_reconcile_pass():
+            events.append(e)
+        return events
+
+    events = asyncio.run(collect())
+
+    assert events == []
+    assert broker._reconcile_fail_streak == 0
+    assert 'w-down' in _live_coids(broker)
+
+
 # === Native fail-safe reconcile-observe (2.5) =============================
 
 def _capture_failsafe(broker) -> list:
