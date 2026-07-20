@@ -772,6 +772,18 @@ class _ExecutionMixin(_CTraderBase):
             self, symbol: str, leg_id: str, volume: int, coid: str,
     ) -> None:
         """Reduce ONE broker leg by ``volume`` centi-units under ``coid``."""
+        # Remember which Pine id this leg's close serves BEFORE dispatching:
+        # the fill's PUSH copy carries only the venue close ``orderId`` +
+        # ``positionId``, and on a startup-adopted position no entry row links
+        # the id — ``_resolve_identity`` then falls back to this map. The core
+        # emulator persists the leg row under the deterministic ``coid``
+        # (``{parent}:{leg_id}``) with the close's ``pine_entry_id``.
+        pine_id: str | None = None
+        if self.store_ctx is not None:
+            row = self.store_ctx.get_order(coid)
+            if row is not None:
+                pine_id = row.pine_entry_id
+        self._close_dispatch_pine_by_position[int(leg_id)] = pine_id
         await self._dispatch_order(
             _oa.ProtoOAClosePositionReq(
                 ctidTraderAccountId=self._live_account_id,
@@ -863,6 +875,12 @@ class _ExecutionMixin(_CTraderBase):
                 f"{intent.symbol!r}"
             )
         volume = quantize_volume(intent.qty, rules.step_volume)
+        # Same fallback identity as ``close_leg``: a close fill on a
+        # startup-adopted position reverse-maps through this record when no
+        # entry row carries the ``position_id`` ref.
+        self._close_dispatch_pine_by_position[position_id] = (
+            intent.pine_id or None
+        )
         event = await self._dispatch_order(
             _oa.ProtoOAClosePositionReq(
                 ctidTraderAccountId=self._live_account_id,

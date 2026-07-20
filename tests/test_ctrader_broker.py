@@ -533,6 +533,132 @@ def __test_translate_closing_fill_with_coid_not_recovered_as_entry__(tmp_path):
     assert broker.store_ctx.find_by_ref('order_id', '222') is None
 
 
+def __test_translate_partial_close_fill_foreign_coid_persists_no_row__(tmp_path):
+    """A partial-close fill with a venue-supplied foreign coid must not upsert a row.
+
+    The venue's close order carries its own ``clientOrderId`` (observed live as
+    ``'27'``) that is not one of ours. The position-linking step used to pass it
+    to ``upsert_order``, which raised ``ValueError`` on the under-specified new
+    row and killed ``watch_orders`` mid-campaign. Linking is entry-row-only:
+    the close fill must translate to a CLOSE leg for its entry and leave the
+    store without a foreign row.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=20.0,
+        intent_key='pineL', pine_entry_id='pineL',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    broker.store_ctx.add_ref('c1', 'order_id', '111')
+    broker.store_ctx.add_ref('c1', 'position_id', '52695200')
+
+    order = _make_order(order_id=777, executed=1000, position_id=52695200,
+                        closing=True,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    order.clientOrderId = '27'
+    deal = _model.ProtoOADeal(dealId=42, filledVolume=1000, executionPrice=1.1)
+    ev = _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+                     deal=deal)
+    # The post-execution snapshot reports the position still OPEN (partial
+    # close: 20-unit entry reduced by 10).
+    ev.position.CopyFrom(_model.ProtoOAPosition(
+        positionId=52695200,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=1000,
+                                          tradeSide=_model.ProtoOATradeSide.BUY),
+    ))
+
+    out = broker._translate_exec_event(ev)
+
+    assert out is not None
+    assert out.event_type == 'filled'
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry == 'pineL'
+    assert out.fill_qty == 10.0
+    # The foreign coid never became a store row, and the entry row survived.
+    assert broker.store_ctx.get_order('27') is None
+    assert broker.store_ctx.get_order('c1') is not None
+
+
+def __test_translate_close_fill_on_adopted_position_maps_via_dispatch_record__(tmp_path):
+    """A close fill on a startup-adopted position maps through the dispatch record.
+
+    No entry row of this run links the ``positionId`` (the position was opened
+    by a prior process and adopted), so the ref index misses and the fill of
+    our OWN close used to be dropped as external activity — the strategy never
+    observed its flatten. ``execute_close`` records the position's Pine id so
+    ``_resolve_identity`` can attribute the fill as a CLOSE leg.
+    """
+    res = _oa.ProtoOAReconcileRes()
+    res.position.append(_model.ProtoOAPosition(
+        positionId=777,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=1000,
+                                          tradeSide=_model.ProtoOATradeSide.BUY),
+    ))
+    broker = _FakeBroker(reconcile=res)
+    _open_store(tmp_path, broker)
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_FILLED,
+        order=_make_order(order_id=888, executed=1000, price=1.25,
+                          status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED),
+    )
+    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=10.0)
+    asyncio.run(broker.execute_close(_envelope(intent)))
+
+    # The PUSH copy of the close fill: closingOrder, no refs for its ids.
+    order = _make_order(order_id=888, executed=1000, position_id=777,
+                        closing=True,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    deal = _model.ProtoOADeal(dealId=77, filledVolume=1000, executionPrice=1.25)
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+                    deal=deal))
+
+    assert out is not None
+    assert out.event_type == 'filled'
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry == 'Long'
+    assert out.fill_qty == 10.0
+
+
+def __test_watch_orders_survives_translation_failure__():
+    """One poisonous PUSH message must not terminate the order-event stream.
+
+    A translation error strands the live strategy on an open position if it
+    tears ``watch_orders`` down; the stream must log, drop the message and
+    keep serving later events (the reconcile pass gap-fills the dropped one).
+    """
+    broker = _FakeBroker()
+    poison = _exec_event(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+    good = _exec_event(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+
+    orig = broker._translate_exec_event
+
+    def flaky(message):
+        if message is poison:
+            raise RuntimeError("translation boom")
+        return orig(message)
+
+    broker._translate_exec_event = flaky
+
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        broker._exec_events.put_nowait(poison)
+        broker._exec_events.put_nowait(good)
+        agen = broker.watch_orders()
+        try:
+            return await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+        finally:
+            await agen.aclose()
+
+    event = asyncio.run(run())
+    # The poison message was skipped; the following event still surfaced.
+    assert event is not None
+    assert event.event_type == 'created'
+
+
 # === state mapping ========================================================
 
 def __test_get_open_orders_maps_working_order__():

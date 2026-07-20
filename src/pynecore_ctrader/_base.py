@@ -202,6 +202,15 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         #: ``ctrader_position_id_shared`` warning fires once per position per run
         #: rather than per linking entry. See :meth:`_link_position_ref`.
         self._shared_position_logged: set[int] = set()
+        #: Pine entry id (``CloseIntent.pine_id``; ``None`` for close_all) per
+        #: ``positionId`` this session dispatched a close against — recorded by
+        #: ``execute_close`` / ``close_leg``. A close fill's PUSH copy carries
+        #: only the venue's own close ``orderId`` (never in the ref index) plus
+        #: the ``positionId``; when no entry row links that position (a
+        #: startup-adopted position closed by this run), ``_resolve_identity``
+        #: falls back to this map so our OWN close fill is emitted as a CLOSE
+        #: leg instead of being dropped as external activity.
+        self._close_dispatch_pine_by_position: dict[int, str | None] = {}
         #: One-shot guard for the startup adoption baseline. The engine's startup
         #: ``reconcile`` adopts the broker net position deal-independently; the
         #: FIRST ``get_position`` / ``fetch_raw_positions`` call (which IS that

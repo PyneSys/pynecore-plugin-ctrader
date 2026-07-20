@@ -100,7 +100,29 @@ class _EventStreamMixin(_CTraderBase):
                     _BACKLOG_WATERMARK,
                 )
                 warned = True
-            event = self._translate_exec_event(message)
+            try:
+                event = self._translate_exec_event(message)
+            except BrokerManualInterventionError:
+                # A deliberate halt must reach the engine's graceful stop.
+                raise
+            except Exception as exc:  # noqa: BLE001 - one message must not kill the stream
+                # A translation failure on one PUSH message is recoverable:
+                # tearing the stream down would leave the live strategy
+                # stale on an open position, which is far worse than
+                # degrading to the reconcile-snapshot gap-filler (it
+                # re-derives missed fills from the working/position
+                # snapshots on its ~5 s cadence). Log + audit, keep going.
+                logger.exception(
+                    "cTrader execution-event translation failed; message "
+                    "dropped (reconcile gap-filler covers missed fills): %s",
+                    exc,
+                )
+                if self.store_ctx is not None:
+                    self.store_ctx.log_event(
+                        'exec_event_translation_failed',
+                        payload={'error': str(exc)},
+                    )
+                continue
             if event is not None:
                 yield event
 
@@ -267,7 +289,13 @@ class _EventStreamMixin(_CTraderBase):
         if (event_type == 'filled' and order.closingOrder
                 and self._position_is_flat(message)):
             self._mark_position_closed(order.positionId)
-        elif event_type in ('filled', 'partial') and order.positionId:
+        elif (event_type in ('filled', 'partial') and order.positionId
+              and not order.closingOrder):
+            # Position-linking mirrors ``positionId`` onto the ENTRY row a fill
+            # belongs to. A closing-order fill (e.g. a partial close that
+            # leaves the position open) has no entry row of its own: its
+            # ``orderId`` is the venue's close order and its ``clientOrderId``
+            # is not one of ours — linking would try to upsert a foreign coid.
             self._link_position(order, exch_order.client_order_id)
         elif (event_type == 'cancelled' and not order.closingOrder
               and order.orderId):
@@ -336,6 +364,19 @@ class _EventStreamMixin(_CTraderBase):
         if row is None and order.positionId:
             row = self.store_ctx.find_by_ref('position_id', str(order.positionId))
         if row is None:
+            if order.closingOrder and order.positionId in (
+                    self._close_dispatch_pine_by_position):
+                # A close THIS session dispatched against a position no entry
+                # row links (startup-adopted exposure): the fill's own
+                # ``orderId`` is never in the ref index and the ``position_id``
+                # alias only exists for entries this run placed. Without this
+                # fallback the fill of our OWN close is dropped as external
+                # activity and the strategy never observes the flatten.
+                return (
+                    None,
+                    self._close_dispatch_pine_by_position[order.positionId],
+                    LegType.CLOSE,
+                )
             return None, None, None
         if order.closingOrder:
             return None, row.pine_entry_id, LegType.CLOSE
@@ -464,9 +505,16 @@ class _EventStreamMixin(_CTraderBase):
         if target_coid is None:
             return
         # ``upsert_order`` REPLACES the extras blob, so read-merge to preserve
-        # the existing ``order_id`` alias mirror.
+        # the existing ``order_id`` alias mirror. Linking only ever UPDATES an
+        # entry row this run recorded: a ``target_coid`` with no row means the
+        # id is not ours (cTrader can echo a foreign ``clientOrderId`` on
+        # orders we did not place via that field) — upserting it would insert
+        # an under-specified row and ``upsert_order`` raises ``ValueError`` on
+        # the missing required fields, killing the event stream.
         existing = self.store_ctx.get_order(target_coid)
-        extras = dict(existing.extras or {}) if existing is not None else {}
+        if existing is None:
+            return
+        extras = dict(existing.extras or {})
         extras['position_id'] = order.positionId
         self.store_ctx.upsert_order(target_coid, extras=extras)
         self._link_position_ref(target_coid, order.positionId)
