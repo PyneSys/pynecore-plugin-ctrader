@@ -45,6 +45,23 @@ INBOUND_IDLE_TIMEOUT = 90.0
 #: Default timeout, in seconds, for a request awaiting its correlated response.
 REQUEST_TIMEOUT = 30.0
 
+#: Bound on opening the TCP+TLS connection. ``asyncio.open_connection`` has no
+#: intrinsic timeout, so a socket that accepts the TCP handshake but never
+#: completes TLS (broker edge in maintenance, a half-open path) would wedge the
+#: one-shot startup bridge (``_authed_session`` under ``_run``) forever — the
+#: exact stall behind "Fetching symbol info..." hanging with no bound. On
+#: expiry the connect is cancelled and surfaced as a retryable
+#: :class:`~pynecore_ctrader.wire.CTraderConnectionError`.
+CONNECT_TIMEOUT = 30.0
+
+#: Bound on draining a socket close (``StreamWriter.wait_closed``). The TLS
+#: close-notify exchange cannot complete against an unresponsive / half-open
+#: peer, so an unbounded ``wait_closed`` in teardown wedges indefinitely —
+#: crucially inside the cancellation ``finally`` of the one-shot bridge, which
+#: swallows a Ctrl-C-driven cancel until an external SIGKILL. Teardown must
+#: never block on a dead peer, so the drain is abandoned on expiry.
+CLOSE_TIMEOUT = 5.0
+
 
 def protobuf_host(demo: bool) -> str:
     """Return the protobuf API host for the demo or live system.

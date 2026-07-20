@@ -187,11 +187,30 @@ class WireClient:
         return self._writer is not None and not self._writer.is_closing()
 
     async def connect(self) -> None:
-        """Open the TLS connection and start the receive and heartbeat tasks."""
+        """Open the TLS connection and start the receive and heartbeat tasks.
+
+        The connect is bounded by :data:`~pynecore_ctrader.helpers.CONNECT_TIMEOUT`:
+        ``asyncio.open_connection`` waits without limit, so a socket that accepts
+        the TCP handshake but never finishes TLS (a broker edge in maintenance, a
+        half-open network path) would otherwise stall the one-shot startup bridge
+        forever. On expiry the in-flight connect is cancelled and surfaced as a
+        retryable :class:`CTraderConnectionError`, so the ``--broker`` / ``--live``
+        startup rides it out via its backoff-retry loop instead of hanging.
+
+        :raises CTraderConnectionError: If the connection cannot be established
+            within :data:`~pynecore_ctrader.helpers.CONNECT_TIMEOUT`.
+        """
         ssl_context = ssl.create_default_context()
-        self._reader, self._writer = await asyncio.open_connection(
-            self._host, self._port, ssl=ssl_context
-        )
+        try:
+            self._reader, self._writer = await asyncio.wait_for(
+                asyncio.open_connection(self._host, self._port, ssl=ssl_context),
+                timeout=helpers.CONNECT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise CTraderConnectionError(
+                f"connection to {self._host}:{self._port} not established "
+                f"within {helpers.CONNECT_TIMEOUT}s"
+            ) from None
         now = asyncio.get_running_loop().time()
         self._last_send = now
         self._last_recv = now
@@ -216,9 +235,16 @@ class WireClient:
         writer = self._writer
         self._close_writer()
         if writer is not None:
+            # ``wait_closed`` drains the TLS close-notify exchange, which cannot
+            # complete against an unresponsive / half-open peer. Bound it so a
+            # dead socket never wedges teardown — critically, this teardown runs
+            # in the cancellation ``finally`` of the one-shot bridge, so an
+            # unbounded drain there swallows a Ctrl-C-driven cancel until an
+            # external SIGKILL. On expiry the socket is already ``close()``d, so
+            # abandoning the drain leaks nothing the OS won't reclaim.
             try:
-                await writer.wait_closed()
-            except (OSError, ssl.SSLError):
+                await asyncio.wait_for(writer.wait_closed(), timeout=helpers.CLOSE_TIMEOUT)
+            except (OSError, ssl.SSLError, asyncio.TimeoutError):
                 pass
         self._writer = None
         self._reader = None
