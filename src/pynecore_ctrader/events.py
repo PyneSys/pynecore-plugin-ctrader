@@ -269,6 +269,14 @@ class _EventStreamMixin(_CTraderBase):
             self._mark_position_closed(order.positionId)
         elif event_type in ('filled', 'partial') and order.positionId:
             self._link_position(order, exch_order.client_order_id)
+        elif (event_type == 'cancelled' and not order.closingOrder
+              and order.orderId):
+            # An external / expiry cancel that reaches the PUSH stream (rather
+            # than being consumed by the dispatch confirmed-cancel path) must
+            # also retire its working-order row, or the venue-cancelled order
+            # stays live in the store. The helper leaves a partially filled
+            # entry's row live (its position side is still open exposure).
+            self._retire_cancelled_working_order(order.orderId)
 
         return OrderEvent(
             order=exch_order,

@@ -944,6 +944,8 @@ class _ExecutionMixin(_CTraderBase):
         if (event.executionType
                 == _model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED):
             return False
+        if event.executionType == _model.ProtoOAExecutionType.ORDER_CANCELLED:
+            self._retire_cancelled_working_order(order_id)
         return True
 
     async def _clear_exit_bracket(
@@ -1011,6 +1013,7 @@ class _ExecutionMixin(_CTraderBase):
             raise
         exec_type = event.executionType
         if exec_type == _model.ProtoOAExecutionType.ORDER_CANCELLED:
+            self._retire_cancelled_working_order(order_id)
             return CancelDispositionOutcome.CANCEL_CONFIRMED
         if exec_type == _model.ProtoOAExecutionType.ORDER_FILLED:
             return CancelDispositionOutcome.ALREADY_FILLED

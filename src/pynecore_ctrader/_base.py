@@ -1104,6 +1104,35 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
                 payload={'fifo_head_coid': existing.client_order_id},
             )
 
+    def _retire_cancelled_working_order(self, order_id: int) -> None:
+        """Close the BrokerStore working-order row of a confirmed cancel.
+
+        A synchronous ``ORDER_CANCELLED`` acknowledgement is consumed by the
+        dispatch path (``send_request`` correlates it away), so no PUSH
+        ``cancelled`` event ever reaches :meth:`_translate_exec_event` to retire
+        the row. Without this the working row stays ``confirmed`` /
+        ``closed_ts_ms = NULL`` indefinitely, so a graceful shutdown before the
+        reconcile disappearance-grace window leaves a venue-cancelled order live
+        in the store — a durable terminal-state inconsistency. Match the row by
+        its ``order_id`` alias and close it.
+
+        A partially filled entry whose unfilled residual is cancelled keeps a
+        live position under its row (the fill side is still open exposure that
+        later close / reconcile events must reverse-map), so a row carrying fills
+        is left live for the position-close / reconcile path to retire. A missing
+        row (persistence off, or already retired by a concurrent reconcile pass)
+        is a benign no-op; :meth:`close_order` is itself idempotent, so a later
+        duplicate signal cannot double-count.
+
+        :param order_id: The broker ``orderId`` of the cancelled working order.
+        """
+        if self.store_ctx is None or not order_id:
+            return
+        row = self.store_ctx.find_by_ref('order_id', str(order_id))
+        if row is None or row.filled_qty > 1e-9:
+            return
+        self.store_ctx.close_order(row.client_order_id)
+
     # === Cross-mix-in private surface (type-only) ===========================
     # Implementations live in the provider / execution / state / events
     # mix-ins; declared here with a ``...`` body so each mix-in can call

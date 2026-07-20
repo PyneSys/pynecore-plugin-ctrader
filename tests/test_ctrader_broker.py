@@ -813,6 +813,61 @@ def __test_cancel_no_live_order_is_unknown_without_dispatch__(tmp_path):
     assert broker.sent == []
 
 
+def __test_cancel_confirmed_closes_broker_store_row__(tmp_path):
+    # A synchronous ORDER_CANCELLED is consumed by the dispatch path, so no
+    # PUSH cancelled event retires the row — the confirmed-cancel path must
+    # itself close the working row, or a graceful shutdown before the reconcile
+    # grace window leaves a venue-cancelled order live in the store.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED)
+    assert _cancel(broker) is CancelDispositionOutcome.CANCEL_CONFIRMED
+    assert list(broker.store_ctx.iter_live_orders()) == []
+    row = broker.store_ctx.get_order('coid-111')
+    assert row is not None and row.closed_ts_ms is not None
+    # Refs are dropped by close_order, so a duplicate signal is a benign no-op.
+    assert broker.store_ctx.find_by_ref('order_id', '111') is None
+
+
+def __test_execute_cancel_bool_confirmed_closes_broker_store_row__(tmp_path):
+    # The bool-only execute_cancel path (diff drop / OCA cascade / forced
+    # cancel) must also retire the working row on a confirmed ORDER_CANCELLED.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED)
+    intent = CancelIntent(pine_id='Long', symbol='EURUSD')
+    assert asyncio.run(broker.execute_cancel(_envelope(intent))) is True
+    assert list(broker.store_ctx.iter_live_orders()) == []
+
+
+def __test_cancel_confirmed_keeps_partially_filled_row_live__(tmp_path):
+    # A cancelled UNFILLED residual of a partially filled entry leaves a live
+    # position under the row — retiring it would strand that exposure. The
+    # confirmed-cancel close must skip a row carrying fills.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker.store_ctx.set_filled('coid-111', 4.0)
+    broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED)
+    assert _cancel(broker) is CancelDispositionOutcome.CANCEL_CONFIRMED
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+
+
+def __test_push_cancelled_closes_broker_store_row__(tmp_path):
+    # An external / expiry cancel that reaches the PUSH stream (not consumed by
+    # the dispatch path) must also retire its working-order row.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    event = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED,
+                    order=_make_order(order_id=111)))
+    assert event is not None and event.event_type == 'cancelled'
+    assert list(broker.store_ctx.iter_live_orders()) == []
+
+
 # === Bracket-attach-reject residual cleanup ================================
 # A rejected ProtoOAAmendPositionSLTPReq references only the positionId, so
 # the unfilled remainder of a partially filled parent LIMIT/STOP stays live
