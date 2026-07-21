@@ -552,6 +552,12 @@ def __test_translate_partial_close_fill_foreign_coid_persists_no_row__(tmp_path)
     )
     broker.store_ctx.add_ref('c1', 'order_id', '111')
     broker.store_ctx.add_ref('c1', 'position_id', '52695200')
+    # A self-close always registers the dispatch record (execute_close /
+    # close_leg). This is the run-owned handle that attributes the close fill;
+    # the shared ``position_id`` ref alone is deliberately NOT enough (it is
+    # present in every run that entered the netted position — see
+    # ``_resolve_identity`` run-ownership isolation).
+    broker._close_dispatch_pine_by_position[52695200] = 'pineL'
 
     order = _make_order(order_id=777, executed=1000, position_id=52695200,
                         closing=True,
@@ -621,6 +627,71 @@ def __test_translate_close_fill_on_adopted_position_maps_via_dispatch_record__(t
     assert out.leg_type is LegType.CLOSE
     assert out.from_entry == 'Long'
     assert out.fill_qty == 10.0
+
+
+def __test_translate_foreign_run_entry_fill_on_shared_position_dropped__(tmp_path):
+    """A concurrent run's entry fill on the SHARED netted positionId is dropped.
+
+    On a one-way account both runs attach their entries to the same venue
+    ``positionId`` and each records a ``position_id`` ref for it. This run's
+    PUSH stream also sees the OTHER run's entry fill (a different, un-journaled
+    ``orderId`` but the same shared ``positionId``). Attributing it through the
+    shared ``position_id`` ref would grow this run's position past its own
+    slice. Only the run-unique ``order_id`` may attribute an entry, so the
+    foreign fill is dropped as external activity.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='pineL', pine_entry_id='pineL',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    # This run's own entry: order 111 -> shared position 999.
+    broker.store_ctx.add_ref('c1', 'order_id', '111')
+    broker.store_ctx.add_ref('c1', 'position_id', '999')
+
+    # The other run's entry fill: a DIFFERENT orderId, the SAME shared position.
+    order = _make_order(order_id=222, executed=1000, position_id=999,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    deal = _model.ProtoOADeal(dealId=7, filledVolume=1000, executionPrice=1.2)
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+                    deal=deal))
+    assert out is None
+
+
+def __test_translate_foreign_run_close_fill_on_shared_position_dropped__(tmp_path):
+    """A concurrent run's close fill on the SHARED netted positionId is dropped.
+
+    This run entered the netted position (so it holds a ``position_id`` ref) but
+    did NOT dispatch this close. The other run's close of the shared net reaches
+    this run's PUSH stream as a ``closingOrder`` fill on the shared
+    ``positionId``. Booking it through the shared ``position_id`` ref would
+    record a phantom exit against this run's still-open slice; only a close THIS
+    run dispatched (``_close_dispatch_pine_by_position``) is ours.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='pineL', pine_entry_id='pineL',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    broker.store_ctx.add_ref('c1', 'order_id', '111')
+    broker.store_ctx.add_ref('c1', 'position_id', '999')
+    # This run dispatched NO close -> _close_dispatch_pine_by_position is empty.
+
+    order = _make_order(order_id=888, executed=1000, position_id=999,
+                        closing=True,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    deal = _model.ProtoOADeal(dealId=8, filledVolume=1000, executionPrice=1.2)
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+                    deal=deal))
+    assert out is None
+    # This run's own entry row is untouched by the foreign close.
+    assert broker.store_ctx.get_order('c1') is not None
 
 
 def __test_watch_orders_survives_translation_failure__():
@@ -738,6 +809,71 @@ def __test_fetch_raw_positions_returns_legs_oldest_first__():
     assert [leg.leg_id for leg in legs] == ["1", "2"]
     assert legs[0].qty == 30.0 and legs[1].qty == 10.0
     assert all(leg.side == "buy" for leg in legs)
+
+
+def _own_entry_row(broker, *, coid, position_id, qty=10.0):
+    """Seed a live entry row owning ``position_id`` (as a fill would)."""
+    create_entry_order_row(
+        broker.store_ctx, coid=coid, symbol='EURUSD', side='buy', qty=qty,
+        intent_key=coid, pine_entry_id=coid,
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    broker.store_ctx.upsert_order(
+        coid, state='confirmed', filled_qty=qty,
+        exchange_order_id=str(position_id),
+        extras={'kind': 'position', 'order_type': 'market',
+                'position_id': position_id},
+    )
+
+
+def __test_fetch_raw_positions_excludes_foreign_run_leg__(tmp_path):
+    # On a shared account+symbol scope the reconcile snapshot carries every
+    # run's leg. The one-way emulator's leg source must return ONLY the leg this
+    # run's journal owns, or a close / reversal would plan over another run's leg.
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, open_ts=1000),  # this run's
+        _position(position_id=2, volume=1000, open_ts=2000),  # another run's
+    )
+    _open_store(tmp_path, broker)
+    _own_entry_row(broker, coid='c1', position_id=1)
+    legs = asyncio.run(broker.fetch_raw_positions("EURUSD"))
+    assert [leg.leg_id for leg in legs] == ["1"]
+
+
+def __test_get_position_excludes_foreign_run_leg_netting__(tmp_path):
+    # Netting single-position read: a fresh run whose journal owns nothing must
+    # NOT adopt a concurrent run's open position on the same account+symbol.
+    res = _oa.ProtoOAReconcileRes()
+    res.position.append(_position(position_id=2, volume=1000))
+    broker = _FakeBroker(reconcile=res)
+    _open_store(tmp_path, broker)
+    # This run's journal is empty (owns no positionId) -> flat, not adoption.
+    assert asyncio.run(broker.get_position("EURUSD")) is None
+    # Once it owns position 2, the same read returns it (genuine restart).
+    _own_entry_row(broker, coid='c1', position_id=2, qty=10.0)
+    pos = asyncio.run(broker.get_position("EURUSD"))
+    assert pos is not None and pos.size == 10.0
+
+
+def __test_get_open_orders_excludes_foreign_run_working_order__(tmp_path):
+    # A concurrent run's resting working order on the shared scope must not be
+    # returned as one the engine should verify / track.
+    res = _oa.ProtoOAReconcileRes()
+    res.order.append(_make_order(order_id=42, order_type=_model.ProtoOAOrderType.LIMIT,
+                                 limit=1.2345, volume=2000))
+    res.order.append(_make_order(order_id=99, order_type=_model.ProtoOAOrderType.LIMIT,
+                                 limit=1.2000, volume=1000))
+    broker = _FakeBroker(reconcile=res)
+    _open_store(tmp_path, broker)
+    # This run journaled only order 42 (order_id ref).
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=20.0,
+        intent_key='c1', pine_entry_id='c1',
+        kind=ENTRY_KIND_WORKING, order_type='limit',
+    )
+    broker.store_ctx.add_ref('c1', 'order_id', '42')
+    orders = asyncio.run(broker.get_open_orders("EURUSD"))
+    assert [o.id for o in orders] == ["42"]
 
 
 # === PositionPort transport primitives (one-way emulation) ================

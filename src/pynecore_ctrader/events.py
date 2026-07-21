@@ -351,36 +351,51 @@ class _EventStreamMixin(_CTraderBase):
     ) -> tuple[str | None, str | None, LegType | None]:
         """Reverse-map an execution event to its Pine identity.
 
-        Resolves the originating entry via the BrokerStore order-ref index
-        (``order_id`` then ``position_id``). A closing-order fill is reported as
-        the entry's exit; a non-closing fill as the entry itself. Precise
-        TP-vs-SL leg attribution and disconnect-replay are M3.
+        Run-ownership isolation is the governing rule here. On a one-way
+        (netting) account the venue keeps a SINGLE net position per symbol, so
+        every run trading that account+symbol attaches its entries to — and
+        records a ``position_id`` ref for — the SAME ``positionId``. That alias
+        is therefore NOT run-unique: reverse-mapping a fill through it would let
+        one run adopt another run's entry (position grows past the run's own
+        slice) or book another run's close as its own exit. The only run-unique
+        venue handle is the entry ``orderId`` this run placed (recorded as an
+        ``order_id`` ref); a close carries only the venue's own close
+        ``orderId`` (never in the ref index), so a close is ours only when THIS
+        run dispatched it (``_close_dispatch_pine_by_position``, keyed by the
+        shared ``positionId`` but only ever populated by our own
+        ``execute_close`` / ``close_leg``).
+
+        A closing-order fill is reported as the entry's exit; a non-closing
+        fill as the entry itself. A fill that maps to neither run-owned handle
+        is another run's / external activity and returns ``(None, None, None)``
+        so the caller drops it.
         """
         if self.store_ctx is None:
             return None, None, None
-        row = None
-        if order.orderId:
-            row = self.store_ctx.find_by_ref('order_id', str(order.orderId))
-        if row is None and order.positionId:
-            row = self.store_ctx.find_by_ref('position_id', str(order.positionId))
-        if row is None:
-            if order.closingOrder and order.positionId in (
-                    self._close_dispatch_pine_by_position):
-                # A close THIS session dispatched against a position no entry
-                # row links (startup-adopted exposure): the fill's own
-                # ``orderId`` is never in the ref index and the ``position_id``
-                # alias only exists for entries this run placed. Without this
-                # fallback the fill of our OWN close is dropped as external
-                # activity and the strategy never observes the flatten.
-                return (
-                    None,
-                    self._close_dispatch_pine_by_position[order.positionId],
-                    LegType.CLOSE,
-                )
-            return None, None, None
-        if order.closingOrder:
-            return None, row.pine_entry_id, LegType.CLOSE
-        return row.pine_entry_id, None, LegType.ENTRY
+        # ``order_id`` — the run-unique handle — resolves an entry this run
+        # placed. It never matches a close order (a close order's id is never
+        # journaled), so a matched row is always an ENTRY; the ``closingOrder``
+        # guard is defensive.
+        row = (self.store_ctx.find_by_ref('order_id', str(order.orderId))
+               if order.orderId else None)
+        if row is not None:
+            if order.closingOrder:
+                return None, row.pine_entry_id, LegType.CLOSE
+            return row.pine_entry_id, None, LegType.ENTRY
+        # No run-owned entry order matched. A closing fill is ours only when
+        # this run dispatched the close against that position — the shared
+        # ``position_id`` ref must NOT stand in for that dispatch, or a
+        # concurrent run's close of the netted position would be mis-booked as
+        # this run's exit. This same map also covers a close THIS run
+        # dispatched against startup-adopted exposure that no entry row links.
+        if order.closingOrder and order.positionId in (
+                self._close_dispatch_pine_by_position):
+            return (
+                None,
+                self._close_dispatch_pine_by_position[order.positionId],
+                LegType.CLOSE,
+            )
+        return None, None, None
 
     def _recover_parked_entry_by_coid(self, order) -> str | None:
         """Reverse-map a parked entry fill the order/position ref index missed.

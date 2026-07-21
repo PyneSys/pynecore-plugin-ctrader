@@ -240,6 +240,11 @@ class _StateMixin(_CTraderBase):
             symbol_id = order.tradeData.symbolId
             if want_id is not None and symbol_id != want_id:
                 continue
+            if self.store_ctx is not None and not self._order_is_owned(order):
+                # Run-ownership isolation: skip a concurrent run's working order
+                # on a shared account+symbol scope — only orders THIS run's
+                # journal placed are the engine's to verify / track.
+                continue
             qty = volume_to_units(order.tradeData.volume)
             filled = volume_to_units(order.executedVolume)
             side = ('buy' if order.tradeData.tradeSide == _model.ProtoOATradeSide.BUY
@@ -284,11 +289,17 @@ class _StateMixin(_CTraderBase):
         res = await self._reconcile()
         self._apply_adoption_baseline(res)
         digits = self._symbol_rules[symbol].digits if symbol in self._symbol_rules else 5
+        # Run-ownership isolation: return only legs THIS run's journal owns, so
+        # the one-way emulator's close / reversal planner never plans over a
+        # concurrent run's leg on a shared account+symbol scope.
+        owned = self._owned_position_ids()
         legs: list[PositionLeg] = []
         for position in res.position:
             if position.positionStatus != _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue
             if position.tradeData.symbolId != want_id:
+                continue
+            if owned is not None and position.positionId not in owned:
                 continue
             side = ('buy' if position.tradeData.tradeSide == _model.ProtoOATradeSide.BUY
                     else 'sell')
@@ -323,10 +334,17 @@ class _StateMixin(_CTraderBase):
             return None
         res = await self._reconcile()
         self._apply_adoption_baseline(res)
+        # Run-ownership isolation: adopt only a position THIS run's journal owns
+        # so a concurrent run's leg on the same account+symbol is never folded
+        # into this run's netted snapshot (startup adoption, periodic
+        # shrink-to-zero reconcile).
+        owned = self._owned_position_ids()
         for position in res.position:
             if position.positionStatus != _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue
             if position.tradeData.symbolId != want_id:
+                continue
+            if owned is not None and position.positionId not in owned:
                 continue
             digits = self._symbol_rules[symbol].digits if symbol in self._symbol_rules else 5
             side = ('long' if position.tradeData.tradeSide == _model.ProtoOATradeSide.BUY

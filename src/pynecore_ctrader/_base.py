@@ -1077,6 +1077,64 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         """
         return self._symbols_by_id.get(symbol_id, str(symbol_id))
 
+    def _owned_position_ids(self) -> set[int] | None:
+        """Venue ``positionId``s this run owns, from its durable order journal.
+
+        Run-ownership isolation for the venue snapshot reads. A cTrader account
+        reports EVERY open position for a symbol regardless of which run opened
+        it, so on a shared account+symbol scope two independent runs see each
+        other's legs. Filtering those reads to the set THIS run's own journal
+        recorded keeps each run acting only on its own exposure: close / exit
+        targeting (:meth:`_find_open_position_id`), the one-way emulator leg
+        source (``fetch_raw_positions``), the netted ``get_position`` adoption
+        input and ``get_open_orders`` all consult this set.
+
+        Ownership is every live entry row's ``positionId`` (mirrored into
+        ``extras['position_id']`` when the entry fills, with ``exchange_order_id``
+        as the compatibility fallback) plus every position this run dispatched a
+        close against (``_close_dispatch_pine_by_position`` — so the closing
+        position stays visible until its close settles). Persisted across
+        restarts, so a genuine restart still adopts its own prior position while
+        a concurrent fresh run (empty journal) owns nothing and stays flat.
+
+        Returns ``None`` — the "do not filter" sentinel — when no journal is
+        available (store off / unit fixtures), preserving the raw account-wide
+        reads those paths rely on.
+        """
+        if self.store_ctx is None:
+            return None
+        owned: set[int] = set()
+        for row in self.store_ctx.iter_live_orders():
+            pid = (row.extras or {}).get('position_id')
+            if pid:
+                owned.add(int(pid))
+                continue
+            xoid = row.exchange_order_id
+            if xoid and xoid.isdigit():
+                owned.add(int(xoid))
+        owned.update(
+            pid for pid in self._close_dispatch_pine_by_position if pid
+        )
+        return owned
+
+    def _order_is_owned(self, order) -> bool:
+        """Report whether a venue working order was placed by THIS run.
+
+        Run-ownership for ``get_open_orders``: a working order is ours when its
+        venue ``orderId`` is a journaled ref, or its ``clientOrderId`` echoes one
+        of our own rows (a resting entry not yet linked by ``orderId``). Foreign
+        runs' working orders on a shared account+symbol scope are excluded so the
+        engine never verifies / tracks another run's order. Store-less callers
+        never reach this (the caller gates on ``store_ctx``).
+        """
+        if self.store_ctx is None:
+            return True
+        if order.orderId and self.store_ctx.find_by_ref(
+                'order_id', str(order.orderId)) is not None:
+            return True
+        return bool(order.clientOrderId
+                    and self.store_ctx.get_order(order.clientOrderId) is not None)
+
     def _link_position_ref(self, coid: str, position_id: int) -> None:
         """Pin the ``position_id`` reverse-map alias to the FIFO-oldest entry.
 

@@ -146,6 +146,12 @@ class _ExecutionMixin(_CTraderBase):
             # symbol's position on a multi-symbol account.
             return None
         res = await self._reconcile()
+        # NETTING single-position path: the account merges same-symbol entries
+        # (and every concurrent run's exposure) into ONE position, so the sole
+        # open position IS this run's slice — no ownership filter applies here
+        # (that would break closing a startup-adopted own position that carries
+        # no entry row). Cross-run leg selection is a HEDGING concern and lives
+        # in the emulator's ``fetch_raw_positions`` (owned-scoped there).
         for position in res.position:
             if position.positionStatus != _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue
