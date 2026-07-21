@@ -211,6 +211,16 @@ class WireClient:
                 f"connection to {self._host}:{self._port} not established "
                 f"within {helpers.CONNECT_TIMEOUT}s"
             ) from None
+        except OSError as exc:
+            # A transient socket/TLS fault during the handshake — most notably
+            # ``ConnectionResetError`` ([Errno 54]) raised straight out of
+            # ``asyncio.open_connection`` when the broker edge drops the peer
+            # mid-TLS. Surface it as a retryable ``CTraderConnectionError`` so
+            # the ``--broker`` / ``--live`` startup rides it out on its
+            # backoff-retry loop instead of exiting with a raw traceback.
+            raise CTraderConnectionError(
+                f"connection to {self._host}:{self._port} failed: {exc}"
+            ) from exc
         now = asyncio.get_running_loop().time()
         self._last_send = now
         self._last_recv = now

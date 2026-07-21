@@ -114,6 +114,26 @@ def __test_connect_bounds_the_tls_handshake_and_is_retryable__(monkeypatch):
     assert elapsed < 3.0
 
 
+def __test_connect_wraps_connection_reset_as_retryable__(monkeypatch):
+    # A raw ConnectionResetError ([Errno 54]) out of asyncio.open_connection
+    # during the TLS handshake must not propagate untranslated: it is wrapped as
+    # a retryable CTraderConnectionError so the --broker/--live startup rides it
+    # out on its backoff-retry loop instead of dying with a raw traceback.
+    async def _boom(*_args, **_kwargs):
+        raise ConnectionResetError(54, "Connection reset by peer")
+
+    monkeypatch.setattr(asyncio, "open_connection", _boom)
+
+    async def scenario() -> None:
+        wire = WireClient("127.0.0.1", 1)
+        with pytest.raises(CTraderConnectionError) as excinfo:
+            await wire.connect()
+        assert is_retryable_provider_error(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, ConnectionResetError)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
 def __test_disconnect_drain_is_bounded_on_a_dead_peer__(monkeypatch):
     # wait_closed cannot complete against a half-open peer; disconnect must
     # abandon the drain on its bound so teardown (which runs in the one-shot
