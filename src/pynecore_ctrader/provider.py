@@ -579,7 +579,7 @@ class _ProviderMixin(_CTraderBase):
 
     @override
     async def on_reconnect(self) -> None:
-        """Replay the live subscription on the fresh connection.
+        """Replay the live subscription and backfill closed outage bars.
 
         Subscriptions are connection-scoped server state, and the lazy
         subscribe in :meth:`watch_ohlcv` runs under the framework's
@@ -588,10 +588,78 @@ class _ProviderMixin(_CTraderBase):
         round-trips. The framework awaits this hook OUTSIDE any timeout
         right after a successful ``connect()``, so the replay gets a full
         request budget here and the first ``watch_ohlcv`` call finds
-        ``_subscribed_symbols`` already populated.
+        ``_subscribed_symbols`` already populated. The subscription is restored
+        before querying history so current pushes accumulate in the router queue
+        while the historical request fills any fully closed slots missed during
+        the outage. Historical bars are bid-only, matching the provider's normal
+        historical download unless ask reconstruction is explicitly requested.
         """
         if self._live_subscription is not None:
             await self._subscribe_live(*self._live_subscription)
+            await self._backfill_live_gap(*self._live_subscription)
+
+    async def _backfill_live_gap(self, symbol: str, timeframe: str) -> None:
+        """Queue venue trendbars that closed since the last delivered live bar.
+
+        The current slot is deliberately excluded because it is still forming
+        and will arrive through the restored live subscription. Responses are
+        sorted and filtered at the local cursor, making inclusive venue bounds
+        and replayed edge bars harmless.
+
+        :param symbol: The cTrader symbol name.
+        :param timeframe: Timeframe in TradingView format.
+        :raises CTraderConnectionError: If the live connection is not open.
+        """
+        anchor = self._last_live_closed_bar
+        if anchor is None:
+            return
+        wire = self._wire
+        account_id = self._live_account_id
+        if wire is None or account_id is None:
+            raise CTraderConnectionError('live connection not established')
+
+        period_seconds = max(1, int(in_seconds(timeframe)))
+        current_slot = (
+            int(datetime.now(timezone.utc).timestamp()) // period_seconds
+            * period_seconds
+        )
+        cursor = int(anchor.timestamp) + period_seconds
+        if cursor >= current_slot:
+            return
+
+        symbol_id = await self._resolve_symbol_id(wire, account_id)
+        period = _model.ProtoOATrendbarPeriod.Value(self.to_exchange_timeframe(timeframe))
+        recovered_by_timestamp: dict[int, OHLCV] = {}
+        window_seconds = period_seconds * 2000
+        while cursor < current_slot:
+            window_end = min(cursor + window_seconds, current_slot)
+            response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
+                _oa.ProtoOAGetTrendbarsReq(
+                    ctidTraderAccountId=account_id,
+                    symbolId=symbol_id,
+                    period=period,
+                    fromTimestamp=cursor * 1000,
+                    toTimestamp=window_end * 1000,
+                )
+            ))
+            for trendbar in response.trendbar:
+                timestamp = trendbar.utcTimestampInMinutes * 60
+                if cursor <= timestamp < window_end:
+                    recovered_by_timestamp[timestamp] = self._decode_trendbar(trendbar)
+            cursor = window_end
+
+        recovered = [
+            recovered_by_timestamp[timestamp]
+            for timestamp in sorted(recovered_by_timestamp)
+        ]
+        self._pending_bars.extend(recovered)
+        if recovered:
+            logger.info(
+                'Backfilled %d closed trendbar(s) after reconnect (%d..%d)',
+                len(recovered),
+                recovered[0].timestamp,
+                recovered[-1].timestamp,
+            )
 
     @override
     async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
@@ -621,7 +689,10 @@ class _ProviderMixin(_CTraderBase):
 
         while True:
             if self._pending_bars:
-                return self._pending_bars.popleft()
+                bar = self._pending_bars.popleft()
+                if bar.is_closed:
+                    self._last_live_closed_bar = bar
+                return bar
             # The event router (see ``_CTraderBase._event_router_loop``) is the
             # sole consumer of ``wire.events`` and forwards spot events here, so
             # ``watch_ohlcv`` and ``watch_orders`` can stream concurrently

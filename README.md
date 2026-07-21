@@ -98,6 +98,10 @@ translation table in the config.
   client id and secret; the end user grants account access in the browser and
   the plugin stores the refreshable access token.
 - **Market data**: historical trendbars and live spot/trendbar subscriptions.
+  After a live reconnect, the provider replays every fully closed trendbar since
+  the last delivered close from cTrader history before resuming queued live
+  updates. The still-forming current slot is excluded, and duplicate boundary
+  bars returned by inclusive history bounds are filtered locally.
 - **Order model**: position-based with server-side stop-loss / take-profit /
   trailing stop as position attributes. Netting (one-way) accounts use the
   direct execution path; hedging accounts run through PyneCore's one-way

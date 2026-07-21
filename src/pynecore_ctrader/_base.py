@@ -151,6 +151,10 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         self._pending_bars: deque[OHLCV] = deque()
         self._current_bar: OHLCV | None = None
         self._current_bar_ts: int | None = None
+        # Last closed live bar handed to PyneCore. Unlike connection-scoped
+        # accumulators this survives reconnect so the provider can query the
+        # venue for closed trendbars missed while the socket was down.
+        self._last_live_closed_bar: OHLCV | None = None
         # Latest spot ``bid`` of the bar in progress. The live trendbar's close
         # lags the spot stream (it is not refreshed on every tick), so the spot
         # bid is the authoritative close. Reset on each rollover.

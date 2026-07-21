@@ -3,8 +3,10 @@
 import asyncio
 from dataclasses import replace
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from pynecore.core.broker.models import LegType, OrderStatus
+from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 from pynecore.testing.broker_lab import Scenario, Step, pairwise_cases
 from pynecore.testing.broker_lab.reference import (
     ReferenceVenueProfile,
@@ -17,6 +19,7 @@ from pynecore_ctrader.models import _SymbolRules
 from pynecore_ctrader.wire import (
     CTraderConnectionError,
     CTraderRequestSentConnectionError,
+    WireClient,
 )
 
 _RULES = _SymbolRules(
@@ -63,7 +66,7 @@ class OfflineWire:
         self.fail_next_new: str | None = None
         self.connected = True
         self.connect_calls = 0
-        self.fail_connects = 0
+        self.connect_error: BaseException | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -71,10 +74,11 @@ class OfflineWire:
 
     async def connect(self) -> None:
         self.connect_calls += 1
-        if self.fail_connects > 0:
-            self.fail_connects -= 1
+        if self.connect_error is not None:
+            error = self.connect_error
+            self.connect_error = None
             self.connected = False
-            raise CTraderConnectionError("injected cTrader connect failure")
+            raise error
         self.connected = True
 
     async def disconnect(self) -> None:
@@ -180,18 +184,18 @@ class OfflineWire:
                 event.position.CopyFrom(position)
             else:
                 del self.positions[request.positionId]
-            run_name = self.profile.dispatch_run
-            if run_name is None:
+            owner_run = self.profile.dispatch_run
+            if owner_run is None:
                 raise AssertionError("cTrader close request has no dispatch owner")
-            self.profile.pending_events.setdefault(run_name, []).append(event)
+            self.profile.broadcast_execution_event(event)
             leg_key = self.profile.position_keys[request.positionId]
             signed = closed_volume / 100.0
             current = self.profile.state.position_legs.get(leg_key, 0.0)
             residual_units = max(0.0, abs(current) - signed)
             updated = residual_units if current >= 0 else -residual_units
             self.profile.state.position_legs[leg_key] = updated
-            owner = self.profile.state.position_owners.get(run_name, 0.0)
-            self.profile.state.position_owners[run_name] = (
+            owner = self.profile.state.position_owners.get(owner_run, 0.0)
+            self.profile.state.position_owners[owner_run] = (
                 owner - signed if current >= 0 else owner + signed
             )
             self.profile.state.position = sum(
@@ -297,6 +301,16 @@ class OfflineCTrader(CTrader):
             self.profile.dispatch_run = None
 
 
+class OwnershipLeakingOfflineCTrader(OfflineCTrader):
+    """Deliberately broken broker that treats foreign entry fills as owned."""
+
+    def _resolve_identity(self, order, deal):
+        identity = super()._resolve_identity(order, deal)
+        if identity == (None, None, None) and not order.closingOrder:
+            return "foreign", None, LegType.ENTRY
+        return identity
+
+
 class CTraderProfile(ReferenceVenueProfile):
     """cTrader profile using real snapshot and correlated-ACK translation."""
 
@@ -312,9 +326,17 @@ class CTraderProfile(ReferenceVenueProfile):
         self.pending_events: dict[str, list[Any]] = {}
         self.position_keys: dict[int, tuple[str, str]] = {}
         self.dispatch_run: str | None = None
+        self.brokers: dict[str, OfflineCTrader] = {}
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
-        return OfflineCTrader(self, run_name, store_ctx)
+        broker = OfflineCTrader(self, run_name, store_ctx)
+        self.brokers[run_name] = broker
+        return broker
+
+    def broadcast_execution_event(self, event: Any) -> None:
+        """Queue one account-wide PUSH for every active broker instance."""
+        for run_name in self.brokers:
+            self.pending_events.setdefault(run_name, []).append(event)
 
     def handle_step(self, runner: Any, step: Step) -> bool:
         if step.kind == "expect_ctrader_request":
@@ -394,7 +416,7 @@ class CTraderProfile(ReferenceVenueProfile):
             )
             event.deal.CopyFrom(deal)
             self.wire.deals.append(deal)
-            self.pending_events.setdefault(step.run, []).append(event)
+            self.broadcast_execution_event(event)
             qty = wire_order.tradeData.volume / 100.0
             signed = (
                 qty
@@ -421,6 +443,25 @@ class CTraderProfile(ReferenceVenueProfile):
             if not events:
                 raise AssertionError("cTrader PUSH queue is empty")
             runner.runs[step.run].broker._exec_events.put_nowait(events.pop(0))
+            return True
+        if step.kind == "ctrader_deliver_pending_pushes":
+            runtime = runner.runs[step.run]
+            pending = self.pending_events.get(step.run, [])
+            messages = list(pending)
+            pending.clear()
+            emitted = 0
+            for message in messages:
+                event = runtime.broker._translate_exec_event(message)
+                if event is not None:
+                    emitted += 1
+                    runtime.engine.on_order_event(event)
+            if emitted:
+                runtime.engine.apply_async_events()
+            expected = int(step.values.get("emitted", emitted))
+            if emitted != expected:
+                raise AssertionError(
+                    f"expected {expected} owned cTrader PUSH events, got {emitted}"
+                )
             return True
         if step.kind == "ctrader_duplicate_pending_push":
             events = self.pending_events.get(step.run, [])
@@ -495,52 +536,139 @@ class CTraderProfile(ReferenceVenueProfile):
                     f"requests={len(new_requests)}, physical_orders={len(self.wire.orders)}"
                 )
             return True
-        if step.kind == "ctrader_transient_connect_retry":
-            broker = runner.runs[step.run].broker
-            self.wire.connected = False
-            self.wire.connect_calls = 0
-            self.wire.fail_connects = 1
-
-            async def connect_with_retry() -> None:
-                try:
-                    await broker.connect()
-                except CTraderConnectionError:
-                    await broker.connect()
-                else:
-                    raise AssertionError(
-                        "cTrader transient connect fault did not surface"
-                    )
-                if not broker.is_connected or self.wire.connect_calls != 2:
-                    raise AssertionError(
-                        "cTrader transient connect was not retried exactly once: "
-                        f"calls={self.wire.connect_calls}, connected={broker.is_connected}"
-                    )
-                await broker.disconnect()
-
-            asyncio.run(connect_with_retry())
+        if step.kind == "expect_ctrader_store_terminal":
+            pine_id = str(step.values["id"])
+            records = [
+                record
+                for record in self.state.orders.values()
+                if record.run_name == step.run and record.pine_id == pine_id
+            ]
+            if not records:
+                raise AssertionError(f"no cTrader order recorded for {pine_id!r}")
+            coid = records[-1].order.client_order_id
+            store_ctx = runner.runs[step.run].store_ctx
+            row = store_ctx.get_order(coid)
+            if row is None:
+                raise AssertionError(f"cTrader store row {coid!r} is missing")
+            if row.closed_ts_ms is None:
+                raise AssertionError(f"cTrader store row {coid!r} is still live")
+            live_coids = {live.client_order_id for live in store_ctx.iter_live_orders()}
+            if coid in live_coids:
+                raise AssertionError(
+                    f"terminal cTrader store row {coid!r} remains in the live index"
+                )
             return True
-        if step.kind == "ctrader_permanent_connect_failure":
+        if step.kind == "expect_ctrader_store_not_resurrected":
+            pine_id = str(step.values["id"])
+            records = [
+                record
+                for record in self.state.orders.values()
+                if record.run_name == step.run and record.pine_id == pine_id
+            ]
+            if not records:
+                raise AssertionError(f"no cTrader order recorded for {pine_id!r}")
+            coid = records[-1].order.client_order_id
+            store_ctx = runner.runs[step.run].store_ctx
+            if store_ctx.get_order(coid) is not None:
+                raise AssertionError(
+                    f"terminal cTrader order {coid!r} was copied into the new run instance"
+                )
+            live_coids = {live.client_order_id for live in store_ctx.iter_live_orders()}
+            if coid in live_coids:
+                raise AssertionError(
+                    f"terminal cTrader order {coid!r} resurrected in the new live index"
+                )
+            return True
+        if step.kind == "expect_ctrader_trade_ledger":
+            position = runner.runs[step.run].position
+            ledgers = {
+                "open": position.open_trades,
+                "closed": position.closed_trades,
+                "new_closed": position.new_closed_trades,
+            }
+            for name, trades in ledgers.items():
+                actual_ids = [trade.entry_id for trade in trades]
+                ids_key = f"{name}_ids"
+                if ids_key in step.values:
+                    expected_ids = list(step.values[ids_key])
+                    if actual_ids != expected_ids:
+                        raise AssertionError(
+                            f"cTrader trade ledger mismatch for {step.run} {name}: "
+                            f"expected entry_ids={expected_ids}, got {actual_ids}"
+                        )
+                count_key = f"{name}_count"
+                if count_key in step.values:
+                    expected_count = int(step.values[count_key])
+                    if len(actual_ids) != expected_count:
+                        raise AssertionError(
+                            f"cTrader trade ledger mismatch for {step.run} {name}: "
+                            f"expected count={expected_count}, got {len(actual_ids)}"
+                        )
+            return True
+        if step.kind == "ctrader_transient_oserror_translation":
+
+            async def translate_oserror() -> None:
+                wire = WireClient("offline.invalid")
+                with patch(
+                    "asyncio.open_connection",
+                    new=AsyncMock(side_effect=ConnectionResetError("injected reset")),
+                ):
+                    try:
+                        await wire.connect()
+                    except CTraderConnectionError as exc:
+                        if not isinstance(exc.__cause__, ConnectionResetError):
+                            raise AssertionError(
+                                "cTrader connect discarded the transient OSError cause"
+                            ) from exc
+                        if not is_retryable_provider_error(exc):
+                            raise AssertionError(
+                                "translated cTrader connection error is not retryable"
+                            ) from exc
+                    else:
+                        raise AssertionError(
+                            "cTrader WireClient did not translate a transient OSError"
+                        )
+
+            asyncio.run(translate_oserror())
+            return True
+        if step.kind == "ctrader_permanent_connect_error_type":
             broker = runner.runs[step.run].broker
             self.wire.connected = False
             self.wire.connect_calls = 0
-            self.wire.fail_connects = 2
+            self.wire.connect_error = ProviderError("injected permanent failure")
 
             async def fail_once() -> None:
                 try:
                     await broker.connect()
-                except CTraderConnectionError:
-                    pass
+                except ProviderError as exc:
+                    if isinstance(exc, CTraderConnectionError):
+                        raise AssertionError(
+                            "permanent provider failure became a connection error"
+                        ) from exc
+                    if is_retryable_provider_error(exc):
+                        raise AssertionError(
+                            "permanent cTrader provider failure became retryable"
+                        ) from exc
                 else:
                     raise AssertionError("cTrader permanent connect fault did not fail")
                 if self.wire.connect_calls != 1 or broker.is_connected:
                     raise AssertionError(
-                        "cTrader permanent connect did not fail fast: "
+                        "cTrader permanent connect boundary changed cardinality: "
                         f"calls={self.wire.connect_calls}, connected={broker.is_connected}"
                     )
 
             asyncio.run(fail_once())
             return True
         return super().handle_step(runner, step)
+
+
+class OwnershipLeakingCTraderProfile(CTraderProfile):
+    """Negative control proving account-wide PUSH ownership is enforced."""
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
+        broker = OwnershipLeakingOfflineCTrader(self, run_name, store_ctx)
+        self.brokers[run_name] = broker
+        return broker
 
 
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
@@ -563,16 +691,16 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             ),
         ),
         Scenario(
-            name="ctrader-real-connect-boundary-retries-transient-fault-once",
+            name="ctrader-wire-connect-translates-transient-oserror",
             profile_factory=CTraderProfile,
             seed=seed,
-            steps=(Step("ctrader_transient_connect_retry"),),
+            steps=(Step("ctrader_transient_oserror_translation"),),
         ),
         Scenario(
-            name="ctrader-real-connect-boundary-fails-fast-on-permanent-fault",
+            name="ctrader-connect-boundary-preserves-permanent-error-type",
             profile_factory=CTraderProfile,
             seed=seed,
-            steps=(Step("ctrader_permanent_connect_failure"),),
+            steps=(Step("ctrader_permanent_connect_error_type"),),
         ),
         Scenario(
             name="ctrader-working-order-restart-ownership",
@@ -607,6 +735,13 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("sync", values={"last_price": 1.10}),
                 Step("pump_watch"),
                 Step("expect_ctrader_open_orders", values={"count": 0}),
+                Step("expect_ctrader_store_terminal", values={"id": "C"}),
+                Step("restart"),
+                Step("expect_ctrader_store_not_resurrected", values={"id": "C"}),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_ctrader_wire_dispatch", values={"requests": 1, "orders": 0}
+                ),
             ),
         ),
         Scenario(
@@ -649,8 +784,16 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 ),
                 Step("sync", run="A", values={"last_price": 1.10}),
                 Step("ctrader_fill_entry", run="A", check_invariants=False),
-                Step("ctrader_queue_pending_push", run="A", check_invariants=False),
-                Step("pump_watch", run="A"),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="A",
+                    values={"emitted": 1},
+                ),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="B",
+                    values={"emitted": 0},
+                ),
                 Step(
                     "entry",
                     run="B",
@@ -658,8 +801,17 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 ),
                 Step("sync", run="B", values={"last_price": 1.10}),
                 Step("ctrader_fill_entry", run="B", check_invariants=False),
-                Step("ctrader_queue_pending_push", run="B", check_invariants=False),
-                Step("pump_watch", run="B"),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="A",
+                    values={"emitted": 0},
+                    check_invariants=False,
+                ),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="B",
+                    values={"emitted": 1},
+                ),
                 Step("restart", run="A", check_invariants=False),
                 Step("restart", run="B", check_invariants=False),
                 Step(
@@ -680,8 +832,42 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step(
                     "sync", run="A", values={"last_price": 1.10}, check_invariants=False
                 ),
-                Step("ctrader_queue_pending_push", run="A", check_invariants=False),
-                Step("pump_watch", run="A"),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="B",
+                    values={"emitted": 0},
+                    check_invariants=False,
+                ),
+                Step(
+                    "expect_ctrader_trade_ledger",
+                    run="B",
+                    values={
+                        "open_ids": ["Short"],
+                        "open_count": 1,
+                        "closed_ids": [],
+                        "closed_count": 0,
+                        "new_closed_ids": [],
+                        "new_closed_count": 0,
+                    },
+                    check_invariants=False,
+                ),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="A",
+                    values={"emitted": 1},
+                ),
+                Step(
+                    "expect_ctrader_trade_ledger",
+                    run="A",
+                    values={
+                        "open_ids": [],
+                        "open_count": 0,
+                        "closed_ids": ["Long"],
+                        "closed_count": 1,
+                        "new_closed_ids": ["Long"],
+                        "new_closed_count": 1,
+                    },
+                ),
                 Step(
                     "expect",
                     run="A",
@@ -695,6 +881,149 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                     "expect",
                     run="B",
                     values={"position": -10.0, "engine_position": -10.0},
+                ),
+            ),
+        ),
+        Scenario(
+            name="ctrader-concurrent-same-direction-runs-ignore-foreign-pushes",
+            profile_factory=CTraderProfile,
+            runs=("A", "B"),
+            seed=seed,
+            steps=(
+                Step(
+                    "entry",
+                    run="A",
+                    values={"id": "A-Long", "side": "buy", "qty": 10.0},
+                ),
+                Step("sync", run="A", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", run="A", check_invariants=False),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="A",
+                    values={"emitted": 1},
+                ),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="B",
+                    values={"emitted": 0},
+                ),
+                Step(
+                    "expect_ctrader_trade_ledger",
+                    run="A",
+                    values={
+                        "open_ids": ["A-Long"],
+                        "open_count": 1,
+                        "closed_ids": [],
+                        "closed_count": 0,
+                        "new_closed_ids": [],
+                        "new_closed_count": 0,
+                    },
+                ),
+                Step(
+                    "expect_ctrader_trade_ledger",
+                    run="B",
+                    values={
+                        "open_ids": [],
+                        "open_count": 0,
+                        "closed_ids": [],
+                        "closed_count": 0,
+                        "new_closed_ids": [],
+                        "new_closed_count": 0,
+                    },
+                ),
+                Step(
+                    "entry",
+                    run="B",
+                    values={"id": "B-Long", "side": "buy", "qty": 10.0},
+                ),
+                Step("sync", run="B", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", run="B", check_invariants=False),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="A",
+                    values={"emitted": 0},
+                    check_invariants=False,
+                ),
+                Step(
+                    "expect_ctrader_trade_ledger",
+                    run="A",
+                    values={
+                        "open_ids": ["A-Long"],
+                        "open_count": 1,
+                        "closed_ids": [],
+                        "closed_count": 0,
+                        "new_closed_ids": [],
+                        "new_closed_count": 0,
+                    },
+                    check_invariants=False,
+                ),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="B",
+                    values={"emitted": 1},
+                ),
+                Step(
+                    "expect_ctrader_trade_ledger",
+                    run="B",
+                    values={
+                        "open_ids": ["B-Long"],
+                        "open_count": 1,
+                        "closed_ids": [],
+                        "closed_count": 0,
+                        "new_closed_ids": [],
+                        "new_closed_count": 0,
+                    },
+                ),
+                Step(
+                    "expect",
+                    run="A",
+                    values={
+                        "position": 10.0,
+                        "engine_position": 10.0,
+                        "account_position": 20.0,
+                    },
+                ),
+                Step(
+                    "expect",
+                    run="B",
+                    values={"position": 10.0, "engine_position": 10.0},
+                ),
+            ),
+        ),
+        Scenario(
+            name="ctrader-control-foreign-push-ownership-leak-is-detected",
+            profile_factory=OwnershipLeakingCTraderProfile,
+            runs=("A", "B"),
+            seed=seed,
+            expected_violation="trade ledger mismatch for B open",
+            steps=(
+                Step(
+                    "entry", run="A", values={"id": "Owned", "side": "buy", "qty": 10.0}
+                ),
+                Step("sync", run="A", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", run="A", check_invariants=False),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="A",
+                    values={"emitted": 1},
+                ),
+                Step(
+                    "ctrader_deliver_pending_pushes",
+                    run="B",
+                    values={"emitted": 1},
+                    check_invariants=False,
+                ),
+                Step(
+                    "expect_ctrader_trade_ledger",
+                    run="B",
+                    values={
+                        "open_ids": [],
+                        "open_count": 0,
+                        "closed_ids": [],
+                        "closed_count": 0,
+                        "new_closed_ids": [],
+                        "new_closed_count": 0,
+                    },
                 ),
             ),
         ),
