@@ -1133,6 +1133,13 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         is a benign no-op; :meth:`close_order` is itself idempotent, so a later
         duplicate signal cannot double-count.
 
+        Also writes a durable ``'cancelled'`` audit event alongside the close
+        (mirroring the Capital.com confirmed-cancel convention): the generic
+        ``order_closed`` row cannot be told apart from a fill-driven close, so
+        without it the durable log carries no cancellation terminal at all for
+        a synchronously acknowledged cancel — a run audit sees the cancel
+        reach the venue with no local terminal progression.
+
         :param order_id: The broker ``orderId`` of the cancelled working order.
         """
         if self.store_ctx is None or not order_id:
@@ -1141,6 +1148,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         if row is None or row.filled_qty > 1e-9:
             return
         self.store_ctx.close_order(row.client_order_id)
+        self.store_ctx.log_event(
+            'cancelled',
+            client_order_id=row.client_order_id,
+            exchange_order_id=str(order_id),
+            intent_key=row.intent_key,
+        )
 
     # === Cross-mix-in private surface (type-only) ===========================
     # Implementations live in the provider / execution / state / events

@@ -968,6 +968,119 @@ def __test_execute_cancel_bool_confirmed_closes_broker_store_row__(tmp_path):
     assert list(broker.store_ctx.iter_live_orders()) == []
 
 
+def _seed_adopted_working_entry(broker, *, pine_id='Long', order_id=111,
+                                position_id=52709805):
+    """Seed the restart-adoption shape of a working-order row.
+
+    Mirrors the live adopted row: ``extras`` carries the venue ``order_id``
+    AND a linked ``position_id`` (cTrader assigns one to pending orders), the
+    ``exchange_order_id`` column holds the position id, and the ``order_id``
+    ref exists (BrokerStore adoption migrates refs across run instances).
+    """
+    coid = f'coid-{order_id}'
+    broker.store_ctx.upsert_order(
+        coid, symbol='EURUSD', side='buy', qty=10.0, filled_qty=0.0,
+        state='confirmed', pine_entry_id=pine_id,
+        exchange_order_id=str(position_id),
+        extras={'order_id': str(order_id), 'position_id': position_id,
+                'kind': 'working', 'order_type': 'stop'},
+    )
+    broker.store_ctx.add_ref(coid, 'order_id', str(order_id))
+    return coid
+
+
+def _store_event_kinds(tmp_path, coid):
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / 'broker.sqlite')
+    try:
+        rows = conn.execute(
+            "SELECT kind FROM events WHERE client_order_id = ? ORDER BY id",
+            (coid,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [kind for (kind,) in rows]
+
+
+def __test_sync_cancel_ack_reinjects_cancelled_event_and_logs_terminal__(tmp_path):
+    # LIVE sequence (2026-07-21 restart-adoption repro): phase B adopts the
+    # venue STOP order, strategy.cancel lands, the ONLY ORDER_CANCELLED
+    # terminal comes back as the correlated dispatch response and is consumed
+    # by send_request — nothing ever reaches watch_orders, so no
+    # strategy-visible cancelled OrderEvent and no durable cancellation
+    # terminal exist: the local runner never terminalizes the cancel. The
+    # confirmed sync ack must (a) re-inject the consumed execution event onto
+    # the order-event stream (like correlated fills) and (b) write a durable
+    # 'cancelled' audit event alongside the row close.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    coid = _seed_adopted_working_entry(broker)
+    cancelled = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_CANCELLED,
+        order=_make_order(order_id=111, order_type=_model.ProtoOAOrderType.STOP,
+                          stop=1.30, position_id=52709805))
+    broker._canned_event = cancelled
+
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        intent = CancelIntent(pine_id='Long', symbol='EURUSD')
+        assert await broker.execute_cancel(_envelope(intent)) is True
+        # The consumed ack is back on the stream for watch_orders to emit.
+        assert broker._exec_events.qsize() == 1
+        agen = broker.watch_orders()
+        try:
+            return await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+        finally:
+            await agen.aclose()
+
+    event = asyncio.run(run())
+    # Strategy-visible cancellation terminal, keyed by the broker order id the
+    # engine registered as strategy-cancel-expected.
+    assert event is not None and event.event_type == 'cancelled'
+    assert event.order.id == '111'
+    # Durable terminal: the row is closed AND the close is identifiable as a
+    # cancellation (generic order_closed alone is not terminal progress).
+    row = broker.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is not None
+    assert 'cancelled' in _store_event_kinds(tmp_path, coid)
+
+
+def __test_cancel_with_outcome_reinjects_cancelled_event__(tmp_path):
+    # The outcome-based cancel path (cancel-tentative retry loop) consumes the
+    # same correlated ORDER_CANCELLED — it must surface the terminal on the
+    # stream too, or a tentative resolved by return value still leaves no
+    # strategy-visible / durable cancellation terminal.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    coid = _seed_adopted_working_entry(broker)
+    broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED)
+
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        intent = CancelIntent(pine_id='Long', symbol='EURUSD')
+        outcome = await broker.execute_cancel_with_outcome(_envelope(intent))
+        assert outcome is CancelDispositionOutcome.CANCEL_CONFIRMED
+        return broker._exec_events.qsize()
+
+    assert asyncio.run(run()) == 1
+    assert 'cancelled' in _store_event_kinds(tmp_path, coid)
+
+
+def __test_reinjected_cancel_translation_survives_dropped_refs__(tmp_path):
+    # By the time watch_orders drains the re-injected ack, close_order has
+    # already deleted the order_id refs — identity resolution misses. A
+    # cancelled event must still be emitted (identity-less), never dropped as
+    # external activity; the duplicate retire must be a benign no-op.
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_adopted_working_entry(broker)
+    cancelled = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED)
+    broker._retire_cancelled_working_order(111)  # refs now gone
+    event = broker._translate_exec_event(cancelled)
+    assert event is not None and event.event_type == 'cancelled'
+    assert event.order.id == '111'
+
+
 def __test_cancel_confirmed_keeps_partially_filled_row_live__(tmp_path):
     # A cancelled UNFILLED residual of a partially filled entry leaves a live
     # position under the row — retiring it would strand that exposure. The

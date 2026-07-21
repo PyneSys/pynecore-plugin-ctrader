@@ -272,6 +272,32 @@ class _ExecutionMixin(_CTraderBase):
                 _model.ProtoOAExecutionType.ORDER_PARTIAL_FILL):
             execq.put_nowait(message)
 
+    def _surface_correlated_cancel(
+            self, message: _oa.ProtoOAExecutionEvent,
+    ) -> None:
+        """Re-inject a correlated ``ORDER_CANCELLED`` onto the order-event stream.
+
+        Same mechanics as :meth:`_surface_correlated_fill`, for the cancel
+        paths: ``send_request`` consumes the correlated ``ORDER_CANCELLED``
+        acknowledgement, so cTrader's ONLY cancellation terminal never reaches
+        ``watch_orders`` — the sync engine tears its mapping down from the
+        ``execute_cancel`` return value alone and no strategy-visible
+        ``cancelled`` :class:`OrderEvent` is ever routed. The engine keys the
+        cancelled broker order ids as strategy-cancel-expected before this
+        message can be drained (same engine thread), so the re-injected event
+        lands in the log-as-own-cancel branch — terminal progress the runner
+        can observe — and resolves a cancel-tentative key if one is armed.
+        A duplicated uncorrelated venue push routes as a key-less external
+        cancel observation (log-only), so re-injection cannot double-apply.
+        Called AFTER :meth:`_retire_cancelled_working_order`; identity
+        resolution on the drained copy may therefore miss (refs are dropped on
+        close), which is fine — cancelled events are never gated on identity.
+        """
+        execq = self._exec_events
+        if execq is None:
+            return
+        execq.put_nowait(message)
+
     # --- BrokerPlugin: execute path ---------------------------------------
 
     @override
@@ -964,6 +990,7 @@ class _ExecutionMixin(_CTraderBase):
             return False
         if event.executionType == _model.ProtoOAExecutionType.ORDER_CANCELLED:
             self._retire_cancelled_working_order(order_id)
+            self._surface_correlated_cancel(event)
         return True
 
     async def _clear_exit_bracket(
@@ -1032,6 +1059,7 @@ class _ExecutionMixin(_CTraderBase):
         exec_type = event.executionType
         if exec_type == _model.ProtoOAExecutionType.ORDER_CANCELLED:
             self._retire_cancelled_working_order(order_id)
+            self._surface_correlated_cancel(event)
             return CancelDispositionOutcome.CANCEL_CONFIRMED
         if exec_type == _model.ProtoOAExecutionType.ORDER_FILLED:
             return CancelDispositionOutcome.ALREADY_FILLED
