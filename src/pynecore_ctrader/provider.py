@@ -172,7 +172,6 @@ class _ProviderMixin(_CTraderBase):
     def update_symbol_info(self) -> SymInfo:
         """Fetch full symbol metadata and map it to a :class:`SymInfo`."""
         assert self.symbol is not None
-        assert self.timeframe is not None
 
         async def work(wire, account_id: int) -> SymInfo:
             light = await self._fetch_light_symbols(wire, account_id)
@@ -209,7 +208,6 @@ class _ProviderMixin(_CTraderBase):
     ) -> SymInfo:
         """Assemble a :class:`SymInfo` from the light + full symbol records."""
         assert self.symbol is not None
-        assert self.timeframe is not None
 
         digits = detail.digits
         mintick = 10 ** -digits
@@ -247,7 +245,7 @@ class _ProviderMixin(_CTraderBase):
             ticker=light.symbolName,
             currency=asset_names.get(light.quoteAssetId, ''),
             basecurrency=basecurrency,
-            period=self.timeframe,
+            period=self.timeframe or "1D",
             type='other',
             mintick=mintick,
             pricescale=pricescale,
