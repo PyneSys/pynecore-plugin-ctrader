@@ -12,12 +12,13 @@ from pynecore.testing.broker_lab.reference import (
     ReferenceVenueProfile,
     VenueOrder,
 )
-from pynecore_ctrader import CTrader, CTraderConfig
+from pynecore_ctrader import CTrader, CTraderConfig, auth
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as model
 from pynecore_ctrader.models import _SymbolRules
 from pynecore_ctrader.wire import (
     CTraderConnectionError,
+    CTraderProtocolError,
     CTraderRequestSentConnectionError,
     WireClient,
 )
@@ -67,6 +68,9 @@ class OfflineWire:
         self.connected = True
         self.connect_calls = 0
         self.connect_error: BaseException | None = None
+        self.expire_next_reconcile = False
+        self.account_auth_calls = 0
+        self.refresh_calls = 0
 
     @property
     def is_connected(self) -> bool:
@@ -99,7 +103,16 @@ class OfflineWire:
                 ],
             )
         if isinstance(request, oa.ProtoOAAccountAuthReq):
+            self.account_auth_calls += 1
             return oa.ProtoOAAccountAuthRes(ctidTraderAccountId=999)
+        if isinstance(request, oa.ProtoOARefreshTokenReq):
+            self.refresh_calls += 1
+            return oa.ProtoOARefreshTokenRes(
+                accessToken="rotated-access",
+                refreshToken="rotated-refresh",
+                tokenType="bearer",
+                expiresIn=2_628_000,
+            )
         if isinstance(request, oa.ProtoOATraderReq):
             return oa.ProtoOATraderRes(
                 ctidTraderAccountId=999,
@@ -133,6 +146,9 @@ class OfflineWire:
             event.order.CopyFrom(order)
             return event
         if isinstance(request, oa.ProtoOAReconcileReq):
+            if self.expire_next_reconcile:
+                self.expire_next_reconcile = False
+                raise CTraderProtocolError("OA_AUTH_TOKEN_EXPIRED", "token expired")
             return oa.ProtoOAReconcileRes(
                 order=list(self.orders.values()),
                 position=list(self.positions.values()),
@@ -518,6 +534,91 @@ class CTraderProfile(ReferenceVenueProfile):
             return True
         if step.kind == "ctrader_fault_next_new":
             self.wire.fail_next_new = str(step.values["mode"])
+            return True
+        if step.kind == "ctrader_expired_token_reauth_preserves_live_state":
+            runtime = runner.runs[step.run]
+            broker = runtime.broker
+            if len(self.wire.positions) != 1 or len(self.wire.orders) != 1:
+                raise AssertionError(
+                    "token-expiry probe requires one position and one pending order"
+                )
+            position = next(iter(self.wire.positions.values()))
+            position.stopLoss = 1.05
+            position.takeProfit = 1.20
+            before_position = (
+                position.positionId,
+                position.stopLoss,
+                position.takeProfit,
+                position.tradeData.volume,
+            )
+            before_order_ids = tuple(sorted(self.wire.orders))
+            before_dispatches = sum(
+                isinstance(request, oa.ProtoOANewOrderReq)
+                for request in self.wire.requests
+            )
+            before_connects = self.wire.connect_calls
+            before_auth = self.wire.account_auth_calls
+            before_refresh = self.wire.refresh_calls
+            saved: list[auth.TokenSet] = []
+            broker._tokens = auth.TokenSet(
+                access_token="expired-access",
+                refresh_token="valid-refresh",
+                expires_in=1,
+            )
+            self.wire.expire_next_reconcile = True
+
+            async def recover():
+                with patch(
+                    "pynecore_ctrader.session.save_session",
+                    side_effect=lambda tokens, *, demo: saved.append(tokens),
+                ):
+                    return await broker._reconcile()
+
+            snapshot = asyncio.run(recover())
+            after_position = next(iter(self.wire.positions.values()))
+            after_dispatches = sum(
+                isinstance(request, oa.ProtoOANewOrderReq)
+                for request in self.wire.requests
+            )
+            if self.wire.refresh_calls != before_refresh + 1:
+                raise AssertionError(
+                    "expired token did not trigger exactly one refresh"
+                )
+            if self.wire.account_auth_calls != before_auth + 1:
+                raise AssertionError(
+                    "expired token did not trigger exactly one account re-auth"
+                )
+            if self.wire.connect_calls != before_connects:
+                raise AssertionError(
+                    "in-place token recovery unexpectedly reconnected the wire"
+                )
+            if broker._tokens.access_token != "rotated-access" or not saved:
+                raise AssertionError(
+                    "rotated token pair was not installed and persisted"
+                )
+            if (
+                after_position.positionId,
+                after_position.stopLoss,
+                after_position.takeProfit,
+                after_position.tradeData.volume,
+            ) != before_position:
+                raise AssertionError(
+                    "token recovery changed protected-position identity or state"
+                )
+            if tuple(sorted(self.wire.orders)) != before_order_ids:
+                raise AssertionError("token recovery changed pending-order identity")
+            if after_dispatches != before_dispatches:
+                raise AssertionError("token recovery redispatched an order")
+            if tuple(
+                sorted(order.orderId for order in snapshot.order)
+            ) != before_order_ids or tuple(
+                position.positionId for position in snapshot.position
+            ) != (
+                before_position[0],
+            ):
+                raise AssertionError(
+                    "post-reauth reconcile did not preserve venue state"
+                )
             return True
         if step.kind == "expect_ctrader_wire_dispatch":
             new_requests = [
@@ -1140,6 +1241,26 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("ctrader_reconcile_once"),
                 Step("ctrader_reconcile_once", values={"events": 0}),
                 Step("expect", values={"position": 10.0, "engine_position": 10.0}),
+            ),
+        ),
+        Scenario(
+            name="ctrader-expired-token-reauth-preserves-protected-position-and-pending-order",
+            profile_factory=CTraderProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "Protected", "side": "buy", "qty": 10.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", check_invariants=False),
+                Step("ctrader_queue_pending_push", check_invariants=False),
+                Step("pump_watch"),
+                Step(
+                    "entry",
+                    values={"id": "Pending", "side": "buy", "qty": 10.0, "limit": 1.05},
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step("ctrader_expired_token_reauth_preserves_live_state"),
+                Step("expect", values={"position": 10.0, "engine_position": 10.0}),
+                Step("expect_ctrader_open_orders", values={"count": 1}),
             ),
         ),
     ]
