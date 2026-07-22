@@ -7,6 +7,7 @@ import pytest
 
 from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
+    ExchangeRateLimitError,
     OrderDispositionUnknownError,
 )
 
@@ -169,6 +170,55 @@ def __test_is_token_invalid_only_for_token_codes__():
 
 
 # === Read path: re-auth + retry ===========================================
+
+
+def __test_reconcile_maps_rate_limit_for_engine_backoff__():
+    wire = _ReauthWire().script(
+        _oa.ProtoOAReconcileReq,
+        CTraderProtocolError(
+            "REQUEST_FREQUENCY_EXCEEDED", "injected bounded throttle",
+        ),
+    )
+    broker = _ReauthBroker(wire)
+
+    with pytest.raises(ExchangeRateLimitError) as caught:
+        asyncio.run(broker._reconcile())
+
+    assert caught.value.retry_after == 1.0
+    assert len(wire.requests) == 1
+
+
+def __test_order_rate_limit_sets_local_prewrite_backoff__():
+    wire = _ReauthWire().script(
+        _oa.ProtoOANewOrderReq,
+        CTraderProtocolError(
+            "REQUEST_FREQUENCY_EXCEEDED", "injected bounded throttle",
+        ),
+    )
+    broker = _ReauthBroker(wire)
+    request = _oa.ProtoOANewOrderReq(
+        ctidTraderAccountId=999,
+        symbolId=1,
+        orderType=_model.ProtoOAOrderType.LIMIT,
+        tradeSide=_model.ProtoOATradeSide.BUY,
+        volume=1000,
+        limitPrice=1.0,
+        clientOrderId="rate-limit-unit",
+    )
+
+    async def scenario():
+        with pytest.raises(ExchangeConnectionError):
+            await broker._dispatch_order(
+                request, coid="rate-limit-unit", context="unit throttle",
+            )
+        sent = len(wire.requests)
+        with pytest.raises(ExchangeConnectionError):
+            await broker._dispatch_order(
+                request, coid="rate-limit-unit", context="unit throttle",
+            )
+        assert len(wire.requests) == sent
+
+    asyncio.run(scenario())
 
 
 def __test_reconcile_reauths_and_retries_on_account_not_authorized__():

@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.core.broker.models import LegType, OrderStatus
 from pynecore.core.plugin import ProviderError, is_retryable_provider_error
 from pynecore.testing.broker_lab import Scenario, Step, pairwise_cases
@@ -13,6 +14,7 @@ from pynecore.testing.broker_lab.reference import (
     VenueOrder,
 )
 from pynecore_ctrader import CTrader, CTraderConfig, auth
+from pynecore_ctrader.exceptions import map_protocol_error
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as model
 from pynecore_ctrader.models import _SymbolRules
@@ -69,6 +71,8 @@ class OfflineWire:
         self.connect_calls = 0
         self.connect_error: BaseException | None = None
         self.expire_next_reconcile = False
+        self.rate_limit_next_reconcile = False
+        self.rate_limit_next_new = False
         self.account_auth_calls = 0
         self.refresh_calls = 0
 
@@ -124,6 +128,11 @@ class OfflineWire:
                 ),
             )
         if isinstance(request, oa.ProtoOANewOrderReq):
+            if self.rate_limit_next_new:
+                self.rate_limit_next_new = False
+                raise CTraderProtocolError(
+                    "REQUEST_FREQUENCY_EXCEEDED", "injected bounded throttle",
+                )
             fault = self.fail_next_new
             self.fail_next_new = None
             if fault == "pre_write":
@@ -172,6 +181,11 @@ class OfflineWire:
             event.position.CopyFrom(position)
             return event
         if isinstance(request, oa.ProtoOAReconcileReq):
+            if self.rate_limit_next_reconcile:
+                self.rate_limit_next_reconcile = False
+                raise CTraderProtocolError(
+                    "REQUEST_FREQUENCY_EXCEEDED", "injected bounded throttle",
+                )
             if self.expire_next_reconcile:
                 self.expire_next_reconcile = False
                 raise CTraderProtocolError("OA_AUTH_TOKEN_EXPIRED", "token expired")
@@ -387,6 +401,46 @@ class TrailingClearSingleStepOfflineCTrader(OfflineCTrader):
             coid=coid,
             context=context,
         )
+
+
+class MultiSymbolOfflineCTrader(OfflineCTrader):
+    """Real plugin instance with one independent wire per logical symbol run."""
+
+    def __init__(self, profile, run_name, store_ctx):
+        super().__init__(profile, run_name, store_ctx)
+        symbol_id = 1 if run_name == "eurusd" else 2
+        self.run_wire = OfflineWire(profile)
+        profile.rate_wires[run_name] = self.run_wire
+        self._wire = self.run_wire
+        self._run_rules = replace(_RULES, symbol_id=symbol_id)
+        self._symbols_by_name = {profile.symbol: symbol_id}
+        self._symbols_by_id = {symbol_id: run_name.upper()}
+        self._symbol_rules = {profile.symbol: self._run_rules}
+
+    def _make_wire(self):
+        return self.run_wire
+
+    async def _get_symbol_rules(self, symbol: str) -> _SymbolRules:
+        return self._run_rules
+
+
+class RateLimitCrashingOfflineCTrader(MultiSymbolOfflineCTrader):
+    """Broken control that exposes a read-side protocol throttle as fatal."""
+
+    async def _account_request(self, req):
+        return await self._account_request_raw(req)
+
+
+class OrderRateLimitCrashingOfflineCTrader(MultiSymbolOfflineCTrader):
+    """Broken control that lets an order throttle escape without local pacing."""
+
+    async def _dispatch_order(
+        self, req, *, coid, context, predecessor_cancel_ids=None,
+    ):
+        try:
+            return await self._account_request_raw(req)
+        except CTraderProtocolError as exc:
+            raise map_protocol_error(exc) from exc
 
 
 class CTraderProfile(ReferenceVenueProfile):
@@ -903,6 +957,126 @@ class TrailingClearSingleStepCTraderProfile(CTraderProfile):
         broker = TrailingClearSingleStepOfflineCTrader(self, run_name, store_ctx)
         self.brokers[run_name] = broker
         return broker
+
+
+class MultiSymbolRateStormCTraderProfile(CTraderProfile):
+    """Two-symbol controlled throttle, backpressure and reconnect profile."""
+
+    broker_class = MultiSymbolOfflineCTrader
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rate_wires: dict[str, OfflineWire] = {}
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
+        broker = self.broker_class(self, run_name, store_ctx)
+        self.brokers[run_name] = broker
+        return broker
+
+    def handle_step(self, runner: Any, step: Step) -> bool:
+        if step.kind != "ctrader_multisymbol_rate_storm":
+            return super().handle_step(runner, step)
+        eur = runner.runs["eurusd"]
+        gbp = runner.runs["gbpusd"]
+        eur_wire = self.rate_wires["eurusd"]
+        gbp_wire = self.rate_wires["gbpusd"]
+        eur_wire.rate_limit_next_reconcile = True
+        try:
+            eur.engine.reconcile()
+        except ExchangeConnectionError:
+            pass
+        else:
+            raise AssertionError("cTrader read throttle did not park the EURUSD run")
+        eur_requests = len(eur_wire.requests)
+        try:
+            eur.engine.reconcile()
+        except ExchangeConnectionError:
+            pass
+        else:
+            raise AssertionError("cTrader read backoff was not enforced")
+        if len(eur_wire.requests) != eur_requests:
+            raise AssertionError("cTrader read backoff sent another venue request")
+        gbp.engine.reconcile()
+        if not any(isinstance(req, oa.ProtoOAReconcileReq) for req in gbp_wire.requests):
+            raise AssertionError("rate-limited EURUSD starved the GBPUSD run")
+
+        async def order_throttle() -> None:
+            request = oa.ProtoOANewOrderReq(
+                ctidTraderAccountId=999,
+                symbolId=2,
+                orderType=model.ProtoOAOrderType.LIMIT,
+                tradeSide=model.ProtoOATradeSide.BUY,
+                volume=1000,
+                limitPrice=1.0,
+                clientOrderId="rate-storm-probe",
+            )
+            gbp_wire.rate_limit_next_new = True
+            try:
+                await gbp.broker._dispatch_order(
+                    request, coid="rate-storm-probe", context="rate storm probe",
+                )
+            except ExchangeConnectionError:
+                pass
+            else:
+                raise AssertionError("cTrader order throttle was not parked")
+            request_count = len(gbp_wire.requests)
+            try:
+                await gbp.broker._dispatch_order(
+                    request, coid="rate-storm-probe", context="rate storm probe",
+                )
+            except ExchangeConnectionError:
+                pass
+            else:
+                raise AssertionError("cTrader order backoff was not enforced")
+            if len(gbp_wire.requests) != request_count:
+                raise AssertionError("order backoff sent another venue request")
+            gbp.broker._order_rate_limit_until = 0.0
+            await gbp.broker._dispatch_order(
+                request, coid="rate-storm-probe", context="rate storm probe",
+            )
+
+        asyncio.run(order_throttle())
+
+        queue = eur.broker._exec_events
+        assert queue is not None
+        queue_identity = id(queue)
+        expected_ids = list(range(10_000, 11_005))
+        for order_id in expected_ids:
+            queue.put_nowait(oa.ProtoOAExecutionEvent(
+                ctidTraderAccountId=999,
+                executionType=model.ProtoOAExecutionType.ORDER_ACCEPTED,
+                order=model.ProtoOAOrder(orderId=order_id),
+            ))
+
+        async def reconnect_storm() -> None:
+            for _ in range(3):
+                await eur.broker.disconnect()
+                await eur.broker.connect()
+            await eur.broker.disconnect()
+
+        asyncio.run(reconnect_storm())
+        if eur_wire.connect_calls != 3:
+            raise AssertionError(
+                f"reconnect loop was not bounded: {eur_wire.connect_calls} connects"
+            )
+        if id(eur.broker._exec_events) != queue_identity:
+            raise AssertionError("reconnect replaced the execution-event queue")
+        actual_ids = [queue.get_nowait().order.orderId for _ in expected_ids]
+        if actual_ids != expected_ids or not queue.empty():
+            raise AssertionError("execution-event backpressure lost or reordered events")
+        return True
+
+
+class RateLimitCrashingCTraderProfile(MultiSymbolRateStormCTraderProfile):
+    """Negative control for the pre-fix fatal read-rate-limit mapping."""
+
+    broker_class = RateLimitCrashingOfflineCTrader
+
+
+class OrderRateLimitCrashingCTraderProfile(MultiSymbolRateStormCTraderProfile):
+    """Negative control for the pre-fix unpaced order throttle."""
+
+    broker_class = OrderRateLimitCrashingOfflineCTrader
 
 
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
@@ -1557,6 +1731,29 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("cancel", values={"id": "TrailExit"}),
                 Step("sync", values={"last_price": 1.10}),
             ),
+        ),
+        Scenario(
+            name="ctrader-multisymbol-rate-limit-backpressure-reconnect-storm",
+            profile_factory=MultiSymbolRateStormCTraderProfile,
+            runs=("eurusd", "gbpusd"),
+            seed=seed,
+            steps=(Step("ctrader_multisymbol_rate_storm", run="eurusd"),),
+        ),
+        Scenario(
+            name="ctrader-control-read-rate-limit-crash-is-detected",
+            profile_factory=RateLimitCrashingCTraderProfile,
+            runs=("eurusd", "gbpusd"),
+            seed=seed,
+            expected_violation="REQUEST_FREQUENCY_EXCEEDED",
+            steps=(Step("ctrader_multisymbol_rate_storm", run="eurusd"),),
+        ),
+        Scenario(
+            name="ctrader-control-order-rate-limit-backoff-is-detected",
+            profile_factory=OrderRateLimitCrashingCTraderProfile,
+            runs=("eurusd", "gbpusd"),
+            seed=seed,
+            expected_violation="ExchangeRateLimitError",
+            steps=(Step("ctrader_multisymbol_rate_storm", run="eurusd"),),
         ),
     ]
 

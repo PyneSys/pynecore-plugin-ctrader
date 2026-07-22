@@ -19,6 +19,7 @@ reconcile-driven disappearance detection and the cancel-tentative state machine
 are M3 — the ``store_ctx`` writes here are a best-effort audit + ref-mapping
 trail, guarded so the plugin still runs without persistence (test paths).
 """
+import asyncio
 from collections.abc import Callable
 from time import time as epoch_time
 from typing import TYPE_CHECKING, cast
@@ -27,6 +28,7 @@ from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    ExchangeRateLimitError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
 )
@@ -186,7 +188,9 @@ class _ExecutionMixin(_CTraderBase):
         """Send an order request and return its acknowledging execution event.
 
         Translates the wire failure modes into the broker taxonomy: a protocol
-        error → mapped reject; a timeout → :class:`OrderDispositionUnknownError`
+        error → mapped reject; a rate-limit rejection → a locally paced,
+        pre-write-retryable connection outcome; a timeout →
+        :class:`OrderDispositionUnknownError`
         (the dispatch may have landed); a drop *after* the request was written
         (:class:`CTraderRequestSentConnectionError`) → likewise
         :class:`OrderDispositionUnknownError`, since the server may have accepted
@@ -204,6 +208,12 @@ class _ExecutionMixin(_CTraderBase):
             treats a CANCELLED push as a genuine external cancel.
         :return: The acknowledging ``ProtoOAExecutionEvent``.
         """
+        remaining = self._order_rate_limit_until - asyncio.get_running_loop().time()
+        if remaining > 0.0:
+            raise ExchangeConnectionError(
+                f"cTrader order requests rate-limited for another {remaining:.1f}s"
+            )
+        self._order_rate_limit_until = 0.0
         try:
             # ``_account_request_raw`` transparently re-authorizes a mid-session
             # account de-auth and re-sends once. That is safe here: an
@@ -217,7 +227,13 @@ class _ExecutionMixin(_CTraderBase):
             # ambiguity and risk the engine duplicating an accepted order.
             message = await self._account_request_raw(req)
         except CTraderProtocolError as exc:
-            raise map_protocol_error(exc) from exc
+            mapped = map_protocol_error(exc)
+            if isinstance(mapped, ExchangeRateLimitError):
+                self._order_rate_limit_until = (
+                    asyncio.get_running_loop().time() + max(0.0, mapped.retry_after)
+                )
+                raise ExchangeConnectionError(str(mapped)) from exc
+            raise mapped from exc
         except CTraderTimeoutError as exc:
             raise OrderDispositionUnknownError(
                 f"cTrader {context} timed out; disposition unknown",
@@ -243,12 +259,25 @@ class _ExecutionMixin(_CTraderBase):
             # (``ORDER_NOT_FOUND`` / ``POSITION_NOT_FOUND``) when the server
             # reports it as an error EVENT rather than an error RESPONSE.
             cause = CTraderProtocolError(message.errorCode, message.description)
-            raise map_error_code(message.errorCode, message.description) from cause
+            mapped = map_error_code(message.errorCode, message.description)
+            if isinstance(mapped, ExchangeRateLimitError):
+                self._order_rate_limit_until = (
+                    asyncio.get_running_loop().time() + max(0.0, mapped.retry_after)
+                )
+                raise ExchangeConnectionError(str(mapped)) from cause
+            raise mapped from cause
         if isinstance(message, _oa.ProtoOAExecutionEvent):
             if (message.executionType == _model.ProtoOAExecutionType.ORDER_REJECTED
                     or message.errorCode):
                 cause = CTraderProtocolError(message.errorCode, "")
-                raise map_error_code(message.errorCode, "") from cause
+                mapped = map_error_code(message.errorCode, "")
+                if isinstance(mapped, ExchangeRateLimitError):
+                    self._order_rate_limit_until = (
+                        asyncio.get_running_loop().time()
+                        + max(0.0, mapped.retry_after)
+                    )
+                    raise ExchangeConnectionError(str(mapped)) from cause
+                raise mapped from cause
             self._surface_correlated_fill(message)
             return message
         raise ExchangeOrderRejectedError(

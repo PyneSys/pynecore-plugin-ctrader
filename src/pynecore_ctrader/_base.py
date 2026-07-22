@@ -31,13 +31,21 @@ from typing import TYPE_CHECKING, cast
 
 from google.protobuf.message import Message
 
-from pynecore.core.broker.exceptions import ExchangeConnectionError
+from pynecore.core.broker.exceptions import (
+    ExchangeConnectionError,
+    ExchangeRateLimitError,
+)
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.types.ohlcv import OHLCV
 
 from . import auth, helpers, session
 from .config import CTraderConfig
-from .exceptions import is_account_auth_lost, is_client_auth_lost, is_token_invalid
+from .exceptions import (
+    is_account_auth_lost,
+    is_client_auth_lost,
+    is_token_invalid,
+    map_protocol_error,
+)
 from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
 from .wire import (
@@ -240,6 +248,10 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         #: Background task for an event-triggered (proactive) re-auth, so the
         #: event router never blocks on the handshake; one in flight at a time.
         self._reauth_task: asyncio.Task | None = None
+        #: Local order-write deadline after a definitive cTrader rate-limit
+        #: rejection. It survives transport reconnects, so reconnecting cannot
+        #: bypass the venue-requested quiet interval.
+        self._order_rate_limit_until: float = 0.0
 
     # --- credentials --------------------------------------------------------
 
@@ -544,9 +556,15 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         :param req: The request message; re-sent unchanged on retry.
         :return: The successful response.
         :raises ExchangeConnectionError: On an unrecovered connection loss.
+        :raises ExchangeRateLimitError: When cTrader asks the caller to back off.
         """
         try:
             return await self._account_request_raw(req)
+        except CTraderProtocolError as exc:
+            mapped = map_protocol_error(exc)
+            if isinstance(mapped, ExchangeRateLimitError):
+                raise mapped from exc
+            raise
         except (CTraderConnectionError, CTraderTimeoutError) as exc:
             raise ExchangeConnectionError(str(exc) or "connection lost") from exc
 
