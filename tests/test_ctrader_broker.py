@@ -917,16 +917,30 @@ def __test_amend_bracket_builds_sltp_request__():
 
 
 def __test_amend_bracket_all_none_clears_protection__():
-    # cTrader overwrites the whole protection set, so an all-None amend carries
-    # no SL/TP/trailing fields and clears the bracket wholesale.
-    broker = _FakeBroker()
+    # cTrader retains an omitted trailing flag but rejects explicit False
+    # without a Stop Loss. Disable with the authenticated anchor, then clear.
+    position = _model.ProtoOAPosition(
+        positionId=3,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        stopLoss=1.1,
+        trailingStopLoss=True,
+        tradeData=_model.ProtoOATradeData(
+            symbolId=1,
+            volume=1000,
+            tradeSide=_model.ProtoOATradeSide.BUY,
+        ),
+    )
+    broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(position=[position]))
     asyncio.run(broker.amend_bracket(
         "EURUSD", "3", side="sell", tp_price=None, sl_price=None,
         trail_offset=None, coid="coid-clear",
     ))
     amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
-    assert len(amends) == 1
-    set_fields = {f.name for f, _ in amends[0].ListFields()}
+    assert len(amends) == 2
+    assert amends[0].stopLoss == 1.1
+    assert amends[0].HasField("trailingStopLoss")
+    assert amends[0].trailingStopLoss is False
+    set_fields = {f.name for f, _ in amends[1].ListFields()}
     assert set_fields.isdisjoint({"stopLoss", "takeProfit", "trailingStopLoss"})
 
 

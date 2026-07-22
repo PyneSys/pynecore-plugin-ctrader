@@ -601,8 +601,7 @@ class _ExecutionMixin(_CTraderBase):
         ``trail_offset``). An explicit ``sl_price`` anchors the (possibly
         trailing) stop; a trail-only exit (``trail_offset`` set, ``sl_price``
         None) gets a current-price-derived anchor so cTrader has an absolute
-        level to trail from. All-None leaves every field unset, so the amend
-        clears the position's protection wholesale.
+        level to trail from.
         """
         if sl_price is not None:
             req.stopLoss = round_price(sl_price, rules.digits)
@@ -614,6 +613,12 @@ class _ExecutionMixin(_CTraderBase):
             req.takeProfit = round_price(tp_price, rules.digits)
         if trail_offset is not None:
             req.trailingStopLoss = True
+        elif sl_price is not None:
+            # cTrader requires a Stop Loss in any request that explicitly
+            # changes the trailing flag. A static SL can therefore disable a
+            # previously trailing stop atomically; TP-only requests must omit
+            # this field.
+            req.trailingStopLoss = False
 
     def _trailing_anchor(
             self, side: str, trail_offset: float, rules: _SymbolRules,
@@ -869,9 +874,25 @@ class _ExecutionMixin(_CTraderBase):
         :class:`BracketAttachAfterFillRejectedError` so the open, now-unprotected
         position is flattened defensively rather than halting the bot.
         """
+        position_id = int(leg_id)
+        if tp_price is None and sl_price is None and trail_offset is None:
+            await self._clear_position_bracket(
+                position_id, coid=coid, context="clear bracket",
+            )
+            return
+        if (tp_price is None and sl_price is None and trail_offset is not None
+                and self._last_bid is None
+                and await self._trail_only_position_already_armed(position_id)):
+            # Restart replay can run before the first fresh quote. Rebuilding a
+            # trail-only anchor needs that quote; a bare full-replacement amend
+            # would clear the broker's existing moving stop. The live snapshot
+            # cannot expose the original trailing distance, but it can prove the
+            # owned position still has exactly trail-only protection, so retain
+            # it without a duplicate write until normal quoted operation resumes.
+            return
         rules = await self._get_symbol_rules(symbol)
         req = _oa.ProtoOAAmendPositionSLTPReq(
-            ctidTraderAccountId=self._live_account_id, positionId=int(leg_id),
+            ctidTraderAccountId=self._live_account_id, positionId=position_id,
         )
         self._apply_bracket_levels(
             req, side=side, sl_price=sl_price, tp_price=tp_price,
@@ -884,6 +905,71 @@ class _ExecutionMixin(_CTraderBase):
             if isinstance(cause, CTraderProtocolError) and is_not_found(cause.error_code):
                 return
             raise
+
+    async def _clear_position_bracket(
+            self, position_id: int, *, coid: str, context: str,
+    ) -> None:
+        """Clear one position's protection using cTrader's valid sequence.
+
+        Pepperstone DEMO retains an omitted trailing flag, rejects explicit
+        ``False`` without a Stop Loss, and accepts disabling trailing while the
+        current Stop Loss is repeated. Clear therefore disables trailing with
+        the authenticated current anchor first, then clears SL/TP in a second
+        amend that omits the trailing field.
+        """
+        snapshot = await self._reconcile()
+        position = next(
+            (item for item in snapshot.position if item.positionId == position_id),
+            None,
+        )
+        if position is None:
+            return
+        trailing = (
+            position.HasField("trailingStopLoss") and position.trailingStopLoss
+        )
+        requests: list[_oa.ProtoOAAmendPositionSLTPReq] = []
+        if trailing:
+            if not position.HasField("stopLoss"):
+                raise CTraderBrokerError(
+                    "cannot disable cTrader trailing protection without an "
+                    f"authenticated Stop Loss on position {position_id}"
+                )
+            requests.append(_oa.ProtoOAAmendPositionSLTPReq(
+                ctidTraderAccountId=self._live_account_id,
+                positionId=position_id,
+                stopLoss=position.stopLoss,
+                trailingStopLoss=False,
+            ))
+        requests.append(_oa.ProtoOAAmendPositionSLTPReq(
+            ctidTraderAccountId=self._live_account_id,
+            positionId=position_id,
+        ))
+        for index, request in enumerate(requests, start=1):
+            try:
+                await self._dispatch_order(
+                    request, coid=coid,
+                    context=f"{context} ({index}/{len(requests)})",
+                )
+            except ExchangeOrderRejectedError as exc:
+                cause = exc.__cause__
+                if isinstance(cause, CTraderProtocolError) and is_not_found(
+                        cause.error_code):
+                    return
+                raise
+
+    async def _trail_only_position_already_armed(self, position_id: int) -> bool:
+        """Return whether one live position already carries trail-only protection."""
+        snapshot = await self._reconcile()
+        for position in snapshot.position:
+            if position.positionId != position_id:
+                continue
+            return (
+                position.HasField('stopLoss')
+                and position.HasField('trailingStopLoss')
+                and position.trailingStopLoss
+                and not position.HasField('takeProfit')
+            )
+        return False
 
     @override
     async def execute_close(
@@ -953,7 +1039,8 @@ class _ExecutionMixin(_CTraderBase):
         working order keyed by the exit id, so clearing it is a fresh
         ``ProtoOAAmendPositionSLTPReq`` with no protective fields set (cTrader
         treats the amend as a full overwrite, so an empty one removes the
-        bracket). Without this an exit the script cancels / stops emitting would
+        bracket). A trailing bracket needs the venue's two-step disable-then-clear
+        sequence. Without this an exit the script cancels / stops emitting would
         leave the old broker-side bracket live to close the position later
         against Pine's state.
 
@@ -1004,10 +1091,9 @@ class _ExecutionMixin(_CTraderBase):
     ) -> bool:
         """Remove the position's native SL/TP/trailing bracket (exit cancel).
 
-        Sends a ``ProtoOAAmendPositionSLTPReq`` carrying only the ``positionId``
-        — cTrader overwrites the whole protection set, so an amend with no
-        ``stopLoss`` / ``takeProfit`` / ``trailingStopLoss`` clears the bracket
-        without a cancel+recreate window. A flat symbol (no open position) or a
+        Uses the venue-valid clear sequence: disable an active trailing flag
+        while repeating its authenticated current Stop Loss, then clear SL/TP
+        with an empty amend. A flat symbol (no open position) or a
         ``*_NOT_FOUND`` race is a benign no-op. On a HEDGED account the Order
         Sync Engine clears the per-leg brackets through the core one-way emulator
         (ownership-scoped, so it strips only the legs the cancelled exit owns);
@@ -1016,20 +1102,11 @@ class _ExecutionMixin(_CTraderBase):
         position_id = await self._find_open_position_id(intent.symbol)
         if position_id is None:
             return True
-        try:
-            await self._dispatch_order(
-                _oa.ProtoOAAmendPositionSLTPReq(
-                    ctidTraderAccountId=self._live_account_id,
-                    positionId=position_id,
-                ),
-                coid=envelope.client_order_id(KIND_CANCEL),
-                context="clear bracket",
-            )
-        except ExchangeOrderRejectedError as exc:
-            if isinstance(exc.__cause__, CTraderProtocolError) and is_not_found(
-                    exc.__cause__.error_code):
-                return True
-            raise
+        await self._clear_position_bracket(
+            position_id,
+            coid=envelope.client_order_id(KIND_CANCEL),
+            context="clear bracket",
+        )
         return True
 
     @override

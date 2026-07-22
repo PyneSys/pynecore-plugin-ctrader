@@ -145,6 +145,32 @@ class OfflineWire:
             )
             event.order.CopyFrom(order)
             return event
+        if isinstance(request, oa.ProtoOAAmendPositionSLTPReq):
+            position = self.positions[request.positionId]
+            if (
+                request.HasField("trailingStopLoss")
+                and not request.trailingStopLoss
+                and not request.HasField("stopLoss")
+            ):
+                raise CTraderProtocolError(
+                    "INVALID_REQUEST",
+                    "Can't set Trailing Stop Loss parameter without specified Stop Loss",
+                )
+            for field in ("stopLoss", "takeProfit"):
+                if request.HasField(field):
+                    setattr(position, field, getattr(request, field))
+                else:
+                    position.ClearField(field)
+            # Live Pepperstone DEMO proved that an omitted trailing flag is
+            # retained even though omitted SL/TP fields are cleared. Disabling
+            # trailing therefore requires an explicit ``False`` field.
+            if request.HasField("trailingStopLoss"):
+                position.trailingStopLoss = request.trailingStopLoss
+            event = oa.ProtoOAExecutionEvent(
+                executionType=model.ProtoOAExecutionType.ORDER_REPLACED
+            )
+            event.position.CopyFrom(position)
+            return event
         if isinstance(request, oa.ProtoOAReconcileReq):
             if self.expire_next_reconcile:
                 self.expire_next_reconcile = False
@@ -325,6 +351,42 @@ class OwnershipLeakingOfflineCTrader(OfflineCTrader):
         if identity == (None, None, None) and not order.closingOrder:
             return "foreign", None, LegType.ENTRY
         return identity
+
+
+class AnchorDroppingOfflineCTrader(OfflineCTrader):
+    """Broken control that repeats the pre-fix anchorless restart amend."""
+
+    async def _trail_only_position_already_armed(self, position_id: int) -> bool:
+        return False
+
+
+class TrailingClearOmittingOfflineCTrader(OfflineCTrader):
+    """Broken control that omits the explicit venue trailing-disable flag."""
+
+    async def _clear_position_bracket(self, position_id, *, coid, context):
+        await self._dispatch_order(
+            oa.ProtoOAAmendPositionSLTPReq(
+                ctidTraderAccountId=self._live_account_id,
+                positionId=position_id,
+            ),
+            coid=coid,
+            context=context,
+        )
+
+
+class TrailingClearSingleStepOfflineCTrader(OfflineCTrader):
+    """Broken control that sends the venue-rejected one-step clear."""
+
+    async def _clear_position_bracket(self, position_id, *, coid, context):
+        await self._dispatch_order(
+            oa.ProtoOAAmendPositionSLTPReq(
+                ctidTraderAccountId=self._live_account_id,
+                positionId=position_id,
+                trailingStopLoss=False,
+            ),
+            coid=coid,
+            context=context,
+        )
 
 
 class CTraderProfile(ReferenceVenueProfile):
@@ -531,6 +593,50 @@ class CTraderProfile(ReferenceVenueProfile):
                     raise AssertionError(
                         f"expected {step.values['wire_positions']} cTrader positions, got {count}"
                     )
+            return True
+        if step.kind == "ctrader_set_bid":
+            runner.runs[step.run].broker._last_bid = float(step.values["price"])
+            return True
+        if step.kind == "expect_ctrader_protection":
+            if len(self.wire.positions) != 1:
+                raise AssertionError(
+                    "cTrader protection assertion requires exactly one position"
+                )
+            position = next(iter(self.wire.positions.values()))
+            expected_trailing = bool(step.values["trailing"])
+            actual_trailing = (
+                position.HasField("trailingStopLoss")
+                and position.trailingStopLoss
+            )
+            if actual_trailing != expected_trailing:
+                raise AssertionError(
+                    "cTrader trailing flag mismatch: "
+                    f"expected {expected_trailing}, got {actual_trailing}"
+                )
+            expected_stop = step.values.get("stop_loss")
+            actual_stop = (
+                position.stopLoss if position.HasField("stopLoss") else None
+            )
+            if expected_stop is None:
+                if actual_stop is not None:
+                    raise AssertionError(
+                        f"expected no cTrader trailing anchor, got {actual_stop}"
+                    )
+            elif actual_stop is None or abs(actual_stop - float(expected_stop)) > 1e-9:
+                raise AssertionError(
+                    "cTrader trailing anchor mismatch: "
+                    f"expected {expected_stop}, got {actual_stop}"
+                )
+            amend_count = sum(
+                isinstance(request, oa.ProtoOAAmendPositionSLTPReq)
+                for request in self.wire.requests
+            )
+            expected_amends = int(step.values.get("amend_requests", amend_count))
+            if amend_count != expected_amends:
+                raise AssertionError(
+                    "cTrader bracket amend duplicated or went missing: "
+                    f"expected {expected_amends}, got {amend_count}"
+                )
             return True
         if step.kind == "ctrader_fault_next_new":
             self.wire.fail_next_new = str(step.values["mode"])
@@ -768,6 +874,33 @@ class OwnershipLeakingCTraderProfile(CTraderProfile):
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
         broker = OwnershipLeakingOfflineCTrader(self, run_name, store_ctx)
+        self.brokers[run_name] = broker
+        return broker
+
+
+class AnchorDroppingCTraderProfile(CTraderProfile):
+    """Negative control proving restart must preserve a live trailing anchor."""
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
+        broker = AnchorDroppingOfflineCTrader(self, run_name, store_ctx)
+        self.brokers[run_name] = broker
+        return broker
+
+
+class TrailingClearOmittingCTraderProfile(CTraderProfile):
+    """Negative control for cTrader's asymmetric protection replacement."""
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
+        broker = TrailingClearOmittingOfflineCTrader(self, run_name, store_ctx)
+        self.brokers[run_name] = broker
+        return broker
+
+
+class TrailingClearSingleStepCTraderProfile(CTraderProfile):
+    """Negative control for cTrader's rejected one-step trailing clear."""
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
+        broker = TrailingClearSingleStepOfflineCTrader(self, run_name, store_ctx)
         self.brokers[run_name] = broker
         return broker
 
@@ -1261,6 +1394,168 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("ctrader_expired_token_reauth_preserves_live_state"),
                 Step("expect", values={"position": 10.0, "engine_position": 10.0}),
                 Step("expect_ctrader_open_orders", values={"count": 1}),
+            ),
+        ),
+        Scenario(
+            name="ctrader-trail-only-amend-restart-clear-preserves-anchor",
+            profile_factory=CTraderProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "Trail", "side": "buy", "qty": 10.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", check_invariants=False),
+                Step("ctrader_queue_pending_push", check_invariants=False),
+                Step("pump_watch"),
+                Step("ctrader_set_bid", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    values={
+                        "id": "TrailExit",
+                        "from_entry": "Trail",
+                        "side": "sell",
+                        "qty": 10.0,
+                        "trail_price": 1.10,
+                        "trail_offset": 10.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_ctrader_protection",
+                    values={
+                        "trailing": True,
+                        "stop_loss": 1.0,
+                        "amend_requests": 1,
+                    },
+                ),
+                Step("ctrader_set_bid", values={"price": 1.11}),
+                Step(
+                    "amend_exit",
+                    values={
+                        "id": "TrailExit",
+                        "from_entry": "Trail",
+                        "trail_price": 1.11,
+                        "trail_offset": 20.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 1.11}),
+                Step(
+                    "expect_ctrader_protection",
+                    values={
+                        "trailing": True,
+                        "stop_loss": 0.91,
+                        "amend_requests": 2,
+                    },
+                ),
+                Step("restart", check_invariants=False),
+                Step(
+                    "expect_ctrader_protection",
+                    values={
+                        "trailing": True,
+                        "stop_loss": 0.91,
+                        "amend_requests": 2,
+                    },
+                ),
+                Step("cancel", values={"id": "TrailExit"}),
+                Step("sync", values={"last_price": 1.11}),
+                Step(
+                    "expect_ctrader_protection",
+                    values={
+                        "trailing": False,
+                        "stop_loss": None,
+                        "amend_requests": 4,
+                    },
+                ),
+            ),
+        ),
+        Scenario(
+            name="ctrader-control-anchorless-restart-amend-is-detected",
+            profile_factory=AnchorDroppingCTraderProfile,
+            seed=seed,
+            expected_violation="cTrader trailing anchor mismatch",
+            steps=(
+                Step("entry", values={"id": "Trail", "side": "buy", "qty": 10.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", check_invariants=False),
+                Step("ctrader_queue_pending_push", check_invariants=False),
+                Step("pump_watch"),
+                Step("ctrader_set_bid", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    values={
+                        "id": "TrailExit",
+                        "from_entry": "Trail",
+                        "side": "sell",
+                        "qty": 10.0,
+                        "trail_price": 1.10,
+                        "trail_offset": 10.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step("restart", check_invariants=False),
+                Step(
+                    "expect_ctrader_protection",
+                    values={"trailing": True, "stop_loss": 1.0},
+                ),
+            ),
+        ),
+        Scenario(
+            name="ctrader-control-omitted-trailing-disable-is-detected",
+            profile_factory=TrailingClearOmittingCTraderProfile,
+            seed=seed,
+            expected_violation="cTrader trailing flag mismatch",
+            steps=(
+                Step("entry", values={"id": "Trail", "side": "buy", "qty": 10.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", check_invariants=False),
+                Step("ctrader_queue_pending_push", check_invariants=False),
+                Step("pump_watch"),
+                Step("ctrader_set_bid", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    values={
+                        "id": "TrailExit",
+                        "from_entry": "Trail",
+                        "side": "sell",
+                        "qty": 10.0,
+                        "trail_price": 1.10,
+                        "trail_offset": 10.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step("cancel", values={"id": "TrailExit"}),
+                Step("sync", values={"last_price": 1.10}),
+                Step(
+                    "expect_ctrader_protection",
+                    values={"trailing": False, "stop_loss": None},
+                ),
+            ),
+        ),
+        Scenario(
+            name="ctrader-control-one-step-trailing-clear-is-rejected",
+            profile_factory=TrailingClearSingleStepCTraderProfile,
+            seed=seed,
+            expected_violation="Can't set Trailing Stop Loss parameter without specified Stop Loss",
+            steps=(
+                Step("entry", values={"id": "Trail", "side": "buy", "qty": 10.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", check_invariants=False),
+                Step("ctrader_queue_pending_push", check_invariants=False),
+                Step("pump_watch"),
+                Step("ctrader_set_bid", values={"price": 1.10}),
+                Step(
+                    "exit",
+                    values={
+                        "id": "TrailExit",
+                        "from_entry": "Trail",
+                        "side": "sell",
+                        "qty": 10.0,
+                        "trail_price": 1.10,
+                        "trail_offset": 10.0,
+                    },
+                ),
+                Step("sync", values={"last_price": 1.10}),
+                Step("cancel", values={"id": "TrailExit"}),
+                Step("sync", values={"last_price": 1.10}),
             ),
         ),
     ]
