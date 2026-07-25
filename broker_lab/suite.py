@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -13,6 +14,7 @@ from pynecore.testing.broker_lab.reference import (
     ReferenceVenueProfile,
     VenueOrder,
 )
+from pynecore.types.ohlcv import OHLCV
 from pynecore_ctrader import CTrader, CTraderConfig, auth
 from pynecore_ctrader.exceptions import map_protocol_error
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as oa
@@ -75,6 +77,7 @@ class OfflineWire:
         self.rate_limit_next_new = False
         self.account_auth_calls = 0
         self.refresh_calls = 0
+        self.history_responses: list[list[model.ProtoOATrendbar]] = []
 
     @property
     def is_connected(self) -> bool:
@@ -116,6 +119,22 @@ class OfflineWire:
                 refreshToken="rotated-refresh",
                 tokenType="bearer",
                 expiresIn=2_628_000,
+            )
+        if isinstance(request, oa.ProtoOASubscribeSpotsReq):
+            return oa.ProtoOASubscribeSpotsRes(
+                ctidTraderAccountId=request.ctidTraderAccountId
+            )
+        if isinstance(request, oa.ProtoOASubscribeLiveTrendbarReq):
+            return oa.ProtoOASubscribeLiveTrendbarRes(
+                ctidTraderAccountId=request.ctidTraderAccountId
+            )
+        if isinstance(request, oa.ProtoOAGetTrendbarsReq):
+            history = self.history_responses.pop(0) if self.history_responses else []
+            return oa.ProtoOAGetTrendbarsRes(
+                ctidTraderAccountId=request.ctidTraderAccountId,
+                period=request.period,
+                symbolId=request.symbolId,
+                trendbar=history,
             )
         if isinstance(request, oa.ProtoOATraderReq):
             return oa.ProtoOATraderRes(
@@ -365,6 +384,12 @@ class OwnershipLeakingOfflineCTrader(OfflineCTrader):
         if identity == (None, None, None) and not order.closingOrder:
             return "foreign", None, LegType.ENTRY
         return identity
+
+
+class OneShotHistoryOfflineCTrader(OfflineCTrader):
+    """Broken control that trusts the first empty reconnect-history response."""
+
+    _live_history_settle_attempts = 1
 
 
 class AnchorDroppingOfflineCTrader(OfflineCTrader):
@@ -920,6 +945,52 @@ class CTraderProfile(ReferenceVenueProfile):
 
             asyncio.run(fail_once())
             return True
+        if step.kind == "ctrader_delayed_reconnect_history":
+            broker = runner.runs[step.run].broker
+            last_ts = 1_800_000_000
+            missed_ts = last_ts + 60
+            current_ts = last_ts + 120
+            broker.symbol = self.symbol
+            broker._live_subscription = (self.symbol, "1")
+            broker._last_live_closed_bar = OHLCV(
+                timestamp=last_ts,
+                open=1.14,
+                high=1.14,
+                low=1.14,
+                close=1.14,
+                volume=1.0,
+                is_closed=True,
+            )
+            broker._live_history_settle_delay_seconds = 0
+            self.wire.history_responses = [
+                [],
+                [
+                    model.ProtoOATrendbar(
+                        utcTimestampInMinutes=missed_ts // 60,
+                        low=114_000,
+                        deltaOpen=1,
+                        deltaHigh=3,
+                        deltaClose=2,
+                        volume=7,
+                    )
+                ],
+            ]
+
+            class _Now(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return cls.fromtimestamp(current_ts + 2, tz=timezone.utc)
+
+            with patch("pynecore_ctrader.provider.datetime", _Now):
+                asyncio.run(broker.on_reconnect())
+            recovered = [
+                bar.timestamp for bar in broker._pending_bars if bar.is_closed
+            ]
+            if recovered != [missed_ts]:
+                raise AssertionError(
+                    f"unrepaired reconnect bar gap: expected {[missed_ts]}, got {recovered}"
+                )
+            return True
         return super().handle_step(runner, step)
 
 
@@ -928,6 +999,15 @@ class OwnershipLeakingCTraderProfile(CTraderProfile):
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
         broker = OwnershipLeakingOfflineCTrader(self, run_name, store_ctx)
+        self.brokers[run_name] = broker
+        return broker
+
+
+class OneShotHistoryCTraderProfile(CTraderProfile):
+    """Negative control proving delayed reconnect history must be retried."""
+
+    def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
+        broker = OneShotHistoryOfflineCTrader(self, run_name, store_ctx)
         self.brokers[run_name] = broker
         return broker
 
@@ -1081,6 +1161,19 @@ class OrderRateLimitCrashingCTraderProfile(MultiSymbolRateStormCTraderProfile):
 
 def smoke_scenarios(seed: int = 0) -> list[Scenario]:
     return [
+        Scenario(
+            name="ctrader-reconnect-retries-temporarily-empty-history",
+            profile_factory=CTraderProfile,
+            seed=seed,
+            steps=(Step("ctrader_delayed_reconnect_history"),),
+        ),
+        Scenario(
+            name="ctrader-control-one-shot-empty-history-is-detected",
+            profile_factory=OneShotHistoryCTraderProfile,
+            seed=seed,
+            expected_violation="unrepaired reconnect bar gap",
+            steps=(Step("ctrader_delayed_reconnect_history"),),
+        ),
         Scenario(
             name="ctrader-correlated-ack-without-push",
             profile_factory=CTraderProfile,

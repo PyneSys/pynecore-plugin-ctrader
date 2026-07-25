@@ -15,6 +15,7 @@ Implements the :class:`~pynecore.core.plugin.ProviderPlugin` /
 All cTrader trendbar prices are integers in units of 1/100000; the low carries
 the absolute price and open/high/close are non-negative deltas above it.
 """
+import asyncio
 import logging
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable, cast
@@ -44,6 +45,12 @@ _PRICE_SCALE = 100000.0
 #: effective-dated session history (DST-correct backtest sessions).
 _SCHEDULE_HISTORY_YEARS = 5
 
+#: A just-closed cTrader trendbar can briefly be absent from history immediately
+#: after reconnect. Keep the recovery bounded while allowing that read model to
+#: settle before handing control back to the live stream.
+_LIVE_HISTORY_SETTLE_ATTEMPTS = 5
+_LIVE_HISTORY_SETTLE_DELAY_SECONDS = 1.0
+
 #: TradingView timeframe -> ``ProtoOATrendbarPeriod`` enum name.
 _TV_TO_PERIOD = {
     '1': 'M1', '2': 'M2', '3': 'M3', '4': 'M4', '5': 'M5', '10': 'M10',
@@ -55,6 +62,9 @@ _PERIOD_TO_TV = {period: tv for tv, period in _TV_TO_PERIOD.items()}
 
 class _ProviderMixin(_CTraderBase):
     """Provider mix-in: timeframe maps, listings, symbol info and OHLCV."""
+
+    _live_history_settle_attempts = _LIVE_HISTORY_SETTLE_ATTEMPTS
+    _live_history_settle_delay_seconds = _LIVE_HISTORY_SETTLE_DELAY_SECONDS
 
     # --- timeframe helpers --------------------------------------------------
 
@@ -631,22 +641,29 @@ class _ProviderMixin(_CTraderBase):
         period = _model.ProtoOATrendbarPeriod.Value(self.to_exchange_timeframe(timeframe))
         recovered_by_timestamp: dict[int, OHLCV] = {}
         window_seconds = period_seconds * 2000
-        while cursor < current_slot:
-            window_end = min(cursor + window_seconds, current_slot)
-            response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
-                _oa.ProtoOAGetTrendbarsReq(
-                    ctidTraderAccountId=account_id,
-                    symbolId=symbol_id,
-                    period=period,
-                    fromTimestamp=cursor * 1000,
-                    toTimestamp=window_end * 1000,
-                )
-            ))
-            for trendbar in response.trendbar:
-                timestamp = trendbar.utcTimestampInMinutes * 60
-                if cursor <= timestamp < window_end:
-                    recovered_by_timestamp[timestamp] = self._decode_trendbar(trendbar)
-            cursor = window_end
+        for attempt in range(self._live_history_settle_attempts):
+            query_cursor = cursor
+            while query_cursor < current_slot:
+                window_end = min(query_cursor + window_seconds, current_slot)
+                response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
+                    _oa.ProtoOAGetTrendbarsReq(
+                        ctidTraderAccountId=account_id,
+                        symbolId=symbol_id,
+                        period=period,
+                        fromTimestamp=query_cursor * 1000,
+                        toTimestamp=window_end * 1000,
+                    )
+                ))
+                for trendbar in response.trendbar:
+                    timestamp = trendbar.utcTimestampInMinutes * 60
+                    if cursor <= timestamp < window_end:
+                        recovered_by_timestamp[timestamp] = self._decode_trendbar(
+                            trendbar
+                        )
+                query_cursor = window_end
+            if recovered_by_timestamp or attempt + 1 == self._live_history_settle_attempts:
+                break
+            await asyncio.sleep(self._live_history_settle_delay_seconds)
 
         recovered = [
             recovered_by_timestamp[timestamp]

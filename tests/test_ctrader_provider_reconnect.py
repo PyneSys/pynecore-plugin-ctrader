@@ -27,14 +27,25 @@ def _trendbar(timestamp: int, price: int) -> _model.ProtoOATrendbar:
 class _HistoryWire:
     """Lowest-seam wire fake recording subscription and history requests."""
 
-    def __init__(self, history: list[_model.ProtoOATrendbar]) -> None:
+    def __init__(
+        self,
+        history: list[_model.ProtoOATrendbar],
+        *,
+        history_responses: list[list[_model.ProtoOATrendbar]] | None = None,
+    ) -> None:
         self.history = history
+        self.history_responses = list(history_responses or [])
         self.requests: list = []
 
     async def send_request(self, request):
         self.requests.append(request)
         if isinstance(request, _oa.ProtoOAGetTrendbarsReq):
-            return _oa.ProtoOAGetTrendbarsRes(trendbar=self.history)
+            history = (
+                self.history_responses.pop(0)
+                if self.history_responses
+                else self.history
+            )
+            return _oa.ProtoOAGetTrendbarsRes(trendbar=history)
         if isinstance(request, _oa.ProtoOASubscribeSpotsReq):
             return _oa.ProtoOASubscribeSpotsRes()
         if isinstance(request, _oa.ProtoOASubscribeLiveTrendbarReq):
@@ -108,6 +119,44 @@ def __test_reconnect_without_a_closed_anchor_only_restores_subscription__():
 
     assert not any(isinstance(request, _oa.ProtoOAGetTrendbarsReq) for request in wire.requests)
     assert not provider._pending_bars
+
+
+def __test_reconnect_retries_temporarily_empty_recent_history__(monkeypatch):
+    """A just-closed trendbar may settle after the first history response."""
+    last_ts = 1_800_000_000
+    missed_ts = last_ts + 60
+    current_ts = last_ts + 120
+    wire = _HistoryWire(
+        [_trendbar(missed_ts, 114_010)],
+        history_responses=[[]],
+    )
+    provider = _provider(wire)
+    provider._live_history_settle_delay_seconds = 0
+    provider._last_live_closed_bar = OHLCV(
+        timestamp=last_ts,
+        open=1.14,
+        high=1.14,
+        low=1.14,
+        close=1.14,
+        volume=1.0,
+        is_closed=True,
+    )
+
+    class _Now(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromtimestamp(current_ts + 2, tz=timezone.utc)
+
+    monkeypatch.setattr("pynecore_ctrader.provider.datetime", _Now)
+    asyncio.run(provider.on_reconnect())
+
+    history_requests = [
+        request
+        for request in wire.requests
+        if isinstance(request, _oa.ProtoOAGetTrendbarsReq)
+    ]
+    assert len(history_requests) == 2
+    assert [bar.timestamp for bar in provider._pending_bars] == [missed_ts]
 
 
 def __test_closed_live_delivery_advances_the_reconnect_anchor__():
