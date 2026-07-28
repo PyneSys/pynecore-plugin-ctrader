@@ -17,6 +17,7 @@ the absolute price and open/high/close are non-negative deltas above it.
 """
 import asyncio
 import logging
+from bisect import bisect_right
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable, cast
 from zoneinfo import ZoneInfo
@@ -31,10 +32,11 @@ from pynecore.types.ohlcv import OHLCV
 from . import auth
 from ._base import _CTraderBase
 from .config import CTraderConfig
+from .exceptions import is_rate_limited
 from .helpers import VOLUME_SCALE
 from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
-from .wire import CTraderConnectionError, CTraderProtocolError
+from .wire import CTraderConnectionError, CTraderProtocolError, CTraderWireError
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,14 @@ _SCHEDULE_HISTORY_YEARS = 5
 #: settle before handing control back to the live stream.
 _LIVE_HISTORY_SETTLE_ATTEMPTS = 5
 _LIVE_HISTORY_SETTLE_DELAY_SECONDS = 1.0
+
+#: Bounds on the length of a calendar month. ``MN1`` openings follow the
+#: calendar, so no fixed number of milliseconds locates them; only these bounds
+#: hold for every month, whatever timezone the venue aggregates in. The minimum
+#: is the smallest possible step to the next opening (never overshoots it), the
+#: maximum the largest possible age at which a bar may still be forming.
+_MIN_MONTH_MS = 28 * 86_400_000
+_MAX_MONTH_MS = 31 * 86_400_000
 
 #: TradingView timeframe -> ``ProtoOATrendbarPeriod`` enum name.
 _TV_TO_PERIOD = {
@@ -388,40 +398,109 @@ class _ProviderMixin(_CTraderBase):
             from_ms = int(from_dt.timestamp() * 1000)
             to_ms = int(to_dt.timestamp() * 1000)
             cursor = from_ms
+            last_saved: int | None = None
             while cursor < to_ms:
                 end_ms = min(cursor + window * 1000, to_ms)
-                response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
-                    _oa.ProtoOAGetTrendbarsReq(
-                        ctidTraderAccountId=account_id, symbolId=symbol_id,
-                        period=period, fromTimestamp=cursor, toTimestamp=end_ms,
-                    )
-                ))
-                bars = list(response.trendbar)
-                if not bars:
+                bars_by_open, covered = await self._fetch_trendbar_window(
+                    wire, account_id, symbol_id, period, cursor, end_ms
+                )
+                if not bars_by_open:
                     cursor = end_ms
                     continue
+                # The writer demands strictly increasing timestamps, so the page
+                # is ordered here rather than trusting the response order.
+                bar_opens = sorted(bars_by_open)
+                resume_from = bar_opens[-1] + 1
+                ask_end = end_ms
+                if not covered and len(bar_opens) > 1:
+                    # The venue capped the window, so nothing bounds the newest
+                    # returned bar: its successor opening — the only thing that
+                    # tells the tick bucketing where this bar ends — is still
+                    # unread. Hand the bar back to the next window rather than
+                    # closing it against data that was never fetched.
+                    resume_from = bar_opens[-1]
+                    ask_end = bar_opens.pop()
+                bars = [bars_by_open[opening] for opening in bar_opens]
                 # The trendbars are bid-based; the ask side has no trendbars and
                 # is reconstructed (only when requested) by bucketing ``ASK`` tick
                 # history into the same bars (open/high/low/close per period).
                 ask_bars = await self._fetch_ask_bars(
-                    wire, account_id, symbol_id, cursor, end_ms, period_seconds
+                    wire, account_id, symbol_id, cursor, ask_end, bar_opens
                 ) if with_extra else {}
-                last_ts = cursor
                 for bar in bars:
                     candle = self._decode_trendbar(bar)
-                    if from_ms <= candle.timestamp * 1000 < to_ms:
+                    if from_ms <= candle.timestamp < to_ms \
+                            and (last_saved is None or candle.timestamp > last_saved):
                         self.save_ohlcv_data(self._attach_ask(candle, ask_bars.get(candle.timestamp)))
-                    last_ts = max(last_ts, (bar.utcTimestampInMinutes * 60 + period_seconds) * 1000)
+                        last_saved = candle.timestamp
                 if on_progress is not None:
-                    on_progress(datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc)
+                    progress_ms = bar_opens[-1] + period_seconds * 1000
+                    on_progress(datetime.fromtimestamp(progress_ms / 1000, tz=timezone.utc)
                                 .replace(tzinfo=None))
-                cursor = max(last_ts, cursor + window * 1000)
+                # Resume just past the newest bar that was fully read. Stepping
+                # by ``open + period_seconds`` instead would overshoot the next
+                # opening whenever the period is a calendar unit (the average
+                # month is not a month), silently skipping it.
+                cursor = max(resume_from, cursor + 1)
 
         self._run(self._authed_session(work))
 
+    async def _fetch_trendbar_window(
+        self, wire, account_id: int, symbol_id: int, period: int,
+        from_ms: int, to_ms: int,
+    ) -> tuple[dict[int, _model.ProtoOATrendbar], bool]:
+        """Read the trendbars the venue holds in ``[from_ms, to_ms]``.
+
+        ``ProtoOAGetTrendbarsRes.hasMore`` marks a response the backend capped to
+        its chunk size, and ``ProtoOAGetTrendbarsReq.count`` is documented as
+        limiting the bars *back from* ``toTimestamp`` — so a capped response
+        carries the newest part of the window and paging forward from it would
+        drop the older part for good. The window is therefore drained backwards
+        from the oldest opening received so far. A backend that instead caps to
+        the oldest part answers the narrowed request with nothing new, which ends
+        the drain and reports the window as not fully covered.
+
+        :param from_ms: Window start in epoch milliseconds.
+        :param to_ms: Window end in epoch milliseconds.
+        :return: The trendbars keyed by their opening (epoch milliseconds), and
+            whether they are known to cover the whole window.
+        """
+        bars: dict[int, _model.ProtoOATrendbar] = {}
+        upper = to_ms
+        narrowed = False
+        while upper > from_ms:
+            response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
+                _oa.ProtoOAGetTrendbarsReq(
+                    ctidTraderAccountId=account_id, symbolId=symbol_id,
+                    period=period, fromTimestamp=from_ms, toTimestamp=upper,
+                )
+            ))
+            oldest = upper
+            added = False
+            for bar in response.trendbar:
+                opening = bar.utcTimestampInMinutes * 60_000
+                oldest = min(oldest, opening)
+                if opening not in bars:
+                    bars[opening] = bar
+                    added = True
+            if narrowed and not added:
+                # The narrowed request brought nothing new, so the backend caps
+                # to the oldest rows: the newest part of the window stays unread.
+                # This has to outrank the response's own ``hasMore``, which is
+                # naturally clear here — the narrowed request was not truncated,
+                # it simply had nothing left to truncate.
+                return bars, False
+            if not response.hasMore:
+                return bars, True
+            if not added or oldest <= from_ms:
+                return bars, False
+            upper = oldest
+            narrowed = True
+        return bars, False
+
     async def _fetch_ask_bars(
         self, wire, account_id: int, symbol_id: int, from_ms: int, to_ms: int,
-        period_seconds: int,
+        bar_opens: list[int],
     ) -> dict[int, tuple[float, float, float, float]]:
         """Aggregate ``ASK`` tick history into per-bar open/high/low/close.
 
@@ -434,10 +513,18 @@ class _ProviderMixin(_CTraderBase):
 
         :param from_ms: Window start in epoch milliseconds (inclusive).
         :param to_ms: Window end in epoch milliseconds (exclusive upper bound).
-        :param period_seconds: The bar length, used to bucket ticks.
-        :return: Mapping of bar timestamp (epoch seconds) to ``(open, high, low,
-            close)`` ask prices; empty when no tick history covers the window.
+            Must not reach past the end of the last bar in ``bar_opens``, since
+            every tick above the last opening is bucketed into that bar.
+        :param bar_opens: Ascending bar openings (epoch milliseconds) of this
+            page. Ticks are assigned to the venue's own bar boundaries rather
+            than to a fixed-width grid, which is the only assignment that holds
+            for calendar periods (``W1`` / ``MN1``) whose openings do not sit on
+            a Unix-epoch multiple of their average length.
+        :return: Mapping of bar timestamp (epoch milliseconds) to ``(open, high,
+            low, close)`` ask prices; empty when no tick history covers the window.
         """
+        if not bar_opens:
+            return {}
         # ``[min_ts, open, max_ts, close, high, low]`` per bar, updated tick by
         # tick so ticks may arrive in any order across pages.
         buckets: dict[int, list[float]] = {}
@@ -454,7 +541,16 @@ class _ProviderMixin(_CTraderBase):
             if not ticks:
                 break
             for ts_ms, price in ticks:
-                key = (ts_ms // 1000 // period_seconds) * period_seconds
+                if ts_ms >= to_ms:
+                    # Past the last bar this page bounds; the venue's inclusive
+                    # upper bound can still hand it over.
+                    continue
+                index = bisect_right(bar_opens, ts_ms) - 1
+                if index < 0:
+                    # Older than the first bar of this page: it belongs to a bar
+                    # outside the window and has no bucket here.
+                    continue
+                key = bar_opens[index]
                 bucket = buckets.get(key)
                 if bucket is None:
                     buckets[key] = [ts_ms, price, ts_ms, price, price, price]
@@ -534,7 +630,7 @@ class _ProviderMixin(_CTraderBase):
         """
         low = bar.low
         return OHLCV(
-            timestamp=bar.utcTimestampInMinutes * 60,
+            timestamp=bar.utcTimestampInMinutes * 60_000,
             open=(low + bar.deltaOpen) / _PRICE_SCALE,
             high=(low + bar.deltaHigh) / _PRICE_SCALE,
             low=low / _PRICE_SCALE,
@@ -608,13 +704,39 @@ class _ProviderMixin(_CTraderBase):
             await self._subscribe_live(*self._live_subscription)
             await self._backfill_live_gap(*self._live_subscription)
 
+    @staticmethod
+    def _history_failure_is_transient(exc: CTraderWireError) -> bool:
+        """Whether a failed history request can plausibly succeed on a retry.
+
+        Timeouts and dropped-link faults are transient by nature. A server error
+        response is only transient when the wire layer classifies its code as a
+        connectivity / maintenance fault, or when it is a rate-limit rejection —
+        every other code is a permanent rejection of this exact request.
+
+        :param exc: The wire error the history request failed with.
+        :return: ``True`` when retrying the same request is worthwhile.
+        """
+        if isinstance(exc, CTraderProtocolError):
+            return exc.retryable or is_rate_limited(exc.error_code)
+        return True
+
     async def _backfill_live_gap(self, symbol: str, timeframe: str) -> None:
         """Queue venue trendbars that closed since the last delivered live bar.
 
-        The current slot is deliberately excluded because it is still forming
-        and will arrive through the restored live subscription. Responses are
-        sorted and filtered at the local cursor, making inclusive venue bounds
-        and replayed edge bars harmless.
+        The bar that is still forming is deliberately excluded because it will
+        arrive through the restored live subscription. Responses are sorted and
+        filtered at the local cursor, making inclusive venue bounds and replayed
+        edge bars harmless.
+
+        Bar openings are NOT Unix-epoch multiples of the period: cTrader
+        aggregates on its own grid (measured on live data: daily bars open at
+        21:00 UTC, i.e. three hours off the epoch day). The grid phase therefore
+        comes from ``_last_live_closed_bar`` — an opening the venue itself
+        produced — and every fixed-length period is a whole number of periods
+        away from it. ``MN1`` has no fixed length at all, so for it closedness is
+        read off the venue's own bar sequence instead: a returned month bar is
+        closed once a newer opening exists (the same rule the live path uses in
+        :meth:`_ingest_live_bar`), or once no month can still be forming.
 
         :param symbol: The cTrader symbol name.
         :param timeframe: Timeframe in TradingView format.
@@ -628,42 +750,109 @@ class _ProviderMixin(_CTraderBase):
         if wire is None or account_id is None:
             raise CTraderConnectionError('live connection not established')
 
-        period_seconds = max(1, int(in_seconds(timeframe)))
-        current_slot = (
-            int(datetime.now(timezone.utc).timestamp()) // period_seconds
-            * period_seconds
-        )
-        cursor = int(anchor.timestamp) + period_seconds
-        if cursor >= current_slot:
+        anchor_ts = int(anchor.timestamp)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        exchange_period = self.to_exchange_timeframe(timeframe)
+        calendar_period = exchange_period == 'MN1'
+        period_ms = max(1, int(in_seconds(timeframe))) * 1000
+        if calendar_period:
+            # The forming month cannot be located by arithmetic, so it is
+            # requested along with the rest and dropped afterwards.
+            cursor = anchor_ts + _MIN_MONTH_MS
+            query_ceiling = now_ms
+            newest_expected = None
+        else:
+            cursor = anchor_ts + period_ms
+            query_ceiling = anchor_ts + (now_ms - anchor_ts) // period_ms * period_ms
+            # The newest slot that must already be closed. Recovering *some* bar
+            # is no proof the gap is repaired: the venue's history read model can
+            # serve older slots while the just-closed one is still settling, and
+            # stopping there would drop it for good — the live feed advances the
+            # anchor past it. The attempt budget still bounds the wait, because
+            # the slot may legitimately hold no bar (session closed over the
+            # outage).
+            newest_expected = query_ceiling - period_ms
+        if cursor >= query_ceiling:
             return
 
         symbol_id = await self._resolve_symbol_id(wire, account_id)
-        period = _model.ProtoOATrendbarPeriod.Value(self.to_exchange_timeframe(timeframe))
+        period = _model.ProtoOATrendbarPeriod.Value(exchange_period)
         recovered_by_timestamp: dict[int, OHLCV] = {}
-        window_seconds = period_seconds * 2000
+        window_ms = period_ms * 2000
+        failure: CTraderWireError | None = None
+
+        def settled() -> bool:
+            """Whether the newest already-closed bar has been recovered."""
+            if calendar_period:
+                # No month is shorter than ``_MIN_MONTH_MS``, so an opening
+                # younger than that cannot have a successor yet: it is the
+                # forming one, and having it in hand proves every older month is
+                # settled and present. An older newest opening is ambiguous — a
+                # 28-day-old bar is the forming one in a long month but already
+                # closed in February — so it settles nothing and the venue is
+                # asked again until its successor appears.
+                return any(now_ms < timestamp + _MIN_MONTH_MS
+                           for timestamp in recovered_by_timestamp)
+            return newest_expected in recovered_by_timestamp
+
         for attempt in range(self._live_history_settle_attempts):
             query_cursor = cursor
-            while query_cursor < current_slot:
-                window_end = min(query_cursor + window_seconds, current_slot)
-                response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
-                    _oa.ProtoOAGetTrendbarsReq(
-                        ctidTraderAccountId=account_id,
-                        symbolId=symbol_id,
-                        period=period,
-                        fromTimestamp=query_cursor * 1000,
-                        toTimestamp=window_end * 1000,
-                    )
-                ))
-                for trendbar in response.trendbar:
-                    timestamp = trendbar.utcTimestampInMinutes * 60
-                    if cursor <= timestamp < window_end:
-                        recovered_by_timestamp[timestamp] = self._decode_trendbar(
-                            trendbar
+            try:
+                while query_cursor < query_ceiling:
+                    window_end = min(query_cursor + window_ms, query_ceiling)
+                    response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
+                        _oa.ProtoOAGetTrendbarsReq(
+                            ctidTraderAccountId=account_id,
+                            symbolId=symbol_id,
+                            period=period,
+                            fromTimestamp=query_cursor,
+                            toTimestamp=window_end,
                         )
-                query_cursor = window_end
-            if recovered_by_timestamp or attempt + 1 == self._live_history_settle_attempts:
+                    ))
+                    for trendbar in response.trendbar:
+                        timestamp = trendbar.utcTimestampInMinutes * 60_000
+                        if cursor <= timestamp < window_end:
+                            recovered_by_timestamp[timestamp] = self._decode_trendbar(
+                                trendbar
+                            )
+                    query_cursor = window_end
+            except CTraderConnectionError:
+                # The wire itself is gone. The anchor is untouched, so letting
+                # this reach the runner buys a full reconnect that repeats the
+                # backfill over the very same window.
+                raise
+            except CTraderWireError as exc:
+                # Request-scoped failure (timeout, throttle): keep the pages that
+                # did settle and retry inside the bounded budget instead of
+                # abandoning the whole gap. A permanent rejection (rejected
+                # window, unknown symbol, revoked access) cannot settle by
+                # waiting, so it ends the retries instead of burning the budget.
+                failure = exc
+                if not self._history_failure_is_transient(exc):
+                    break
+            if settled() or attempt + 1 == self._live_history_settle_attempts:
                 break
             await asyncio.sleep(self._live_history_settle_delay_seconds)
+
+        if failure is not None and not settled():
+            # Degrade rather than halt: the live subscription is already
+            # restored, so the feed keeps running and PyneCore synthesizes the
+            # slots that stayed missing.
+            logger.warning(
+                'Reconnect backfill incomplete for %s %s (%d bar(s) recovered): %s',
+                symbol, timeframe, len(recovered_by_timestamp), failure,
+            )
+
+        if calendar_period and recovered_by_timestamp:
+            newest = max(recovered_by_timestamp)
+            if now_ms < newest + _MAX_MONTH_MS:
+                # No opening proves this month ended and it is young enough to
+                # still be running, so it belongs to the live subscription. A
+                # short month whose successor has not opened a bar yet is held
+                # back too; that errs towards a missing bar rather than a
+                # forming one published as final, and the anchor stays put so a
+                # later reconnect picks it up once its successor exists.
+                del recovered_by_timestamp[newest]
 
         recovered = [
             recovered_by_timestamp[timestamp]

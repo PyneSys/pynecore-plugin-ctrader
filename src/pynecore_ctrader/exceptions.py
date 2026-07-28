@@ -153,6 +153,18 @@ def is_not_found(error_code: str) -> bool:
     return error_code in _NOT_FOUND_CODES
 
 
+def is_rate_limited(error_code: str) -> bool:
+    """Whether ``error_code`` means the client exceeded a request-rate budget.
+
+    Such a rejection says nothing about the request itself, so the caller may
+    repeat it after a backoff.
+
+    :param error_code: The cTrader ``errorCode`` string.
+    :return: ``True`` if the request was throttled.
+    """
+    return error_code in _RATE_LIMIT_CODES
+
+
 def map_error_code(error_code: str, description: str = "") -> BrokerError:
     """Translate a cTrader ``errorCode`` string to the broker taxonomy.
 

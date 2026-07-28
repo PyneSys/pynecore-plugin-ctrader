@@ -431,7 +431,10 @@ class TrailingClearSingleStepOfflineCTrader(OfflineCTrader):
 class MultiSymbolOfflineCTrader(OfflineCTrader):
     """Real plugin instance with one independent wire per logical symbol run."""
 
-    def __init__(self, profile, run_name, store_ctx):
+    def __init__(
+        self, profile: "MultiSymbolRateStormCTraderProfile", run_name: str,
+        store_ctx: Any
+    ) -> None:
         super().__init__(profile, run_name, store_ctx)
         symbol_id = 1 if run_name == "eurusd" else 2
         self.run_wire = OfflineWire(profile)
@@ -953,7 +956,7 @@ class CTraderProfile(ReferenceVenueProfile):
             broker.symbol = self.symbol
             broker._live_subscription = (self.symbol, "1")
             broker._last_live_closed_bar = OHLCV(
-                timestamp=last_ts,
+                timestamp=last_ts * 1000,
                 open=1.14,
                 high=1.14,
                 low=1.14,
@@ -986,9 +989,10 @@ class CTraderProfile(ReferenceVenueProfile):
             recovered = [
                 bar.timestamp for bar in broker._pending_bars if bar.is_closed
             ]
-            if recovered != [missed_ts]:
+            expected = [missed_ts * 1000]
+            if recovered != expected:
                 raise AssertionError(
-                    f"unrepaired reconnect bar gap: expected {[missed_ts]}, got {recovered}"
+                    f"unrepaired reconnect bar gap: expected {expected}, got {recovered}"
                 )
             return True
         return super().handle_step(runner, step)
