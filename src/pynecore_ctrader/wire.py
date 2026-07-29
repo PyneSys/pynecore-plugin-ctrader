@@ -27,6 +27,7 @@ import asyncio
 import logging
 import ssl
 import struct
+from dataclasses import dataclass
 
 from google.protobuf.message import Message
 
@@ -148,6 +149,15 @@ _PAYLOAD_TYPE_TO_CLASS = _build_payload_type_map()
 _HEARTBEAT_TYPE = _common.ProtoHeartbeatEvent().payloadType
 
 
+@dataclass(frozen=True, slots=True)
+class WireTelemetrySnapshot:
+    """Immutable connection-local counts of selected inbound wire events."""
+
+    inbound_heartbeats: int = 0
+    spot_events_without_trendbar: int = 0
+    spot_events_with_trendbar: int = 0
+
+
 def _raise_on_error(message: Message) -> None:
     """Raise :class:`CTraderProtocolError` if ``message`` is an error response.
 
@@ -178,6 +188,9 @@ class WireClient:
         self._last_send = 0.0
         self._last_recv = 0.0
         self._send_lock = asyncio.Lock()
+        self._inbound_heartbeats = 0
+        self._spot_events_without_trendbar = 0
+        self._spot_events_with_trendbar = 0
         #: Queue of unsolicited inbound messages (events and orphan responses).
         self.events: asyncio.Queue[Message] = asyncio.Queue()
 
@@ -185,6 +198,20 @@ class WireClient:
     def is_connected(self) -> bool:
         """Whether the socket is open and writable."""
         return self._writer is not None and not self._writer.is_closing()
+
+    def telemetry_snapshot(self) -> WireTelemetrySnapshot:
+        """Return an immutable snapshot of this connection's inbound counters."""
+        return WireTelemetrySnapshot(
+            inbound_heartbeats=self._inbound_heartbeats,
+            spot_events_without_trendbar=self._spot_events_without_trendbar,
+            spot_events_with_trendbar=self._spot_events_with_trendbar,
+        )
+
+    def _reset_telemetry(self) -> None:
+        """Reset counters when a new socket becomes the active connection."""
+        self._inbound_heartbeats = 0
+        self._spot_events_without_trendbar = 0
+        self._spot_events_with_trendbar = 0
 
     async def connect(self) -> None:
         """Open the TLS connection and start the receive and heartbeat tasks.
@@ -221,6 +248,7 @@ class WireClient:
             raise CTraderConnectionError(
                 f"connection to {self._host}:{self._port} failed: {exc}"
             ) from exc
+        self._reset_telemetry()
         now = asyncio.get_running_loop().time()
         self._last_send = now
         self._last_recv = now
@@ -377,6 +405,7 @@ class WireClient:
                 envelope = _common.ProtoMessage()
                 envelope.ParseFromString(body)
                 if envelope.payloadType == _HEARTBEAT_TYPE:
+                    self._inbound_heartbeats += 1
                     await self._send_message(_common.ProtoHeartbeatEvent())
                     continue
                 self._route(envelope)
@@ -401,6 +430,11 @@ class WireClient:
             return
         message = klass()
         message.ParseFromString(envelope.payload)
+        if isinstance(message, _oa.ProtoOASpotEvent):
+            if message.trendbar:
+                self._spot_events_with_trendbar += 1
+            else:
+                self._spot_events_without_trendbar += 1
         client_msg_id = envelope.clientMsgId
         if client_msg_id:
             future = self._pending.get(client_msg_id)

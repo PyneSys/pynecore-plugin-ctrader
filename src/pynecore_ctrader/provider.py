@@ -18,7 +18,9 @@ the absolute price and open/high/close are non-negative deltas above it.
 import asyncio
 import logging
 from bisect import bisect_right
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from enum import Enum
 from typing import Callable, cast
 from zoneinfo import ZoneInfo
 
@@ -70,6 +72,21 @@ _TV_TO_PERIOD = {
 _PERIOD_TO_TV = {period: tv for tv, period in _TV_TO_PERIOD.items()}
 
 
+class SubscribeStatus(str, Enum):
+    """Server outcome of one cTrader subscription request."""
+
+    SUCCESS = "success"
+    ALREADY_SUBSCRIBED = "already_subscribed"
+
+
+@dataclass(frozen=True, slots=True)
+class SubscribeOutcome:
+    """Immutable outcome of the spot and live-trendbar subscription pair."""
+
+    spots: SubscribeStatus
+    trendbars: SubscribeStatus
+
+
 class _ProviderMixin(_CTraderBase):
     """Provider mix-in: timeframe maps, listings, symbol info and OHLCV."""
 
@@ -99,10 +116,10 @@ class _ProviderMixin(_CTraderBase):
                 f"Supported: {', '.join(_TV_TO_PERIOD)}"
             )
 
-    def _period_value(self) -> int:
-        """Return the numeric ``ProtoOATrendbarPeriod`` for the current timeframe."""
+    def _period_name(self) -> str:
+        """Return the ``ProtoOATrendbarPeriod`` name for the current timeframe."""
         assert self.xchg_timeframe is not None
-        return _model.ProtoOATrendbarPeriod.Value(self.xchg_timeframe)
+        return self.xchg_timeframe
 
     # --- broker listing -----------------------------------------------------
 
@@ -137,6 +154,7 @@ class _ProviderMixin(_CTraderBase):
         on the per-account trader record, so each account is authorized to read
         it; the readable name is the account list's ``brokerTitleShort``.
         """
+
         async def work(wire) -> list[Broker]:
             accounts = await self._get_accounts(wire)
             want_live = not self._demo
@@ -149,6 +167,7 @@ class _ProviderMixin(_CTraderBase):
                 if slug:
                     titles.setdefault(slug, a.brokerTitleShort or "")
             return [Broker(id=slug, name=titles[slug]) for slug in sorted(titles)]
+
         return cast("list[Broker]", self._run(self._app_session(work)))
 
     # --- symbol listing + resolution ----------------------------------------
@@ -162,13 +181,15 @@ class _ProviderMixin(_CTraderBase):
         account (e.g. spread-bet ``_SB``/``_SBE`` variants on a CFD account, and
         broker test symbols), which the native platform also hides.
         """
+
         async def work(wire, account_id: int) -> list[str]:
             symbols = await self._fetch_light_symbols(wire, account_id)
             return sorted(s.symbolName for s in symbols if s.symbolName and s.enabled)
+
         return cast(list[str], self._run(self._authed_session(work)))
 
     async def _fetch_light_symbols(
-        self, wire, account_id: int, *, recover: bool = False
+            self, wire, account_id: int, *, recover: bool = False
     ) -> list[_model.ProtoOALightSymbol]:
         """Fetch the account's light-symbol list and cache name -> id.
 
@@ -221,10 +242,10 @@ class _ProviderMixin(_CTraderBase):
         return cast(SymInfo, self._run(self._authed_session(work)))
 
     def _build_sym_info(
-        self,
-        light: _model.ProtoOALightSymbol,
-        detail: _model.ProtoOASymbol,
-        asset_names: dict[int, str],
+            self,
+            light: _model.ProtoOALightSymbol,
+            detail: _model.ProtoOASymbol,
+            asset_names: dict[int, str],
     ) -> SymInfo:
         """Assemble a :class:`SymInfo` from the light + full symbol records."""
         assert self.symbol is not None
@@ -283,9 +304,9 @@ class _ProviderMixin(_CTraderBase):
         )
 
     def _schedule_to_sessions(
-        self, schedule: list[_model.ProtoOAInterval], schedule_tz: str
+            self, schedule: list[_model.ProtoOAInterval], schedule_tz: str
     ) -> tuple[list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession],
-               list[SymInfoScheduleVariant]]:
+    list[SymInfoScheduleVariant]]:
         """Map cTrader's weekly schedule to PyneCore sessions.
 
         Each :class:`ProtoOAInterval` is given in seconds from Sunday 00:00 in
@@ -319,7 +340,7 @@ class _ProviderMixin(_CTraderBase):
         dst = ZoneInfo(self.timezone)
 
         def render_week(sunday_date: date) -> tuple[
-                list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]]:
+            list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession]]:
             sunday = datetime.combine(sunday_date, time(0, 0), tzinfo=src)
             opening_hours: list[SymInfoInterval] = []
             session_starts: list[SymInfoSession] = []
@@ -394,7 +415,7 @@ class _ProviderMixin(_CTraderBase):
 
         async def work(wire, account_id: int) -> None:
             symbol_id = await self._resolve_symbol_id(wire, account_id)
-            period = self._period_value()
+            period = self._period_name()
             from_ms = int(from_dt.timestamp() * 1000)
             to_ms = int(to_dt.timestamp() * 1000)
             cursor = from_ms
@@ -446,8 +467,8 @@ class _ProviderMixin(_CTraderBase):
         self._run(self._authed_session(work))
 
     async def _fetch_trendbar_window(
-        self, wire, account_id: int, symbol_id: int, period: int,
-        from_ms: int, to_ms: int,
+            self, wire, account_id: int, symbol_id: int, period: str,
+            from_ms: int, to_ms: int,
     ) -> tuple[dict[int, _model.ProtoOATrendbar], bool]:
         """Read the trendbars the venue holds in ``[from_ms, to_ms]``.
 
@@ -499,8 +520,8 @@ class _ProviderMixin(_CTraderBase):
         return bars, False
 
     async def _fetch_ask_bars(
-        self, wire, account_id: int, symbol_id: int, from_ms: int, to_ms: int,
-        bar_opens: list[int],
+            self, wire, account_id: int, symbol_id: int, from_ms: int, to_ms: int,
+            bar_opens: list[int],
     ) -> dict[int, tuple[float, float, float, float]]:
         """Aggregate ``ASK`` tick history into per-bar open/high/low/close.
 
@@ -587,7 +608,7 @@ class _ProviderMixin(_CTraderBase):
 
     @staticmethod
     def _attach_ask(
-        candle: OHLCV, ask: tuple[float, float, float, float] | None
+            candle: OHLCV, ask: tuple[float, float, float, float] | None
     ) -> OHLCV:
         """Attach ask O/H/L/C and ``spread`` to a bid candle, if ask is known.
 
@@ -641,7 +662,7 @@ class _ProviderMixin(_CTraderBase):
 
     # --- live OHLCV ---------------------------------------------------------
 
-    async def _subscribe_live(self, symbol: str, timeframe: str) -> None:
+    async def _subscribe_live(self, symbol: str, timeframe: str) -> SubscribeOutcome:
         """Subscribe spot quotes + live trendbars for the watched symbol.
 
         Tolerant of a half-completed earlier attempt: ``watch_ohlcv`` runs
@@ -652,36 +673,44 @@ class _ProviderMixin(_CTraderBase):
         rejected with ``ALREADY_SUBSCRIBED`` (cTrader subscribes are not
         idempotent). That state is exactly what we want, so the error is
         treated as success (mirroring ``ALREADY_LOGGED_IN`` in
-        ``_send_account_auth``). On success the ``(symbol, timeframe)`` pair
-        is recorded in ``_live_subscription`` so :meth:`on_reconnect` can
-        replay it on a fresh connection.
+        ``_send_account_auth``). The returned immutable outcome preserves the
+        distinction for diagnostics while existing callers may ignore it. On
+        success the ``(symbol, timeframe)`` pair is recorded in
+        ``_live_subscription`` so :meth:`on_reconnect` can replay it on a fresh
+        connection.
 
         :param symbol: The cTrader symbol name.
         :param timeframe: Timeframe in TradingView format.
+        :return: The distinct server outcome of both subscription requests.
         :raises CTraderConnectionError: If the live connection is not open.
         """
         wire = self._wire
         if wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
         symbol_id = await self._resolve_symbol_id(wire, self._live_account_id)
-        period = _model.ProtoOATrendbarPeriod.Value(self.to_exchange_timeframe(timeframe))
+        period = self.to_exchange_timeframe(timeframe)
+        statuses: list[SubscribeStatus] = []
         for request in (
-            _oa.ProtoOASubscribeSpotsReq(
-                ctidTraderAccountId=self._live_account_id, symbolId=[symbol_id],
-            ),
-            _oa.ProtoOASubscribeLiveTrendbarReq(
-                ctidTraderAccountId=self._live_account_id, period=period,
-                symbolId=symbol_id,
-            ),
+                _oa.ProtoOASubscribeSpotsReq(
+                    ctidTraderAccountId=self._live_account_id, symbolId=[symbol_id],
+                ),
+                _oa.ProtoOASubscribeLiveTrendbarReq(
+                    ctidTraderAccountId=self._live_account_id, period=period,
+                    symbolId=symbol_id,
+                ),
         ):
             try:
                 await wire.send_request(request)
             except CTraderProtocolError as exc:
                 if exc.error_code != 'ALREADY_SUBSCRIBED':
                     raise
+                statuses.append(SubscribeStatus.ALREADY_SUBSCRIBED)
+            else:
+                statuses.append(SubscribeStatus.SUCCESS)
         self._subscribed_symbols.add(symbol)
         self._watch_symbol_id = symbol_id
         self._live_subscription = (symbol, timeframe)
+        return SubscribeOutcome(spots=statuses[0], trendbars=statuses[1])
 
     @override
     async def on_reconnect(self) -> None:
@@ -776,7 +805,7 @@ class _ProviderMixin(_CTraderBase):
             return
 
         symbol_id = await self._resolve_symbol_id(wire, account_id)
-        period = _model.ProtoOATrendbarPeriod.Value(exchange_period)
+        period = exchange_period
         recovered_by_timestamp: dict[int, OHLCV] = {}
         window_ms = period_ms * 2000
         failure: CTraderWireError | None = None
@@ -893,12 +922,7 @@ class _ProviderMixin(_CTraderBase):
         if spot_events is None:
             raise CTraderConnectionError("live event router not started")
 
-        while True:
-            if self._pending_bars:
-                bar = self._pending_bars.popleft()
-                if bar.is_closed:
-                    self._last_live_closed_bar = bar
-                return bar
+        while not self._pending_bars:
             # The event router (see ``_CTraderBase._event_router_loop``) is the
             # sole consumer of ``wire.events`` and forwards spot events here, so
             # ``watch_ohlcv`` and ``watch_orders`` can stream concurrently
@@ -911,12 +935,17 @@ class _ProviderMixin(_CTraderBase):
             # Roll the trendbars first (they finalize the prior bar against the
             # bid/ask seen so far), then fold THIS event's quotes into the new
             # current bar.
-            for bar in message.trendbar:
-                self._ingest_live_bar(bar)
+            for trendbar in message.trendbar:
+                self._ingest_live_bar(trendbar)
             if message.bid:
                 self._last_bid = message.bid / _PRICE_SCALE
             if message.ask:
                 self._track_ask(message.ask / _PRICE_SCALE)
+
+        bar = self._pending_bars.popleft()
+        if bar.is_closed:
+            self._last_live_closed_bar = bar
+        return bar
 
     def _ingest_live_bar(self, bar: _model.ProtoOATrendbar) -> None:
         """Fold a live trendbar into the pending-bar buffer.
