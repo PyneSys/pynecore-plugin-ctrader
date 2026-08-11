@@ -62,19 +62,56 @@ class _HistoryWire:
         raise AssertionError(f"unexpected request: {type(request).__name__}")
 
 
-def _provider(wire: _HistoryWire, timeframe: str = "1") -> CTrader:
+class _ObservedCTrader(CTrader):
+    """Provider test seam collecting connected-gap observation hook calls."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.connected_gap_events: list[tuple[str, dict[str, object]]] = []
+
+    def _observe_connected_gap_repair(
+        self,
+        event: str,
+        payload: dict[str, object],
+    ) -> None:
+        self.connected_gap_events.append((event, dict(payload)))
+
+
+def _provider(wire: _HistoryWire, timeframe: str = "1") -> _ObservedCTrader:
     config = CTraderConfig(
         demo=True,
         client_id="client",
         client_secret="secret",
         account_id="999",
     )
-    provider = CTrader(symbol="broker:EURUSD", timeframe=timeframe, config=config)
+    provider = _ObservedCTrader(
+        symbol="broker:EURUSD",
+        timeframe=timeframe,
+        config=config,
+    )
     provider._wire = wire  # type: ignore[assignment]
     provider._live_account_id = 999
     provider._symbols_by_name = {"EURUSD": 1}
     provider._live_subscription = ("EURUSD", timeframe)
     return provider
+
+
+def _closed(timestamp: int, price: float = 1.14) -> OHLCV:
+    return OHLCV(
+        timestamp=timestamp * 1000,
+        open=price,
+        high=price,
+        low=price,
+        close=price,
+        volume=1.0,
+        is_closed=True,
+    )
+
+
+async def _watch(provider: _ObservedCTrader) -> OHLCV:
+    provider._spot_events = asyncio.Queue()
+    provider._subscribed_symbols.add("EURUSD")
+    return await provider.watch_ohlcv("EURUSD", "1")
 
 
 def _anchor(moment: datetime) -> OHLCV:
@@ -96,6 +133,28 @@ def _freeze(monkeypatch, moment: datetime) -> None:
             return moment
 
     monkeypatch.setattr("pynecore_ctrader.provider.datetime", _Now)
+
+
+class _BlockingHistoryWire(_HistoryWire):
+    """History wire whose response is released by the test interleaving."""
+
+    def __init__(
+        self,
+        history: list[_model.ProtoOATrendbar],
+        started: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        super().__init__(history)
+        self.started = started
+        self.release = release
+
+    async def send_request(self, request):
+        if isinstance(request, _oa.ProtoOAGetTrendbarsReq):
+            self.requests.append(request)
+            self.started.set()
+            await self.release.wait()
+            return _oa.ProtoOAGetTrendbarsRes(trendbar=self.history)
+        return await super().send_request(request)
 
 
 def __test_reconnect_backfills_only_fully_closed_missing_bars__(monkeypatch):
@@ -456,3 +515,280 @@ def __test_closed_live_delivery_advances_the_reconnect_anchor__():
 
     assert delivered is closed
     assert provider._last_live_closed_bar is closed
+
+
+def __test_connected_gap_returns_deduplicated_history_before_stream_candidate__():
+    """A 21:06 history bar precedes the frozen 21:07 stream candidate exactly."""
+    anchor_ts = 1_800_000_000
+    missing_ts = anchor_ts + 60
+    candidate_ts = anchor_ts + 120
+    wire = _HistoryWire(
+        [
+            _trendbar(anchor_ts, 114_000),
+            _trendbar(missing_ts, 114_010),
+            _trendbar(missing_ts, 114_011),
+            _trendbar(candidate_ts, 114_020),
+        ]
+    )
+    provider = _provider(wire)
+    anchor = _closed(anchor_ts)
+    candidate = _closed(candidate_ts, 1.142)
+    later_forming = OHLCV(
+        timestamp=(candidate_ts + 60) * 1000,
+        open=1.143,
+        high=1.143,
+        low=1.143,
+        close=1.143,
+        volume=1.0,
+        is_closed=False,
+    )
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.extend((candidate, later_forming))
+
+    first = asyncio.run(_watch(provider))
+    second = asyncio.run(_watch(provider))
+
+    assert first.timestamp == missing_ts * 1000
+    assert second is candidate
+    assert list(provider._pending_bars) == [later_forming]
+    assert provider._last_live_closed_bar is candidate
+    history_requests = [
+        request
+        for request in wire.requests
+        if isinstance(request, _oa.ProtoOAGetTrendbarsReq)
+    ]
+    assert len(history_requests) == 1
+    assert history_requests[0].fromTimestamp == missing_ts * 1000
+    assert history_requests[0].toTimestamp == candidate_ts * 1000
+    assert [event for event, _payload in provider.connected_gap_events] == [
+        "started",
+        "completed",
+    ]
+    completed = provider.connected_gap_events[-1][1]
+    assert completed["recovered_timestamps"] == [missing_ts * 1000]
+    assert completed["candidate_released"] is True
+
+
+def __test_connected_gap_retry_uses_an_event_loop_timer__(monkeypatch):
+    """A temporarily empty history read settles through the bounded loop timer."""
+    anchor_ts = 1_800_000_000
+    missing_ts = anchor_ts + 60
+    candidate_ts = anchor_ts + 120
+    missing = _trendbar(missing_ts, 114_010)
+    wire = _HistoryWire(
+        [missing],
+        history_responses=[[], [missing]],
+    )
+    provider = _provider(wire)
+    provider._live_history_settle_delay_seconds = 0.001
+    provider._last_live_closed_bar = _closed(anchor_ts)
+    provider._pending_bars.append(_closed(candidate_ts))
+
+    async def forbidden_sleep(_seconds: float) -> None:
+        raise AssertionError("history retry used asyncio.sleep")
+
+    monkeypatch.setattr("pynecore_ctrader.provider.asyncio.sleep", forbidden_sleep)
+    delivered = asyncio.run(_watch(provider))
+
+    assert delivered.timestamp == missing_ts * 1000
+    assert len(
+        [
+            request
+            for request in wire.requests
+            if isinstance(request, _oa.ProtoOAGetTrendbarsReq)
+        ]
+    ) == 2
+
+
+def __test_connected_gap_partial_history_preserves_original_candidate_order__():
+    """A partial response is emitted exactly without inventing absent slots."""
+    anchor_ts = 1_800_000_000
+    returned_ts = anchor_ts + 120
+    candidate_ts = anchor_ts + 180
+    wire = _HistoryWire([_trendbar(returned_ts, 114_020)])
+    provider = _provider(wire)
+    provider._live_history_settle_attempts = 1
+    anchor = _closed(anchor_ts)
+    candidate = _closed(candidate_ts)
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    first = asyncio.run(_watch(provider))
+
+    assert first.timestamp == returned_ts * 1000
+    assert list(provider._pending_bars) == [candidate]
+    assert provider._last_live_closed_bar is first
+    assert provider.connected_gap_events[-1][1]["recovered_timestamps"] == [
+        returned_ts * 1000
+    ]
+
+
+def __test_connected_gap_permanent_rejection_releases_only_the_stream_candidate__():
+    """A permanent history rejection leaves no filler and releases the candidate."""
+    anchor_ts = 1_800_000_000
+    candidate_ts = anchor_ts + 120
+    wire = _HistoryWire(
+        [],
+        history_faults=[CTraderProtocolError("SYMBOL_NOT_FOUND", "no such symbol")],
+    )
+    provider = _provider(wire)
+    provider._last_live_closed_bar = _closed(anchor_ts)
+    candidate = _closed(candidate_ts)
+    provider._pending_bars.append(candidate)
+
+    delivered = asyncio.run(_watch(provider))
+
+    assert delivered is candidate
+    assert provider._last_live_closed_bar is candidate
+    assert [event for event, _payload in provider.connected_gap_events] == [
+        "started",
+        "failed",
+    ]
+    failed = provider.connected_gap_events[-1][1]
+    assert failed["candidate_released"] is True
+    assert failed["recovered_timestamps"] == []
+
+
+def __test_connected_gap_dead_wire_preserves_candidate_and_anchor__():
+    """A socket failure leaves the accepted cursor and queue head untouched."""
+    anchor_ts = 1_800_000_000
+    candidate_ts = anchor_ts + 120
+    wire = _HistoryWire(
+        [],
+        history_faults=[CTraderConnectionError("not connected")],
+    )
+    provider = _provider(wire)
+    anchor = _closed(anchor_ts)
+    candidate = _closed(candidate_ts)
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    async def scenario() -> None:
+        try:
+            await _watch(provider)
+        except CTraderConnectionError:
+            return
+        raise AssertionError("dead wire did not propagate")
+
+    asyncio.run(scenario())
+
+    assert list(provider._pending_bars) == [candidate]
+    assert provider._last_live_closed_bar is anchor
+    assert provider.connected_gap_events[-1][1]["candidate_released"] is False
+
+
+def __test_connected_gap_rejects_stale_history_after_wire_replacement__():
+    """A new wire and queued update invalidate the blocked history result."""
+    anchor_ts = 1_800_000_000
+    missing_ts = anchor_ts + 60
+    candidate_ts = anchor_ts + 120
+
+    async def scenario() -> tuple[_ObservedCTrader, OHLCV, OHLCV, OHLCV]:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        wire = _BlockingHistoryWire(
+            [_trendbar(missing_ts, 114_010)],
+            started,
+            release,
+        )
+        provider = _provider(wire)
+        anchor = _closed(anchor_ts)
+        candidate = _closed(candidate_ts)
+        next_update = _closed(candidate_ts + 60)
+        provider._last_live_closed_bar = anchor
+        provider._pending_bars.append(candidate)
+        provider._spot_events = asyncio.Queue()
+        provider._subscribed_symbols.add("EURUSD")
+        task = asyncio.create_task(provider.watch_ohlcv("EURUSD", "1"))
+        await started.wait()
+        provider._wire = _HistoryWire([])  # type: ignore[assignment]
+        provider._pending_bars.append(next_update)
+        release.set()
+        try:
+            await task
+        except CTraderConnectionError:
+            pass
+        else:
+            raise AssertionError("stale history result was accepted")
+        return provider, anchor, candidate, next_update
+
+    provider, anchor, candidate, next_update = asyncio.run(scenario())
+
+    assert list(provider._pending_bars) == [candidate, next_update]
+    assert provider._last_live_closed_bar is anchor
+    assert provider.connected_gap_events[-1][1]["failure_type"] == (
+        "ConnectedGapStateChanged"
+    )
+
+
+def __test_connected_gap_cancellation_leaves_no_queue_or_cursor_commit__():
+    """Cancellation during collection preserves state and leaves no child task."""
+    anchor_ts = 1_800_000_000
+    candidate_ts = anchor_ts + 120
+
+    async def scenario() -> tuple[_ObservedCTrader, OHLCV, OHLCV]:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        wire = _BlockingHistoryWire([], started, release)
+        provider = _provider(wire)
+        anchor = _closed(anchor_ts)
+        candidate = _closed(candidate_ts)
+        provider._last_live_closed_bar = anchor
+        provider._pending_bars.append(candidate)
+        provider._spot_events = asyncio.Queue()
+        provider._subscribed_symbols.add("EURUSD")
+        task = asyncio.create_task(provider.watch_ohlcv("EURUSD", "1"))
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("connected gap collection ignored cancellation")
+        remaining = [
+            pending
+            for pending in asyncio.all_tasks()
+            if pending is not asyncio.current_task() and not pending.done()
+        ]
+        assert not remaining
+        return provider, anchor, candidate
+
+    provider, anchor, candidate = asyncio.run(scenario())
+
+    assert list(provider._pending_bars) == [candidate]
+    assert provider._last_live_closed_bar is anchor
+    assert provider.connected_gap_events[-1][1]["failure_type"] == "CancelledError"
+
+
+def __test_connected_gap_empty_history_does_not_create_closed_session_bars__():
+    """An empty venue response releases the jump without synthetic history."""
+    anchor_ts = 1_800_000_000
+    candidate_ts = anchor_ts + 3 * 60
+    wire = _HistoryWire([])
+    provider = _provider(wire)
+    provider._live_history_settle_attempts = 1
+    provider._last_live_closed_bar = _closed(anchor_ts)
+    candidate = _closed(candidate_ts)
+    provider._pending_bars.append(candidate)
+
+    delivered = asyncio.run(_watch(provider))
+
+    assert delivered is candidate
+    assert not provider._pending_bars
+    assert provider.connected_gap_events[-1][1]["recovered_timestamps"] == []
+
+
+def __test_connected_gap_wire_identity_is_provider_owned_and_monotonic__():
+    """Durable wire evidence never depends on a reusable Python object address."""
+    first_wire = _HistoryWire([])
+    provider = _provider(first_wire)
+
+    assert provider._connection_generation_for_wire(first_wire) == 1  # type: ignore[arg-type]
+    first_identity = provider._live_wire_identity
+    assert provider._connection_generation_for_wire(first_wire) == 1  # type: ignore[arg-type]
+    assert provider._live_wire_identity == first_identity
+
+    second_wire = _HistoryWire([])
+    assert provider._connection_generation_for_wire(second_wire) == 2  # type: ignore[arg-type]
+    assert provider._live_wire_identity == first_identity + 1

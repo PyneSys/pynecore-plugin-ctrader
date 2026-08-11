@@ -17,6 +17,7 @@ the absolute price and open/high/close are non-negative deltas above it.
 """
 import asyncio
 import logging
+import time as monotonic_time
 from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -38,7 +39,12 @@ from .exceptions import is_rate_limited
 from .helpers import VOLUME_SCALE
 from .messages import OpenApiMessages_pb2 as _oa
 from .messages import OpenApiModelMessages_pb2 as _model
-from .wire import CTraderConnectionError, CTraderProtocolError, CTraderWireError
+from .wire import (
+    CTraderConnectionError,
+    CTraderProtocolError,
+    CTraderWireError,
+    WireClient,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +93,25 @@ class SubscribeOutcome:
     trendbars: SubscribeStatus
 
 
+@dataclass(frozen=True, slots=True)
+class _LiveHistoryCollection:
+    """Side-effect-free result of one bounded live-history collection."""
+
+    bars: tuple[OHLCV, ...]
+    failure: CTraderWireError | None
+    response_received_monotonic_ns: int
+
+
 class _ProviderMixin(_CTraderBase):
     """Provider mix-in: timeframe maps, listings, symbol info and OHLCV."""
 
     _live_history_settle_attempts = _LIVE_HISTORY_SETTLE_ATTEMPTS
     _live_history_settle_delay_seconds = _LIVE_HISTORY_SETTLE_DELAY_SECONDS
+    _live_history_bar_ids: set[int]
+    _live_generation_wire: WireClient
+    _live_connection_generation: int
+    _live_wire_identity: int
+    _connected_gap_repair_occurrence: int
 
     # --- timeframe helpers --------------------------------------------------
 
@@ -687,6 +707,7 @@ class _ProviderMixin(_CTraderBase):
         wire = self._wire
         if wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
+        self._connection_generation_for_wire(wire)
         symbol_id = await self._resolve_symbol_id(wire, self._live_account_id)
         period = self.to_exchange_timeframe(timeframe)
         statuses: list[SubscribeStatus] = []
@@ -730,8 +751,49 @@ class _ProviderMixin(_CTraderBase):
         historical download unless ask reconstruction is explicitly requested.
         """
         if self._live_subscription is not None:
+            self._live_history_bar_ids = set()
             await self._subscribe_live(*self._live_subscription)
             await self._backfill_live_gap(*self._live_subscription)
+
+    def _connection_generation_for_wire(self, wire: WireClient) -> int:
+        """Return the stable streaming generation assigned to ``wire``."""
+        if getattr(self, '_live_generation_wire', None) is not wire:
+            self._live_generation_wire = wire
+            self._live_connection_generation = (
+                getattr(self, '_live_connection_generation', 0) + 1
+            )
+            self._live_wire_identity = getattr(self, '_live_wire_identity', 0) + 1
+        return self._live_connection_generation
+
+    def _observe_connected_gap_repair(
+        self,
+        event: str,
+        payload: dict[str, object],
+    ) -> None:
+        """Observe a connected-stream history repair without changing behavior.
+
+        The production provider intentionally does nothing. Read-only laboratory
+        subclasses may override this hook to persist credential-free evidence.
+
+        :param event: ``started``, ``completed`` or ``failed``.
+        :param payload: Primitive repair identity, timing and timestamp evidence.
+        """
+
+    @staticmethod
+    async def _wait_live_history_retry(seconds: float) -> None:
+        """Wait for one bounded retry timer without polling or a sleep task."""
+        loop = asyncio.get_running_loop()
+        elapsed = loop.create_future()
+
+        def complete(_unused: object) -> None:
+            if not elapsed.done():
+                elapsed.set_result(None)
+
+        handle = loop.call_later(max(0.0, seconds), complete, None)
+        try:
+            await elapsed
+        finally:
+            handle.cancel()
 
     @staticmethod
     def _history_failure_is_transient(exc: CTraderWireError) -> bool:
@@ -748,6 +810,110 @@ class _ProviderMixin(_CTraderBase):
         if isinstance(exc, CTraderProtocolError):
             return exc.retryable or is_rate_limited(exc.error_code)
         return True
+
+    async def _collect_live_gap_history(
+        self,
+        wire: WireClient,
+        account_id: int,
+        timeframe: str,
+        *,
+        anchor_timestamp: int,
+        query_ceiling: int,
+    ) -> _LiveHistoryCollection:
+        """Collect sorted closed trendbars inside an explicit live-gap window.
+
+        This method never mutates the pending queue or the accepted closed-bar
+        cursor. Inclusive venue edges are filtered locally and duplicate
+        timestamps collapse before the result is returned.
+
+        :param wire: Frozen wire used for every request in this collection.
+        :param account_id: Frozen live account identity.
+        :param timeframe: Timeframe in TradingView format.
+        :param anchor_timestamp: Last accepted closed bar opening in milliseconds.
+        :param query_ceiling: Exclusive upper opening bound in milliseconds.
+        :return: Sorted closed bars plus terminal request evidence.
+        :raises CTraderConnectionError: If the frozen wire disconnects.
+        """
+        exchange_period = self.to_exchange_timeframe(timeframe)
+        calendar_period = exchange_period == 'MN1'
+        period_ms = max(1, int(in_seconds(timeframe))) * 1000
+        cursor = anchor_timestamp + (_MIN_MONTH_MS if calendar_period else period_ms)
+        response_received_ns = monotonic_time.monotonic_ns()
+        if cursor >= query_ceiling:
+            return _LiveHistoryCollection((), None, response_received_ns)
+
+        try:
+            symbol_id = await self._resolve_symbol_id(wire, account_id)
+        except CTraderConnectionError:
+            raise
+        except CTraderWireError as exc:
+            return _LiveHistoryCollection(
+                (), exc, monotonic_time.monotonic_ns()
+            )
+
+        recovered_by_timestamp: dict[int, OHLCV] = {}
+        window_ms = period_ms * 2000
+        newest_expected = None if calendar_period else query_ceiling - period_ms
+        failure: CTraderWireError | None = None
+
+        def settled() -> bool:
+            """Whether the newest already-closed bar has been recovered."""
+            if calendar_period:
+                return any(
+                    query_ceiling < bar_timestamp + _MIN_MONTH_MS
+                    for bar_timestamp in recovered_by_timestamp
+                )
+            return newest_expected in recovered_by_timestamp
+
+        for attempt in range(self._live_history_settle_attempts):
+            query_cursor = cursor
+            try:
+                while query_cursor < query_ceiling:
+                    window_end = min(query_cursor + window_ms, query_ceiling)
+                    response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
+                        _oa.ProtoOAGetTrendbarsReq(
+                            ctidTraderAccountId=account_id,
+                            symbolId=symbol_id,
+                            period=exchange_period,
+                            fromTimestamp=query_cursor,
+                            toTimestamp=window_end,
+                        )
+                    ))
+                    response_received_ns = monotonic_time.monotonic_ns()
+                    for trendbar in response.trendbar:
+                        timestamp = trendbar.utcTimestampInMinutes * 60_000
+                        if cursor <= timestamp < window_end:
+                            recovered_by_timestamp[timestamp] = self._decode_trendbar(
+                                trendbar
+                            )
+                    query_cursor = window_end
+                failure = None
+            except CTraderConnectionError:
+                raise
+            except CTraderWireError as exc:
+                response_received_ns = monotonic_time.monotonic_ns()
+                failure = exc
+                if not self._history_failure_is_transient(exc):
+                    break
+            if settled() or attempt + 1 == self._live_history_settle_attempts:
+                break
+            await self._wait_live_history_retry(
+                self._live_history_settle_delay_seconds
+            )
+
+        if calendar_period and recovered_by_timestamp:
+            newest = max(recovered_by_timestamp)
+            if query_ceiling < newest + _MAX_MONTH_MS:
+                del recovered_by_timestamp[newest]
+
+        return _LiveHistoryCollection(
+            tuple(
+                recovered_by_timestamp[timestamp]
+                for timestamp in sorted(recovered_by_timestamp)
+            ),
+            failure if not settled() else None,
+            response_received_ns,
+        )
 
     async def _backfill_live_gap(self, symbol: str, timeframe: str) -> None:
         """Queue venue trendbars that closed since the last delivered live bar.
@@ -785,116 +951,166 @@ class _ProviderMixin(_CTraderBase):
         calendar_period = exchange_period == 'MN1'
         period_ms = max(1, int(in_seconds(timeframe))) * 1000
         if calendar_period:
-            # The forming month cannot be located by arithmetic, so it is
-            # requested along with the rest and dropped afterwards.
-            cursor = anchor_ts + _MIN_MONTH_MS
             query_ceiling = now_ms
-            newest_expected = None
         else:
-            cursor = anchor_ts + period_ms
             query_ceiling = anchor_ts + (now_ms - anchor_ts) // period_ms * period_ms
-            # The newest slot that must already be closed. Recovering *some* bar
-            # is no proof the gap is repaired: the venue's history read model can
-            # serve older slots while the just-closed one is still settling, and
-            # stopping there would drop it for good — the live feed advances the
-            # anchor past it. The attempt budget still bounds the wait, because
-            # the slot may legitimately hold no bar (session closed over the
-            # outage).
-            newest_expected = query_ceiling - period_ms
+        cursor = anchor_ts + (_MIN_MONTH_MS if calendar_period else period_ms)
         if cursor >= query_ceiling:
             return
-
-        symbol_id = await self._resolve_symbol_id(wire, account_id)
-        period = exchange_period
-        recovered_by_timestamp: dict[int, OHLCV] = {}
-        window_ms = period_ms * 2000
-        failure: CTraderWireError | None = None
-
-        def settled() -> bool:
-            """Whether the newest already-closed bar has been recovered."""
-            if calendar_period:
-                # No month is shorter than ``_MIN_MONTH_MS``, so an opening
-                # younger than that cannot have a successor yet: it is the
-                # forming one, and having it in hand proves every older month is
-                # settled and present. An older newest opening is ambiguous — a
-                # 28-day-old bar is the forming one in a long month but already
-                # closed in February — so it settles nothing and the venue is
-                # asked again until its successor appears.
-                return any(now_ms < timestamp + _MIN_MONTH_MS
-                           for timestamp in recovered_by_timestamp)
-            return newest_expected in recovered_by_timestamp
-
-        for attempt in range(self._live_history_settle_attempts):
-            query_cursor = cursor
-            try:
-                while query_cursor < query_ceiling:
-                    window_end = min(query_cursor + window_ms, query_ceiling)
-                    response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
-                        _oa.ProtoOAGetTrendbarsReq(
-                            ctidTraderAccountId=account_id,
-                            symbolId=symbol_id,
-                            period=period,
-                            fromTimestamp=query_cursor,
-                            toTimestamp=window_end,
-                        )
-                    ))
-                    for trendbar in response.trendbar:
-                        timestamp = trendbar.utcTimestampInMinutes * 60_000
-                        if cursor <= timestamp < window_end:
-                            recovered_by_timestamp[timestamp] = self._decode_trendbar(
-                                trendbar
-                            )
-                    query_cursor = window_end
-            except CTraderConnectionError:
-                # The wire itself is gone. The anchor is untouched, so letting
-                # this reach the runner buys a full reconnect that repeats the
-                # backfill over the very same window.
-                raise
-            except CTraderWireError as exc:
-                # Request-scoped failure (timeout, throttle): keep the pages that
-                # did settle and retry inside the bounded budget instead of
-                # abandoning the whole gap. A permanent rejection (rejected
-                # window, unknown symbol, revoked access) cannot settle by
-                # waiting, so it ends the retries instead of burning the budget.
-                failure = exc
-                if not self._history_failure_is_transient(exc):
-                    break
-            if settled() or attempt + 1 == self._live_history_settle_attempts:
-                break
-            await asyncio.sleep(self._live_history_settle_delay_seconds)
-
-        if failure is not None and not settled():
+        collection = await self._collect_live_gap_history(
+            wire,
+            account_id,
+            timeframe,
+            anchor_timestamp=anchor_ts,
+            query_ceiling=query_ceiling,
+        )
+        if collection.failure is not None:
             # Degrade rather than halt: the live subscription is already
-            # restored, so the feed keeps running and PyneCore synthesizes the
-            # slots that stayed missing.
+            # restored, while downstream continuity checks retain authority over
+            # any slot that history did not return.
             logger.warning(
                 'Reconnect backfill incomplete for %s %s (%d bar(s) recovered): %s',
-                symbol, timeframe, len(recovered_by_timestamp), failure,
+                symbol, timeframe, len(collection.bars), collection.failure,
             )
-
-        if calendar_period and recovered_by_timestamp:
-            newest = max(recovered_by_timestamp)
-            if now_ms < newest + _MAX_MONTH_MS:
-                # No opening proves this month ended and it is young enough to
-                # still be running, so it belongs to the live subscription. A
-                # short month whose successor has not opened a bar yet is held
-                # back too; that errs towards a missing bar rather than a
-                # forming one published as final, and the anchor stays put so a
-                # later reconnect picks it up once its successor exists.
-                del recovered_by_timestamp[newest]
-
-        recovered = [
-            recovered_by_timestamp[timestamp]
-            for timestamp in sorted(recovered_by_timestamp)
-        ]
-        self._pending_bars.extend(recovered)
-        if recovered:
+        self._pending_bars.extend(collection.bars)
+        history_ids = getattr(self, '_live_history_bar_ids', set())
+        history_ids.update(id(bar) for bar in collection.bars)
+        self._live_history_bar_ids = history_ids
+        if collection.bars:
             logger.info(
                 'Backfilled %d closed trendbar(s) after reconnect (%d..%d)',
-                len(recovered),
-                recovered[0].timestamp,
-                recovered[-1].timestamp,
+                len(collection.bars),
+                collection.bars[0].timestamp,
+                collection.bars[-1].timestamp,
             )
+
+    async def _repair_connected_gap(
+        self,
+        symbol: str,
+        timeframe: str,
+        candidate: OHLCV,
+    ) -> None:
+        """Insert exact history bars before one frozen stream candidate."""
+        anchor = self._last_live_closed_bar
+        wire = self._wire
+        account_id = self._live_account_id
+        subscription = self._live_subscription
+        if anchor is None or wire is None or account_id is None:
+            return
+
+        anchor_timestamp = int(anchor.timestamp)
+        candidate_timestamp = int(candidate.timestamp)
+        period_ms = max(1, int(in_seconds(timeframe))) * 1000
+        occurrence = getattr(self, '_connected_gap_repair_occurrence', 0) + 1
+        self._connected_gap_repair_occurrence = occurrence
+        recovery_id = f'connected-gap-{occurrence}'
+        generation = self._connection_generation_for_wire(wire)
+        request_started_ns = monotonic_time.monotonic_ns()
+        shared: dict[str, object] = {
+            'recovery_id': recovery_id,
+            'occurrence': occurrence,
+            'wire_identity': self._live_wire_identity,
+            'connection_generation': generation,
+            'symbol': symbol,
+            'timeframe': timeframe,
+            'accepted_anchor_timestamp': anchor_timestamp,
+            'candidate_timestamp': candidate_timestamp,
+            'requested_from_timestamp': anchor_timestamp + period_ms,
+            'requested_to_timestamp': candidate_timestamp,
+            'query_ceiling_timestamp': candidate_timestamp,
+            'request_started_monotonic_ns': request_started_ns,
+        }
+        self._observe_connected_gap_repair('started', shared)
+        try:
+            collection = await self._collect_live_gap_history(
+                wire,
+                account_id,
+                timeframe,
+                anchor_timestamp=anchor_timestamp,
+                query_ceiling=candidate_timestamp,
+            )
+        except asyncio.CancelledError:
+            self._observe_connected_gap_repair(
+                'failed',
+                {
+                    **shared,
+                    'response_received_monotonic_ns': monotonic_time.monotonic_ns(),
+                    'recovered_timestamps': [],
+                    'candidate_released': False,
+                    'failure_type': 'CancelledError',
+                },
+            )
+            raise
+        except CTraderConnectionError:
+            self._observe_connected_gap_repair(
+                'failed',
+                {
+                    **shared,
+                    'response_received_monotonic_ns': monotonic_time.monotonic_ns(),
+                    'recovered_timestamps': [],
+                    'candidate_released': False,
+                    'failure_type': 'CTraderConnectionError',
+                },
+            )
+            raise
+
+        current_anchor = self._last_live_closed_bar
+        current_anchor_timestamp = (
+            int(current_anchor.timestamp) if current_anchor is not None else None
+        )
+        state_changed = (
+            self._wire is not wire
+            or self._live_subscription != subscription
+            or current_anchor is not anchor
+            or current_anchor_timestamp != anchor_timestamp
+            or getattr(self, '_live_connection_generation', None) != generation
+            or not self._pending_bars
+            or self._pending_bars[0] is not candidate
+        )
+        if state_changed:
+            self._observe_connected_gap_repair(
+                'failed',
+                {
+                    **shared,
+                    'response_received_monotonic_ns': (
+                        collection.response_received_monotonic_ns
+                    ),
+                    'recovered_timestamps': [],
+                    'candidate_released': False,
+                    'failure_type': 'ConnectedGapStateChanged',
+                },
+            )
+            raise CTraderConnectionError(
+                'connected gap state changed during history repair'
+            )
+
+        recovered = tuple(
+            bar
+            for bar in collection.bars
+            if anchor_timestamp < int(bar.timestamp) < candidate_timestamp
+        )
+        terminal_event = 'failed' if collection.failure is not None else 'completed'
+        self._observe_connected_gap_repair(
+            terminal_event,
+            {
+                **shared,
+                'response_received_monotonic_ns': (
+                    collection.response_received_monotonic_ns
+                ),
+                'recovered_timestamps': [int(bar.timestamp) for bar in recovered],
+                'candidate_released': True,
+                'failure_type': (
+                    type(collection.failure).__name__
+                    if collection.failure is not None
+                    else None
+                ),
+            },
+        )
+        for bar in reversed(recovered):
+            self._pending_bars.appendleft(bar)
+        history_ids = getattr(self, '_live_history_bar_ids', set())
+        history_ids.update(id(bar) for bar in recovered)
+        self._live_history_bar_ids = history_ids
 
     @override
     async def watch_ohlcv(self, symbol: str, timeframe: str) -> OHLCV:
@@ -942,7 +1158,24 @@ class _ProviderMixin(_CTraderBase):
             if message.ask:
                 self._track_ask(message.ask / _PRICE_SCALE)
 
+        candidate = self._pending_bars[0]
+        history_ids = getattr(self, '_live_history_bar_ids', set())
+        self._live_history_bar_ids = history_ids
+        if (
+            candidate.is_closed
+            and id(candidate) not in history_ids
+            and self._last_live_closed_bar is not None
+            and self.to_exchange_timeframe(timeframe) != 'MN1'
+        ):
+            period_ms = max(1, int(in_seconds(timeframe))) * 1000
+            expected_timestamp = int(self._last_live_closed_bar.timestamp) + period_ms
+            if int(candidate.timestamp) > expected_timestamp:
+                await self._repair_connected_gap(symbol, timeframe, candidate)
+                history_ids = self._live_history_bar_ids
+
         bar = self._pending_bars.popleft()
+        history_ids.discard(id(bar))
+        self._live_history_bar_ids = history_ids
         if bar.is_closed:
             self._last_live_closed_bar = bar
         return bar
