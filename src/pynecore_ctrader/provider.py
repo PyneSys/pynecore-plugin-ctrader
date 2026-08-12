@@ -18,12 +18,13 @@ the absolute price and open/high/close are non-negative deltas above it.
 import asyncio
 import logging
 import time as monotonic_time
+from abc import ABC
 from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from typing import Callable, cast
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pynecore.core.plugin import override, Broker
 from pynecore.core.syminfo import (
@@ -37,8 +38,29 @@ from ._base import _CTraderBase
 from .config import CTraderConfig
 from .exceptions import is_rate_limited
 from .helpers import VOLUME_SCALE
-from .messages import OpenApiMessages_pb2 as _oa
-from .messages import OpenApiModelMessages_pb2 as _model
+from .messages.OpenApiMessages_pb2 import (
+    ProtoOAAssetListReq,
+    ProtoOAAssetListRes,
+    ProtoOAGetTickDataReq,
+    ProtoOAGetTickDataRes,
+    ProtoOAGetTrendbarsReq,
+    ProtoOAGetTrendbarsRes,
+    ProtoOASpotEvent,
+    ProtoOASubscribeLiveTrendbarReq,
+    ProtoOASubscribeSpotsReq,
+    ProtoOASymbolByIdReq,
+    ProtoOASymbolByIdRes,
+    ProtoOASymbolsListReq,
+    ProtoOASymbolsListRes,
+)
+from .messages.OpenApiModelMessages_pb2 import (
+    ProtoOAInterval,
+    ProtoOALightSymbol,
+    ProtoOAQuoteType,
+    ProtoOASymbol,
+    ProtoOATrendbar,
+    ProtoOATrendbarPeriod,
+)
 from .wire import (
     CTraderConnectionError,
     CTraderProtocolError,
@@ -60,14 +82,6 @@ _SCHEDULE_HISTORY_YEARS = 5
 #: settle before handing control back to the live stream.
 _LIVE_HISTORY_SETTLE_ATTEMPTS = 5
 _LIVE_HISTORY_SETTLE_DELAY_SECONDS = 1.0
-
-#: Bounds on the length of a calendar month. ``MN1`` openings follow the
-#: calendar, so no fixed number of milliseconds locates them; only these bounds
-#: hold for every month, whatever timezone the venue aggregates in. The minimum
-#: is the smallest possible step to the next opening (never overshoots it), the
-#: maximum the largest possible age at which a bar may still be forming.
-_MIN_MONTH_MS = 28 * 86_400_000
-_MAX_MONTH_MS = 31 * 86_400_000
 
 #: TradingView timeframe -> ``ProtoOATrendbarPeriod`` enum name.
 _TV_TO_PERIOD = {
@@ -103,7 +117,7 @@ class _LiveHistoryCollection:
     complete: bool
 
 
-class _ProviderMixin(_CTraderBase):
+class _ProviderMixin(_CTraderBase, ABC):
     """Provider mix-in: timeframe maps, listings, symbol info and OHLCV."""
 
     _live_history_settle_attempts = _LIVE_HISTORY_SETTLE_ATTEMPTS
@@ -211,7 +225,7 @@ class _ProviderMixin(_CTraderBase):
 
     async def _fetch_light_symbols(
             self, wire, account_id: int, *, recover: bool = False
-    ) -> list[_model.ProtoOALightSymbol]:
+    ) -> list[ProtoOALightSymbol]:
         """Fetch the account's light-symbol list and cache name -> id.
 
         :param recover: When ``True`` (the live order / state paths, where
@@ -220,15 +234,22 @@ class _ProviderMixin(_CTraderBase):
             recovered instead of leaking a raw protocol error. The one-shot CLI
             paths leave it ``False`` (they run on a private, just-authed wire).
         """
-        req = _oa.ProtoOASymbolsListReq(ctidTraderAccountId=account_id)
+        req = ProtoOASymbolsListReq(ctidTraderAccountId=account_id)
         response = await (self._account_request(req) if recover else wire.send_request(req))
-        response = cast(_oa.ProtoOASymbolsListRes, response)
+        response = cast(ProtoOASymbolsListRes, response)
         symbols = list(response.symbol)
         self._symbols_by_name = {s.symbolName: s.symbolId for s in symbols}
         self._symbols_by_id = {s.symbolId: s.symbolName for s in symbols}
         return symbols
 
     # --- symbol info --------------------------------------------------------
+
+    @override
+    def get_symbol_info(self, force_update: bool = False) -> SymInfo:
+        """Load or fetch symbol metadata and retain it for live gap decisions."""
+        syminfo = super().get_symbol_info(force_update)
+        self.syminfo = syminfo
+        return syminfo
 
     @override
     def update_symbol_info(self) -> SymInfo:
@@ -243,13 +264,13 @@ class _ProviderMixin(_CTraderBase):
                     "SYMBOL_NOT_FOUND", f"symbol '{self.symbol}' not on this account"
                 )
 
-            assets_res = cast(_oa.ProtoOAAssetListRes, await wire.send_request(
-                _oa.ProtoOAAssetListReq(ctidTraderAccountId=account_id)
+            assets_res = cast(ProtoOAAssetListRes, await wire.send_request(
+                ProtoOAAssetListReq(ctidTraderAccountId=account_id)
             ))
             asset_names = {a.assetId: a.name for a in assets_res.asset}
 
-            detail_res = cast(_oa.ProtoOASymbolByIdRes, await wire.send_request(
-                _oa.ProtoOASymbolByIdReq(
+            detail_res = cast(ProtoOASymbolByIdRes, await wire.send_request(
+                ProtoOASymbolByIdReq(
                     ctidTraderAccountId=account_id, symbolId=[match.symbolId]
                 )
             ))
@@ -260,12 +281,14 @@ class _ProviderMixin(_CTraderBase):
             detail = detail_res.symbol[0]
             return self._build_sym_info(match, detail, asset_names)
 
-        return cast(SymInfo, self._run(self._authed_session(work)))
+        syminfo = cast(SymInfo, self._run(self._authed_session(work)))
+        self.syminfo = syminfo
+        return syminfo
 
     def _build_sym_info(
             self,
-            light: _model.ProtoOALightSymbol,
-            detail: _model.ProtoOASymbol,
+            light: ProtoOALightSymbol,
+            detail: ProtoOASymbol,
             asset_names: dict[int, str],
     ) -> SymInfo:
         """Assemble a :class:`SymInfo` from the light + full symbol records."""
@@ -325,7 +348,7 @@ class _ProviderMixin(_CTraderBase):
         )
 
     def _schedule_to_sessions(
-            self, schedule: list[_model.ProtoOAInterval], schedule_tz: str
+            self, schedule: list[ProtoOAInterval], schedule_tz: str
     ) -> tuple[list[SymInfoInterval], list[SymInfoSession], list[SymInfoSession],
     list[SymInfoScheduleVariant]]:
         """Map cTrader's weekly schedule to PyneCore sessions.
@@ -350,14 +373,18 @@ class _ProviderMixin(_CTraderBase):
         re-fetched on every data update anyway.
 
         :param schedule: The weekly trading intervals.
-        :param schedule_tz: The IANA zone the intervals are expressed in.
+        :param schedule_tz: The IANA zone the intervals are expressed in. An empty
+            value uses UTC; an invalid nonempty value is rejected.
         :return: ``(opening_hours, session_starts, session_ends,
             session_schedules)``.
+        :raises ValueError: If the venue supplies an invalid nonempty timezone.
         """
         try:
             src = ZoneInfo(schedule_tz) if schedule_tz else ZoneInfo('UTC')
-        except Exception:  # noqa: BLE001 - unknown zone name falls back to UTC
-            src = ZoneInfo('UTC')
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError(
+                f"Invalid cTrader schedule timezone: {schedule_tz!r}"
+            ) from error
         dst = ZoneInfo(self.timezone)
 
         def render_week(sunday_date: date) -> tuple[
@@ -487,10 +514,11 @@ class _ProviderMixin(_CTraderBase):
 
         self._run(self._authed_session(work))
 
+    @staticmethod
     async def _fetch_trendbar_window(
-            self, wire, account_id: int, symbol_id: int, period: str,
+            wire, account_id: int, symbol_id: int, period: str,
             from_ms: int, to_ms: int,
-    ) -> tuple[dict[int, _model.ProtoOATrendbar], bool]:
+    ) -> tuple[dict[int, ProtoOATrendbar], bool]:
         """Read the trendbars the venue holds in ``[from_ms, to_ms]``.
 
         ``ProtoOAGetTrendbarsRes.hasMore`` marks a response the backend capped to
@@ -507,12 +535,12 @@ class _ProviderMixin(_CTraderBase):
         :return: The trendbars keyed by their opening (epoch milliseconds), and
             whether they are known to cover the whole window.
         """
-        bars: dict[int, _model.ProtoOATrendbar] = {}
+        bars: dict[int, ProtoOATrendbar] = {}
         upper = to_ms
         narrowed = False
         while upper > from_ms:
-            response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
-                _oa.ProtoOAGetTrendbarsReq(
+            response = cast(ProtoOAGetTrendbarsRes, await wire.send_request(
+                ProtoOAGetTrendbarsReq(
                     ctidTraderAccountId=account_id, symbolId=symbol_id,
                     period=period, fromTimestamp=from_ms, toTimestamp=upper,
                 )
@@ -572,10 +600,10 @@ class _ProviderMixin(_CTraderBase):
         buckets: dict[int, list[float]] = {}
         upper = to_ms
         while upper > from_ms:
-            response = cast(_oa.ProtoOAGetTickDataRes, await wire.send_request(
-                _oa.ProtoOAGetTickDataReq(
+            response = cast(ProtoOAGetTickDataRes, await wire.send_request(
+                ProtoOAGetTickDataReq(
                     ctidTraderAccountId=account_id, symbolId=symbol_id,
-                    type=_model.ProtoOAQuoteType.ASK,
+                    type=ProtoOAQuoteType.ASK,
                     fromTimestamp=from_ms, toTimestamp=upper,
                 )
             ))
@@ -660,7 +688,8 @@ class _ProviderMixin(_CTraderBase):
                 "SYMBOL_NOT_FOUND", f"symbol '{self.symbol}' not on this account"
             )
 
-    def _decode_trendbar(self, bar: _model.ProtoOATrendbar, *, is_closed: bool = True) -> OHLCV:
+    @staticmethod
+    def _decode_trendbar(bar: ProtoOATrendbar, *, is_closed: bool = True) -> OHLCV:
         """Decode a ``ProtoOATrendbar`` into an :class:`OHLCV`.
 
         The low carries the absolute price; open/high/close are deltas above it.
@@ -713,10 +742,10 @@ class _ProviderMixin(_CTraderBase):
         period = self.to_exchange_timeframe(timeframe)
         statuses: list[SubscribeStatus] = []
         for request in (
-                _oa.ProtoOASubscribeSpotsReq(
+                ProtoOASubscribeSpotsReq(
                     ctidTraderAccountId=self._live_account_id, symbolId=[symbol_id],
                 ),
-                _oa.ProtoOASubscribeLiveTrendbarReq(
+                ProtoOASubscribeLiveTrendbarReq(
                     ctidTraderAccountId=self._live_account_id, period=period,
                     symbolId=symbol_id,
                 ),
@@ -797,6 +826,198 @@ class _ProviderMixin(_CTraderBase):
             handle.cancel()
 
     @staticmethod
+    def _history_opening_hours_for_date(
+        syminfo: SymInfo,
+        local_date: date,
+    ) -> tuple[list[SymInfoInterval], bool]:
+        """Resolve one date plus the prior date's possible overnight sessions."""
+        previous_date = local_date - timedelta(days=1)
+        corrections = syminfo.session_corrections
+
+        def resolve(target: date) -> tuple[list[SymInfoInterval], bool]:
+            if target in corrections:
+                return list(corrections[target]), True
+            opening_hours, _starts, _ends = syminfo.schedule_for(target)
+            return opening_hours, bool(opening_hours) or bool(syminfo.session_schedules)
+
+        today_hours, today_known = resolve(local_date)
+        previous_hours, previous_known = resolve(previous_date)
+        weekday = local_date.weekday()
+        previous_weekday = previous_date.weekday()
+        relevant = [interval for interval in today_hours if interval.day == weekday]
+        relevant.extend(
+            interval
+            for interval in previous_hours
+            if interval.day == previous_weekday and interval.end < interval.start
+        )
+        return relevant, today_known and previous_known
+
+    @staticmethod
+    def _local_boundary_timestamps(
+        local_date: date,
+        local_time: time,
+        zone: ZoneInfo,
+    ) -> tuple[int, ...]:
+        """Return all valid absolute timestamps for one local wall boundary."""
+        timestamps: set[int] = set()
+        for fold in (0, 1):
+            local = datetime.combine(local_date, local_time, tzinfo=zone).replace(
+                fold=fold
+            )
+            timestamp_ms = int(local.timestamp() * 1000)
+            round_trip = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=zone)
+            if (
+                round_trip.date() == local_date
+                and round_trip.time().replace(tzinfo=None) == local_time
+                and round_trip.fold == fold
+            ):
+                timestamps.add(timestamp_ms)
+        return tuple(sorted(timestamps))
+
+    @classmethod
+    def _history_segment_overlaps_sessions(
+        cls,
+        segment_start_ms: int,
+        segment_end_ms: int,
+        local_date: date,
+        opening_hours: list[SymInfoInterval],
+        zone: ZoneInfo,
+    ) -> bool | None:
+        """Intersect one absolute segment with all relevant local sessions."""
+        weekday = local_date.weekday()
+        previous_date = local_date - timedelta(days=1)
+        previous_weekday = previous_date.weekday()
+        boundaries_known = True
+        for interval in opening_hours:
+            if interval.day == weekday:
+                start_date = local_date
+                end_date = (
+                    local_date + timedelta(days=1)
+                    if interval.end < interval.start
+                    else local_date
+                )
+            elif interval.day == previous_weekday and interval.end < interval.start:
+                start_date = previous_date
+                end_date = local_date
+            else:
+                continue
+            starts = cls._local_boundary_timestamps(
+                start_date,
+                interval.start,
+                zone,
+            )
+            ends = cls._local_boundary_timestamps(
+                end_date,
+                interval.end,
+                zone,
+            )
+            if not starts or not ends:
+                boundaries_known = False
+                continue
+            if any(
+                end_ms > start_ms
+                and segment_end_ms > start_ms
+                and segment_start_ms < end_ms
+                for start_ms in starts
+                for end_ms in ends
+            ):
+                return True
+        return False if boundaries_known else None
+
+    def _history_interval_is_open(
+        self,
+        timestamp_ms: int,
+        next_timestamp_ms: int,
+    ) -> bool | None:
+        """Classify a complete history interval across every local date it spans."""
+        syminfo = self.syminfo
+        if syminfo is None:
+            return None
+        try:
+            zone = ZoneInfo(syminfo.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return None
+        interval_start = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=zone)
+        interval_end = datetime.fromtimestamp(next_timestamp_ms / 1000.0, tz=zone)
+        calendar_known = True
+        day = interval_start.date()
+        while day <= interval_end.date():
+            day_start = datetime.combine(day, time(0, 0), tzinfo=zone)
+            next_day = datetime.combine(
+                day + timedelta(days=1),
+                time(0, 0),
+                tzinfo=zone,
+            )
+            day_start_ms = int(day_start.timestamp() * 1000)
+            next_day_ms = int(next_day.timestamp() * 1000)
+            segment_start_ms = max(timestamp_ms, day_start_ms)
+            segment_end_ms = min(next_timestamp_ms, next_day_ms)
+            if segment_start_ms < segment_end_ms:
+                opening_hours, day_known = self._history_opening_hours_for_date(
+                    syminfo,
+                    day,
+                )
+                overlap = self._history_segment_overlaps_sessions(
+                    segment_start_ms,
+                    segment_end_ms,
+                    day,
+                    opening_hours,
+                    zone,
+                )
+                if overlap:
+                    return True
+                calendar_known = calendar_known and day_known and overlap is False
+            day += timedelta(days=1)
+        return False if calendar_known else None
+
+    def _history_slot_is_open(self, timestamp_ms: int, timeframe: str) -> bool | None:
+        """Classify one complete history slot with the effective-dated calendar.
+
+        ``None`` means symbol metadata is unavailable, so callers must fail closed.
+        Each local date in the slot is resolved through explicit corrections first,
+        then the effective weekly schedule, before applying slot-overlap semantics.
+
+        :param timestamp_ms: Bar opening timestamp in Unix milliseconds.
+        :param timeframe: Timeframe in TradingView format.
+        :return: ``True`` for open-session, ``False`` for closed-session, otherwise
+            ``None`` when no calendar is available.
+        """
+        period_ms = max(1, int(in_seconds(timeframe))) * 1000
+        return self._history_interval_is_open(
+            timestamp_ms,
+            timestamp_ms + period_ms,
+        )
+
+    def _next_month_opening(self, timestamp_ms: int) -> int | None:
+        """Return the next monthly opening on the provider's calendar grid."""
+        try:
+            zone = ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return None
+        local = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=zone)
+        year = local.year + 1 if local.month == 12 else local.year
+        month = 1 if local.month == 12 else local.month + 1
+        next_open = datetime(
+            year,
+            month,
+            1,
+            local.hour,
+            local.minute,
+            local.second,
+            local.microsecond,
+            tzinfo=zone,
+        )
+        return int(next_open.timestamp() * 1000)
+
+    def _history_month_is_open(
+        self,
+        timestamp_ms: int,
+        next_timestamp_ms: int,
+    ) -> bool | None:
+        """Classify whether any venue session overlaps one calendar-month slot."""
+        return self._history_interval_is_open(timestamp_ms, next_timestamp_ms)
+
+    @staticmethod
     def _history_failure_is_transient(exc: CTraderWireError) -> bool:
         """Whether a failed history request can plausibly succeed on a retry.
 
@@ -838,7 +1059,15 @@ class _ProviderMixin(_CTraderBase):
         exchange_period = self.to_exchange_timeframe(timeframe)
         calendar_period = exchange_period == 'MN1'
         period_ms = max(1, int(in_seconds(timeframe))) * 1000
-        cursor = anchor_timestamp + (_MIN_MONTH_MS if calendar_period else period_ms)
+        if calendar_period:
+            month_cursor = self._next_month_opening(anchor_timestamp)
+            if month_cursor is None:
+                return _LiveHistoryCollection(
+                    (), None, monotonic_time.monotonic_ns(), False
+                )
+            cursor = month_cursor
+        else:
+            cursor = anchor_timestamp + period_ms
         response_received_ns = monotonic_time.monotonic_ns()
         if cursor >= query_ceiling:
             return _LiveHistoryCollection((), None, response_received_ns, True)
@@ -859,13 +1088,35 @@ class _ProviderMixin(_CTraderBase):
         coverage_complete = False
 
         def settled() -> bool:
-            """Whether the newest already-closed bar has been recovered."""
+            """Whether every expected slot is recovered or calendar-closed."""
             if calendar_period:
-                return any(
-                    query_ceiling < bar_timestamp + _MIN_MONTH_MS
-                    for bar_timestamp in recovered_by_timestamp
-                )
-            return newest_expected in recovered_by_timestamp
+                expected_timestamp = self._next_month_opening(anchor_timestamp)
+                while (
+                    expected_timestamp is not None
+                    and expected_timestamp < query_ceiling
+                ):
+                    following_timestamp = self._next_month_opening(
+                        expected_timestamp
+                    )
+                    if following_timestamp is None:
+                        return False
+                    if expected_timestamp not in recovered_by_timestamp:
+                        if query_ceiling < following_timestamp:
+                            return False
+                        if self._history_month_is_open(
+                            expected_timestamp,
+                            following_timestamp,
+                        ) is not False:
+                            return False
+                    expected_timestamp = following_timestamp
+                return expected_timestamp is not None
+            assert newest_expected is not None
+            for expected_timestamp in range(cursor, query_ceiling, period_ms):
+                if expected_timestamp in recovered_by_timestamp:
+                    continue
+                if self._history_slot_is_open(expected_timestamp, timeframe) is not False:
+                    return False
+            return True
 
         for attempt in range(self._live_history_settle_attempts):
             query_cursor = cursor
@@ -907,12 +1158,15 @@ class _ProviderMixin(_CTraderBase):
                 self._live_history_settle_delay_seconds
             )
 
+        complete = coverage_complete and settled()
         if calendar_period and recovered_by_timestamp:
             newest = max(recovered_by_timestamp)
-            if query_ceiling < newest + _MAX_MONTH_MS:
+            next_open = self._next_month_opening(newest)
+            if next_open is None:
+                complete = False
+            elif query_ceiling < next_open:
                 del recovered_by_timestamp[newest]
 
-        complete = coverage_complete
         return _LiveHistoryCollection(
             tuple(
                 recovered_by_timestamp[timestamp]
@@ -962,8 +1216,12 @@ class _ProviderMixin(_CTraderBase):
             query_ceiling = now_ms
         else:
             query_ceiling = anchor_ts + (now_ms - anchor_ts) // period_ms * period_ms
-        cursor = anchor_ts + (_MIN_MONTH_MS if calendar_period else period_ms)
-        if cursor >= query_ceiling:
+        cursor = (
+            self._next_month_opening(anchor_ts)
+            if calendar_period
+            else anchor_ts + period_ms
+        )
+        if cursor is None or cursor >= query_ceiling:
             return
         collection = await self._collect_live_gap_history(
             wire,
@@ -1014,6 +1272,14 @@ class _ProviderMixin(_CTraderBase):
         anchor_timestamp = int(anchor.timestamp)
         candidate_timestamp = int(candidate.timestamp)
         period_ms = max(1, int(in_seconds(timeframe))) * 1000
+        if self.to_exchange_timeframe(timeframe) == 'MN1':
+            requested_from_timestamp = self._next_month_opening(anchor_timestamp)
+            if requested_from_timestamp is None:
+                raise CTraderConnectionError(
+                    'monthly connected gap timezone is invalid'
+                )
+        else:
+            requested_from_timestamp = anchor_timestamp + period_ms
         occurrence = getattr(self, '_connected_gap_repair_occurrence', 0) + 1
         self._connected_gap_repair_occurrence = occurrence
         recovery_id = f'connected-gap-{occurrence}'
@@ -1028,7 +1294,7 @@ class _ProviderMixin(_CTraderBase):
             'timeframe': timeframe,
             'accepted_anchor_timestamp': anchor_timestamp,
             'candidate_timestamp': candidate_timestamp,
-            'requested_from_timestamp': anchor_timestamp + period_ms,
+            'requested_from_timestamp': requested_from_timestamp,
             'requested_to_timestamp': candidate_timestamp,
             'query_ceiling_timestamp': candidate_timestamp,
             'request_started_monotonic_ns': request_started_ns,
@@ -1165,7 +1431,7 @@ class _ProviderMixin(_CTraderBase):
         spot_events = self._spot_events
         if spot_events is None:
             raise CTraderConnectionError("live event router not started")
-        expected_period = _model.ProtoOATrendbarPeriod.Value(
+        expected_period = ProtoOATrendbarPeriod.Value(
             self.to_exchange_timeframe(timeframe)
         )
 
@@ -1177,14 +1443,14 @@ class _ProviderMixin(_CTraderBase):
                 # ``watch_ohlcv`` and ``watch_orders`` can stream concurrently
                 # without racing on the shared queue.
                 message = await spot_events.get()
-                if not isinstance(message, _oa.ProtoOASpotEvent):
+                if not isinstance(message, ProtoOASpotEvent):
                     continue
                 if message.symbolId != self._watch_symbol_id:
                     continue
                 # Normalize the repeated trendbar field before mutating live state:
                 # only the subscribed period participates, duplicate openings use
                 # the last payload, and openings are processed chronologically.
-                trendbars_by_timestamp: dict[int, _model.ProtoOATrendbar] = {}
+                trendbars_by_timestamp: dict[int, ProtoOATrendbar] = {}
                 for trendbar in message.trendbar:
                     if trendbar.period != expected_period:
                         continue
@@ -1231,10 +1497,17 @@ class _ProviderMixin(_CTraderBase):
                 candidate.is_closed
                 and id(candidate) not in history_ids
                 and self._last_live_closed_bar is not None
-                and self.to_exchange_timeframe(timeframe) != 'MN1'
             ):
-                period_ms = max(1, int(in_seconds(timeframe))) * 1000
-                expected_timestamp = int(self._last_live_closed_bar.timestamp) + period_ms
+                anchor_timestamp = int(self._last_live_closed_bar.timestamp)
+                if self.to_exchange_timeframe(timeframe) == 'MN1':
+                    expected_timestamp = self._next_month_opening(anchor_timestamp)
+                    if expected_timestamp is None:
+                        raise CTraderConnectionError(
+                            'monthly live cursor timezone is invalid'
+                        )
+                else:
+                    period_ms = max(1, int(in_seconds(timeframe))) * 1000
+                    expected_timestamp = anchor_timestamp + period_ms
                 if int(candidate.timestamp) > expected_timestamp:
                     await self._repair_connected_gap(symbol, timeframe, candidate)
                     history_ids = self._live_history_bar_ids
@@ -1247,7 +1520,7 @@ class _ProviderMixin(_CTraderBase):
             bar = delivered
         return bar
 
-    def _ingest_live_bar(self, bar: _model.ProtoOATrendbar) -> bool:
+    def _ingest_live_bar(self, bar: ProtoOATrendbar) -> bool:
         """Fold a live trendbar into current state and the closed-bar buffer.
 
         When the bar's timestamp advances past the bar being tracked, the prior

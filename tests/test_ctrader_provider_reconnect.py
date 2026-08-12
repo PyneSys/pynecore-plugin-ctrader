@@ -4,8 +4,9 @@
 Regression coverage for cTrader live OHLCV reconnect backfill.
 """
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 
+from pynecore.core.syminfo import SymInfo, SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
 
 from pynecore_ctrader import CTrader, CTraderConfig
@@ -88,7 +89,37 @@ class _ObservedCTrader(CTrader):
         self.connected_gap_events.append((event, dict(payload)))
 
 
-def _provider(wire: _HistoryWire, timeframe: str = "1") -> _ObservedCTrader:
+def _calendar(*, open_all_week: bool) -> SymInfo:
+    opening_hours = [
+        SymInfoInterval(day=day, start=time(0, 0), end=time(23, 59, 59))
+        for day in (range(7) if open_all_week else range(4))
+    ]
+    return SymInfo(
+        prefix="CTRADER",
+        description="EURUSD",
+        ticker="EURUSD",
+        currency="USD",
+        basecurrency="EUR",
+        period="1",
+        type="forex",
+        volumetype="tick",
+        mintick=0.00001,
+        pricescale=100000,
+        pointvalue=1.0,
+        mincontract=1000.0,
+        opening_hours=opening_hours,
+        session_starts=[],
+        session_ends=[],
+        timezone="UTC",
+    )
+
+
+def _provider(
+        wire: _HistoryWire,
+        timeframe: str = "1",
+        *,
+        open_all_week: bool = True,
+) -> _ObservedCTrader:
     config = CTraderConfig(
         demo=True,
         client_id="client",
@@ -104,6 +135,7 @@ def _provider(wire: _HistoryWire, timeframe: str = "1") -> _ObservedCTrader:
     provider._live_account_id = 999
     provider._symbols_by_name = {"EURUSD": 1}
     provider._live_subscription = ("EURUSD", timeframe)
+    provider.syminfo = _calendar(open_all_week=open_all_week)
     return provider
 
 
@@ -119,10 +151,13 @@ def _closed(timestamp: int, price: float = 1.14) -> OHLCV:
     )
 
 
-async def _watch(provider: _ObservedCTrader) -> OHLCV:
+async def _watch(
+    provider: _ObservedCTrader,
+    timeframe: str = "1",
+) -> OHLCV:
     provider._spot_events = asyncio.Queue()
     provider._subscribed_symbols.add("EURUSD")
-    return await provider.watch_ohlcv("EURUSD", "1")
+    return await provider.watch_ohlcv("EURUSD", timeframe)
 
 
 def _anchor(moment: datetime) -> OHLCV:
@@ -166,6 +201,55 @@ class _BlockingHistoryWire(_HistoryWire):
             await self.release.wait()
             return _oa.ProtoOAGetTrendbarsRes(trendbar=self.history)
         return await super().send_request(request)
+
+
+def __test_invalid_nonempty_schedule_timezone_fails_closed__():
+    """Malformed venue timezone cannot become trusted UTC calendar evidence."""
+    provider = _provider(_HistoryWire([]))
+    schedule = [
+        _model.ProtoOAInterval(
+            startSecond=24 * 60 * 60 + 9 * 60 * 60,
+            endSecond=24 * 60 * 60 + 17 * 60 * 60,
+        )
+    ]
+
+    anchor = _closed(1_800_000_000)
+    candidate = _closed(1_800_000_120)
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    try:
+        provider._schedule_to_sessions(schedule, "Invalid/Timezone")
+    except ValueError as error:
+        assert "Invalid cTrader schedule timezone" in str(error)
+    else:
+        raise AssertionError("invalid venue timezone was converted into UTC evidence")
+
+    assert provider._last_live_closed_bar is anchor
+    assert list(provider._pending_bars) == [candidate]
+
+
+def __test_empty_schedule_timezone_uses_utc__():
+    """A missing venue timezone retains the documented UTC default."""
+    provider = _provider(_HistoryWire([]))
+    schedule = [
+        _model.ProtoOAInterval(
+            startSecond=24 * 60 * 60 + 9 * 60 * 60,
+            endSecond=24 * 60 * 60 + 17 * 60 * 60,
+        )
+    ]
+
+    opening_hours, _starts, _ends, _history = provider._schedule_to_sessions(
+        schedule,
+        "",
+    )
+
+    assert any(
+        interval.day == 0
+        and interval.start == time(9, 0)
+        and interval.end == time(17, 0)
+        for interval in opening_hours
+    )
 
 
 def __test_reconnect_backfills_only_fully_closed_missing_bars__(monkeypatch):
@@ -617,6 +701,64 @@ def __test_monthly_backfill_keeps_the_forming_month_out__(monkeypatch):
     ]
 
 
+def __test_monthly_backfill_keeps_late_forming_month_out__(monkeypatch):
+    """Days 29-31 still classify by the actual next calendar opening."""
+    for current in (
+        datetime(2027, 7, 29, 12, tzinfo=timezone.utc),
+        datetime(2027, 7, 30, 12, tzinfo=timezone.utc),
+        datetime(2027, 7, 31, 12, tzinfo=timezone.utc),
+    ):
+        opens = [
+            datetime(2027, 5, 1, tzinfo=timezone.utc),
+            datetime(2027, 6, 1, tzinfo=timezone.utc),
+            datetime(2027, 7, 1, tzinfo=timezone.utc),
+        ]
+        wire = _HistoryWire(
+            [_trendbar(int(moment.timestamp()), 114_000) for moment in opens[1:]]
+        )
+        provider = _provider(wire, "1M")
+        provider._live_history_settle_delay_seconds = 0
+        provider._last_live_closed_bar = _anchor(opens[0])
+
+        _freeze(monkeypatch, current)
+        asyncio.run(provider.on_reconnect())
+
+        assert [bar.timestamp for bar in provider._pending_bars] == [
+            int(opens[1].timestamp()) * 1000
+        ]
+
+
+def __test_monthly_backfill_rejects_a_missing_closed_month__(monkeypatch):
+    """A forming newest month cannot hide an omitted closed month."""
+    opens = [
+        datetime(2027, 1, 1, tzinfo=timezone.utc),
+        datetime(2027, 2, 1, tzinfo=timezone.utc),
+        datetime(2027, 3, 1, tzinfo=timezone.utc),
+        datetime(2027, 4, 1, tzinfo=timezone.utc),
+    ]
+    wire = _HistoryWire(
+        [
+            _trendbar(int(opens[1].timestamp()), 114_000),
+            _trendbar(int(opens[3].timestamp()), 114_000),
+        ]
+    )
+    provider = _provider(wire, "1M")
+    provider._live_history_settle_delay_seconds = 0
+    anchor = _anchor(opens[0])
+    provider._last_live_closed_bar = anchor
+
+    _freeze(monkeypatch, datetime(2027, 4, 15, 12, tzinfo=timezone.utc))
+    try:
+        asyncio.run(provider.on_reconnect())
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("sparse monthly history was committed")
+
+    assert not provider._pending_bars
+    assert provider._last_live_closed_bar is anchor
+
+
 def __test_monthly_backfill_waits_out_a_short_month__(monkeypatch):
     """A 28-day-old opening may already be closed, so it proves nothing settled."""
     opens = [datetime(2027, 1, 1, tzinfo=timezone.utc),
@@ -747,6 +889,72 @@ def __test_connected_gap_returns_deduplicated_history_before_stream_candidate__(
     assert completed["candidate_released"] is True
 
 
+def __test_connected_monthly_gap_repairs_before_stream_candidate__():
+    """A missing closed month precedes the later monthly stream candidate."""
+    opens = [
+        datetime(2027, 1, 1, tzinfo=timezone.utc),
+        datetime(2027, 2, 1, tzinfo=timezone.utc),
+        datetime(2027, 3, 1, tzinfo=timezone.utc),
+    ]
+    wire = _HistoryWire(
+        [
+            _trendbar(int(opens[1].timestamp()), 114_010, "MN1"),
+            _trendbar(int(opens[2].timestamp()), 114_020, "MN1"),
+        ]
+    )
+    provider = _provider(wire, "1M")
+    anchor = _anchor(opens[0])
+    candidate = _anchor(opens[2])
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    first = asyncio.run(_watch(provider, "1M"))
+    second = asyncio.run(_watch(provider, "1M"))
+
+    assert first.timestamp == int(opens[1].timestamp()) * 1000
+    assert second is candidate
+    assert provider._last_live_closed_bar is candidate
+    assert [event for event, _payload in provider.connected_gap_events] == [
+        "started",
+        "completed",
+    ]
+    completed = provider.connected_gap_events[-1][1]
+    assert completed["recovered_timestamps"] == [
+        int(opens[1].timestamp()) * 1000
+    ]
+    assert completed["candidate_released"] is True
+
+
+def __test_connected_monthly_gap_incomplete_history_preserves_state__():
+    """A missing connected month cannot release or advance the stream candidate."""
+    opens = [
+        datetime(2027, 1, 1, tzinfo=timezone.utc),
+        datetime(2027, 2, 1, tzinfo=timezone.utc),
+        datetime(2027, 3, 1, tzinfo=timezone.utc),
+    ]
+    wire = _HistoryWire([_trendbar(int(opens[2].timestamp()), 114_020, "MN1")])
+    provider = _provider(wire, "1M")
+    provider._live_history_settle_attempts = 1
+    anchor = _anchor(opens[0])
+    candidate = _anchor(opens[2])
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    try:
+        asyncio.run(_watch(provider, "1M"))
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("incomplete monthly connected gap was committed")
+
+    assert provider._last_live_closed_bar is anchor
+    assert list(provider._pending_bars) == [candidate]
+    failed = provider.connected_gap_events[-1][1]
+    assert failed["recovered_timestamps"] == []
+    assert failed["candidate_released"] is False
+    assert failed["failure_type"] == "IncompleteHistory"
+
+
 def __test_connected_gap_retry_uses_an_event_loop_timer__(monkeypatch):
     """A temporarily empty history read settles through the bounded loop timer."""
     anchor_ts = 1_800_000_000
@@ -778,8 +986,8 @@ def __test_connected_gap_retry_uses_an_event_loop_timer__(monkeypatch):
     ) == 2
 
 
-def __test_connected_gap_partial_history_preserves_original_candidate_order__():
-    """A partial response is emitted exactly without inventing absent slots."""
+def __test_connected_gap_partial_open_session_history_is_not_committed__():
+    """A partial open-session response cannot advance queue or accepted cursor."""
     anchor_ts = 1_800_000_000
     returned_ts = anchor_ts + 120
     candidate_ts = anchor_ts + 180
@@ -791,14 +999,19 @@ def __test_connected_gap_partial_history_preserves_original_candidate_order__():
     provider._last_live_closed_bar = anchor
     provider._pending_bars.append(candidate)
 
-    first = asyncio.run(_watch(provider))
+    try:
+        asyncio.run(_watch(provider))
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("partial open-session history was committed")
 
-    assert first.timestamp == returned_ts * 1000
     assert list(provider._pending_bars) == [candidate]
-    assert provider._last_live_closed_bar is first
-    assert provider.connected_gap_events[-1][1]["recovered_timestamps"] == [
-        returned_ts * 1000
-    ]
+    assert provider._last_live_closed_bar is anchor
+    assert provider.connected_gap_events[-1][0] == "failed"
+    assert provider.connected_gap_events[-1][1]["recovered_timestamps"] == []
+    assert provider.connected_gap_events[-1][1]["candidate_released"] is False
+    assert provider.connected_gap_events[-1][1]["failure_type"] == "IncompleteHistory"
 
 
 def __test_connected_gap_marks_undrainable_capped_history_incomplete__():
@@ -978,12 +1191,257 @@ def __test_connected_gap_cancellation_leaves_no_queue_or_cursor_commit__():
     assert provider.connected_gap_events[-1][1]["failure_type"] == "CancelledError"
 
 
+def __test_connected_gap_empty_open_session_history_forces_fresh_connection__():
+    """The live failure's five empty reads cannot release an open-session jump."""
+    anchor_ts = 1_800_000_000
+    candidate_ts = anchor_ts + 2 * 60
+    wire = _HistoryWire([])
+    provider = _provider(wire)
+    provider._last_live_closed_bar = _closed(anchor_ts)
+    candidate = _closed(candidate_ts)
+    provider._pending_bars.append(candidate)
+
+    try:
+        asyncio.run(_watch(provider))
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("empty open-session history released its candidate")
+
+    assert len(
+        [
+            request
+            for request in wire.requests
+            if isinstance(request, _oa.ProtoOAGetTrendbarsReq)
+        ]
+    ) == provider._live_history_settle_attempts
+    assert list(provider._pending_bars) == [candidate]
+    assert provider._last_live_closed_bar is not None
+    assert provider._last_live_closed_bar.timestamp == anchor_ts * 1000
+    failed = provider.connected_gap_events[-1][1]
+    assert failed["recovered_timestamps"] == []
+    assert failed["candidate_released"] is False
+    assert failed["failure_type"] == "IncompleteHistory"
+
+
+def __test_history_slot_keeps_dst_spring_forward_overlap_open__():
+    """Absolute H1 overlap survives the skipped local spring-forward hour."""
+    provider = _provider(_HistoryWire([]), "60")
+    assert provider.syminfo is not None
+    provider.syminfo.timezone = "America/New_York"
+    provider.syminfo.opening_hours = [
+        SymInfoInterval(day=6, start=time(3, 0), end=time(4, 0))
+    ]
+    slot_start = datetime(2027, 3, 14, 6, 30, tzinfo=timezone.utc)
+
+    assert provider._history_slot_is_open(
+        int(slot_start.timestamp() * 1000),
+        "60",
+    ) is True
+
+
+def __test_connected_gap_dst_spring_forward_requires_history__():
+    """An empty spring-forward history read cannot release the later candidate."""
+    anchor_moment = datetime(2027, 3, 14, 5, 30, tzinfo=timezone.utc)
+    candidate_moment = datetime(2027, 3, 14, 7, 30, tzinfo=timezone.utc)
+    wire = _HistoryWire([])
+    provider = _provider(wire, "60")
+    provider._live_history_settle_attempts = 1
+    assert provider.syminfo is not None
+    provider.syminfo.timezone = "America/New_York"
+    provider.syminfo.opening_hours = [
+        SymInfoInterval(day=6, start=time(3, 0), end=time(4, 0))
+    ]
+    anchor = _anchor(anchor_moment)
+    candidate = _anchor(candidate_moment)
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    try:
+        asyncio.run(_watch(provider, "60"))
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("DST spring-forward gap was treated as calendar-closed")
+
+    assert provider._last_live_closed_bar is anchor
+    assert list(provider._pending_bars) == [candidate]
+    failed = provider.connected_gap_events[-1][1]
+    assert failed["recovered_timestamps"] == []
+    assert failed["candidate_released"] is False
+    assert failed["failure_type"] == "IncompleteHistory"
+
+
+def __test_history_slot_keeps_dst_fallback_hour_open__():
+    """The repeated local hour remains a non-empty absolute-time H1 slot."""
+    provider = _provider(_HistoryWire([]), "60")
+    assert provider.syminfo is not None
+    provider.syminfo.timezone = "America/New_York"
+    provider.syminfo.opening_hours = [
+        SymInfoInterval(day=6, start=time(0, 0), end=time(3, 0))
+    ]
+    slot_start = datetime(2027, 11, 7, 5, tzinfo=timezone.utc)
+
+    assert provider._history_slot_is_open(
+        int(slot_start.timestamp() * 1000),
+        "60",
+    ) is True
+
+
+def __test_connected_gap_dst_fallback_hour_requires_history__():
+    """An empty repeated-hour history read cannot release the later candidate."""
+    anchor_moment = datetime(2027, 11, 7, 4, tzinfo=timezone.utc)
+    candidate_moment = datetime(2027, 11, 7, 6, tzinfo=timezone.utc)
+    wire = _HistoryWire([])
+    provider = _provider(wire, "60")
+    provider._live_history_settle_attempts = 1
+    assert provider.syminfo is not None
+    provider.syminfo.timezone = "America/New_York"
+    provider.syminfo.opening_hours = [
+        SymInfoInterval(day=6, start=time(0, 0), end=time(3, 0))
+    ]
+    anchor = _anchor(anchor_moment)
+    candidate = _anchor(candidate_moment)
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    try:
+        asyncio.run(_watch(provider, "60"))
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("DST repeated-hour gap was treated as calendar-closed")
+
+    assert provider._last_live_closed_bar is anchor
+    assert list(provider._pending_bars) == [candidate]
+    failed = provider.connected_gap_events[-1][1]
+    assert failed["recovered_timestamps"] == []
+    assert failed["candidate_released"] is False
+    assert failed["failure_type"] == "IncompleteHistory"
+
+
+def __test_history_slot_uses_explicit_closed_day_correction__():
+    """A holiday correction replaces an otherwise open weekly session."""
+    monday = datetime(2027, 6, 7, 10, tzinfo=timezone.utc)
+    provider = _provider(_HistoryWire([]))
+    assert provider.syminfo is not None
+    provider.syminfo.session_corrections[monday.date()] = ()
+
+    assert provider._history_slot_is_open(
+        int(monday.timestamp() * 1000),
+        "1",
+    ) is False
+
+
+def __test_connected_gap_empty_holiday_history_releases_without_synthetic_bar__():
+    """A corrected closed holiday releases the successor without inventing data."""
+    anchor_moment = datetime(2027, 6, 7, 9, 59, tzinfo=timezone.utc)
+    candidate_moment = anchor_moment + timedelta(minutes=2)
+    wire = _HistoryWire([])
+    provider = _provider(wire)
+    provider._live_history_settle_attempts = 1
+    assert provider.syminfo is not None
+    provider.syminfo.session_corrections[anchor_moment.date()] = ()
+    anchor = _anchor(anchor_moment)
+    candidate = _anchor(candidate_moment)
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    delivered = asyncio.run(_watch(provider))
+
+    assert delivered is candidate
+    assert provider._last_live_closed_bar is candidate
+    assert not provider._pending_bars
+    completed = provider.connected_gap_events[-1][1]
+    assert completed["recovered_timestamps"] == []
+    assert completed["candidate_released"] is True
+
+
+def __test_connected_weekly_gap_checks_days_after_closed_opening_day__():
+    """A corrected closed Monday cannot hide open days later in the week."""
+    opens = [
+        datetime(2027, 1, 4, tzinfo=timezone.utc),
+        datetime(2027, 1, 11, tzinfo=timezone.utc),
+        datetime(2027, 1, 18, tzinfo=timezone.utc),
+    ]
+    wire = _HistoryWire([])
+    provider = _provider(wire, "1W")
+    provider._live_history_settle_attempts = 1
+    assert provider.syminfo is not None
+    provider.syminfo.session_corrections[opens[1].date()] = ()
+    anchor = _anchor(opens[0])
+    candidate = _anchor(opens[2])
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    try:
+        asyncio.run(_watch(provider, "1W"))
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("weekly slot with open later days was treated as closed")
+
+    assert provider._last_live_closed_bar is anchor
+    assert list(provider._pending_bars) == [candidate]
+    failed = provider.connected_gap_events[-1][1]
+    assert failed["recovered_timestamps"] == []
+    assert failed["candidate_released"] is False
+    assert failed["failure_type"] == "IncompleteHistory"
+
+
+def __test_connected_weekly_gap_releases_fully_corrected_closed_week__():
+    """A week corrected closed on every local date needs no synthetic history."""
+    opens = [
+        datetime(2027, 1, 4, tzinfo=timezone.utc),
+        datetime(2027, 1, 11, tzinfo=timezone.utc),
+        datetime(2027, 1, 18, tzinfo=timezone.utc),
+    ]
+    wire = _HistoryWire([])
+    provider = _provider(wire, "1W")
+    provider._live_history_settle_attempts = 1
+    assert provider.syminfo is not None
+    day = opens[1].date()
+    while day < opens[2].date():
+        provider.syminfo.session_corrections[day] = ()
+        day += timedelta(days=1)
+    anchor = _anchor(opens[0])
+    candidate = _anchor(opens[2])
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.append(candidate)
+
+    delivered = asyncio.run(_watch(provider, "1W"))
+
+    assert delivered is candidate
+    assert provider._last_live_closed_bar is candidate
+    assert not provider._pending_bars
+    completed = provider.connected_gap_events[-1][1]
+    assert completed["recovered_timestamps"] == []
+    assert completed["candidate_released"] is True
+
+
+def __test_history_month_uses_explicit_closed_day_corrections__():
+    """A month composed entirely of corrected holidays is calendar-closed."""
+    provider = _provider(_HistoryWire([]), "1M")
+    assert provider.syminfo is not None
+    month_start = datetime(2027, 2, 1, tzinfo=timezone.utc)
+    month_end = datetime(2027, 3, 1, tzinfo=timezone.utc)
+    day = month_start.date()
+    while day < month_end.date():
+        provider.syminfo.session_corrections[day] = ()
+        day += timedelta(days=1)
+
+    assert provider._history_month_is_open(
+        int(month_start.timestamp() * 1000),
+        int(month_end.timestamp() * 1000),
+    ) is False
+
+
 def __test_connected_gap_empty_history_does_not_create_closed_session_bars__():
-    """An empty venue response releases the jump without synthetic history."""
+    """An empty closed-session response releases the jump without synthetic bars."""
     anchor_ts = 1_800_000_000
     candidate_ts = anchor_ts + 3 * 60
     wire = _HistoryWire([])
-    provider = _provider(wire)
+    provider = _provider(wire, open_all_week=False)
     provider._live_history_settle_attempts = 1
     provider._last_live_closed_bar = _closed(anchor_ts)
     candidate = _closed(candidate_ts)
