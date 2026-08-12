@@ -18,9 +18,14 @@ from pynecore_ctrader.wire import (
 )
 
 
-def _trendbar(timestamp: int, price: int) -> _model.ProtoOATrendbar:
+def _trendbar(
+    timestamp: int,
+    price: int,
+    period: str = "M1",
+) -> _model.ProtoOATrendbar:
     return _model.ProtoOATrendbar(
         utcTimestampInMinutes=timestamp // 60,
+        period=period,
         low=price,
         deltaOpen=1,
         deltaHigh=3,
@@ -38,10 +43,12 @@ class _HistoryWire:
         *,
         history_responses: list[list[_model.ProtoOATrendbar]] | None = None,
         history_faults: list[Exception] | None = None,
+        history_has_more: list[bool] | None = None,
     ) -> None:
         self.history = history
         self.history_responses = list(history_responses or [])
         self.history_faults = list(history_faults or [])
+        self.history_has_more = list(history_has_more or [])
         self.requests: list = []
 
     async def send_request(self, request):
@@ -54,7 +61,11 @@ class _HistoryWire:
                 if self.history_responses
                 else self.history
             )
-            return _oa.ProtoOAGetTrendbarsRes(trendbar=history)
+            has_more = self.history_has_more.pop(0) if self.history_has_more else False
+            return _oa.ProtoOAGetTrendbarsRes(
+                trendbar=history,
+                hasMore=has_more,
+            )
         if isinstance(request, _oa.ProtoOASubscribeSpotsReq):
             return _oa.ProtoOASubscribeSpotsRes()
         if isinstance(request, _oa.ProtoOASubscribeLiveTrendbarReq):
@@ -199,6 +210,127 @@ def __test_reconnect_backfills_only_fully_closed_missing_bars__(monkeypatch):
     ]
 
 
+def __test_reconnect_history_deduplicates_overlapping_live_snapshot_and_quotes__():
+    """A backfilled bar is not re-emitted or allowed to leak stale quotes."""
+    history_ts = 1_800_000_060
+    next_ts = history_ts + 60
+    following_ts = next_ts + 60
+    provider = _provider(_HistoryWire([]))
+    previous = _closed(history_ts - 60)
+    history = _closed(history_ts, 1.141)
+    provider._last_live_closed_bar = previous
+    provider._pending_bars.append(history)
+    provider._live_history_bar_ids = {id(history)}
+
+    async def scenario() -> tuple[OHLCV, OHLCV, OHLCV]:
+        spot_events = asyncio.Queue()
+        provider._spot_events = spot_events
+        provider._subscribed_symbols.add("EURUSD")
+        provider._watch_symbol_id = 1
+        await spot_events.put(
+            _oa.ProtoOASpotEvent(
+                symbolId=1,
+                bid=900_000,
+                ask=910_000,
+                trendbar=[_trendbar(history_ts, 114_010)],
+            )
+        )
+        await spot_events.put(
+            _oa.ProtoOASpotEvent(
+                symbolId=1,
+                bid=120_000,
+                ask=121_000,
+                trendbar=[_trendbar(next_ts, 114_020)],
+            )
+        )
+        await spot_events.put(
+            _oa.ProtoOASpotEvent(
+                symbolId=1,
+                bid=130_000,
+                ask=131_000,
+                trendbar=[_trendbar(following_ts, 114_030)],
+            )
+        )
+        first_result = await provider.watch_ohlcv("EURUSD", "1")
+        second_result = await provider.watch_ohlcv("EURUSD", "1")
+        third_result = await provider.watch_ohlcv("EURUSD", "1")
+        return first_result, second_result, third_result
+
+    history_bar, forming_bar, closed_bar = asyncio.run(scenario())
+
+    assert history_bar is history
+    assert forming_bar.timestamp == next_ts * 1000
+    assert forming_bar.is_closed is False
+    assert closed_bar.timestamp == next_ts * 1000
+    assert closed_bar.is_closed is True
+    assert closed_bar.close == 1.2
+    assert closed_bar.extra_fields is not None
+    assert closed_bar.extra_fields["ask_close"] == 1.21
+    assert abs(closed_bar.extra_fields["spread"] - 0.01) < 1e-12
+    assert provider._last_live_closed_bar is closed_bar
+    assert all(bar.timestamp != history_ts * 1000 for bar in provider._pending_bars)
+
+
+def __test_pending_stream_duplicate_behind_closed_cursor_is_discarded__():
+    """The delivery boundary drops a stale closed stream candidate."""
+    anchor_ts = 1_800_000_000
+    provider = _provider(_HistoryWire([]))
+    anchor = _closed(anchor_ts)
+    stale = _closed(anchor_ts, 9.0)
+    candidate = _closed(anchor_ts + 60, 1.141)
+    provider._last_live_closed_bar = anchor
+    provider._pending_bars.extend((stale, candidate))
+
+    delivered = asyncio.run(_watch(provider))
+
+    assert delivered is candidate
+    assert provider._last_live_closed_bar is candidate
+    assert not provider._pending_bars
+
+
+def __test_live_event_normalizes_period_order_and_current_quotes__():
+    """Reversed mixed-period snapshots keep a forward cursor and current quotes."""
+    anchor_ts = 1_800_000_000
+    first_ts = anchor_ts + 60
+    current_ts = anchor_ts + 120
+    provider = _provider(_HistoryWire([]))
+    provider._last_live_closed_bar = _closed(anchor_ts)
+
+    async def scenario() -> tuple[OHLCV, OHLCV]:
+        spot_events = asyncio.Queue()
+        provider._spot_events = spot_events
+        provider._subscribed_symbols.add("EURUSD")
+        provider._watch_symbol_id = 1
+        await spot_events.put(
+            _oa.ProtoOASpotEvent(
+                symbolId=1,
+                bid=120_000,
+                ask=121_000,
+                trendbar=[
+                    _trendbar(current_ts, 114_030),
+                    _trendbar(first_ts, 900_000, period="M5"),
+                    _trendbar(first_ts, 114_020),
+                    _trendbar(anchor_ts, 900_000),
+                ],
+            )
+        )
+        first_result = await provider.watch_ohlcv("EURUSD", "1")
+        second_result = await provider.watch_ohlcv("EURUSD", "1")
+        return first_result, second_result
+
+    first_bar, forming_bar = asyncio.run(scenario())
+
+    assert first_bar.timestamp == first_ts * 1000
+    assert first_bar.is_closed is True
+    assert forming_bar.timestamp == current_ts * 1000
+    assert forming_bar.is_closed is False
+    assert forming_bar.close == 1.2
+    assert forming_bar.extra_fields is not None
+    assert forming_bar.extra_fields["ask_close"] == 1.21
+    assert abs(forming_bar.extra_fields["spread"] - 0.01) < 1e-12
+    assert provider._current_bar_ts == current_ts * 1000
+
+
 def __test_reconnect_without_a_closed_anchor_only_restores_subscription__():
     """Initial pre-close reconnect has no safe historical lower bound."""
     wire = _HistoryWire([])
@@ -283,6 +415,42 @@ def __test_reconnect_waits_for_the_newest_missing_bar__(monkeypatch):
     ]
 
 
+def __test_reconnect_drains_capped_history_pages__(monkeypatch):
+    """Every hasMore page is collected before reconnect history is complete."""
+    last_ts = 1_800_000_000
+    first_missed = last_ts + 60
+    second_missed = last_ts + 120
+    current_ts = last_ts + 180
+    wire = _HistoryWire(
+        [],
+        history_responses=[
+            [_trendbar(second_missed, 114_020)],
+            [_trendbar(first_missed, 114_010)],
+        ],
+        history_has_more=[True, False],
+    )
+    provider = _provider(wire)
+    provider._last_live_closed_bar = _closed(last_ts)
+
+    _freeze(monkeypatch, datetime.fromtimestamp(current_ts + 2, timezone.utc))
+    asyncio.run(provider.on_reconnect())
+
+    assert [bar.timestamp for bar in provider._pending_bars] == [
+        first_missed * 1000,
+        second_missed * 1000,
+    ]
+    history_requests = [
+        request
+        for request in wire.requests
+        if isinstance(request, _oa.ProtoOAGetTrendbarsReq)
+    ]
+    assert len(history_requests) == 2
+    assert history_requests[0].fromTimestamp == first_missed * 1000
+    assert history_requests[0].toTimestamp == current_ts * 1000
+    assert history_requests[1].fromTimestamp == first_missed * 1000
+    assert history_requests[1].toTimestamp == second_missed * 1000
+
+
 def __test_reconnect_retries_a_request_scoped_history_failure__(monkeypatch):
     """A timed-out history page is retried instead of ending the reconnect."""
     last_ts = 1_800_000_000
@@ -315,8 +483,8 @@ def __test_reconnect_retries_a_request_scoped_history_failure__(monkeypatch):
     assert [bar.timestamp for bar in provider._pending_bars] == [missed_ts * 1000]
 
 
-def __test_reconnect_survives_a_permanently_failing_history_endpoint__(monkeypatch):
-    """A history endpoint that never answers degrades instead of halting."""
+def __test_reconnect_retries_after_a_permanently_failing_history_endpoint__(monkeypatch):
+    """Unproven history coverage forces a fresh reconnect without queue commit."""
     last_ts = 1_800_000_000
     current_ts = last_ts + 120
     wire = _HistoryWire(
@@ -341,7 +509,12 @@ def __test_reconnect_survives_a_permanently_failing_history_endpoint__(monkeypat
             return cls.fromtimestamp(current_ts + 2, tz=timezone.utc)
 
     monkeypatch.setattr("pynecore_ctrader.provider.datetime", _Now)
-    asyncio.run(provider.on_reconnect())
+    try:
+        asyncio.run(provider.on_reconnect())
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("incomplete reconnect history was committed")
 
     assert not provider._pending_bars
     assert "EURUSD" in provider._subscribed_symbols
@@ -480,7 +653,12 @@ def __test_permanent_history_rejection_is_not_retried__(monkeypatch):
     )
 
     _freeze(monkeypatch, datetime.fromtimestamp(last_ts + 122, timezone.utc))
-    asyncio.run(provider.on_reconnect())
+    try:
+        asyncio.run(provider.on_reconnect())
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("permanent history rejection was treated as complete")
 
     history_requests = [
         request
@@ -623,8 +801,41 @@ def __test_connected_gap_partial_history_preserves_original_candidate_order__():
     ]
 
 
-def __test_connected_gap_permanent_rejection_releases_only_the_stream_candidate__():
-    """A permanent history rejection leaves no filler and releases the candidate."""
+def __test_connected_gap_marks_undrainable_capped_history_incomplete__():
+    """A capped page that cannot advance remains explicit failed evidence."""
+    anchor_ts = 1_800_000_000
+    returned_ts = anchor_ts + 120
+    candidate_ts = anchor_ts + 180
+    repeated = _trendbar(returned_ts, 114_020)
+    wire = _HistoryWire(
+        [],
+        history_responses=[[repeated], [repeated]],
+        history_has_more=[True, False],
+    )
+    provider = _provider(wire)
+    provider._live_history_settle_attempts = 1
+    anchor = _closed(anchor_ts)
+    provider._last_live_closed_bar = anchor
+    candidate = _closed(candidate_ts)
+    provider._pending_bars.append(candidate)
+
+    try:
+        asyncio.run(_watch(provider))
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("incomplete connected-gap history was committed")
+
+    assert list(provider._pending_bars) == [candidate]
+    assert provider._last_live_closed_bar is anchor
+    assert provider.connected_gap_events[-1][0] == "failed"
+    assert provider.connected_gap_events[-1][1]["candidate_released"] is False
+    assert provider.connected_gap_events[-1][1]["failure_type"] == "IncompleteHistory"
+    assert provider.connected_gap_events[-1][1]["recovered_timestamps"] == []
+
+
+def __test_connected_gap_permanent_rejection_preserves_candidate_and_anchor__():
+    """A permanent rejection forces reconnect without cursor or queue commit."""
     anchor_ts = 1_800_000_000
     candidate_ts = anchor_ts + 120
     wire = _HistoryWire(
@@ -632,20 +843,26 @@ def __test_connected_gap_permanent_rejection_releases_only_the_stream_candidate_
         history_faults=[CTraderProtocolError("SYMBOL_NOT_FOUND", "no such symbol")],
     )
     provider = _provider(wire)
-    provider._last_live_closed_bar = _closed(anchor_ts)
+    anchor = _closed(anchor_ts)
+    provider._last_live_closed_bar = anchor
     candidate = _closed(candidate_ts)
     provider._pending_bars.append(candidate)
 
-    delivered = asyncio.run(_watch(provider))
+    try:
+        asyncio.run(_watch(provider))
+    except CTraderConnectionError:
+        pass
+    else:
+        raise AssertionError("permanently rejected history released its candidate")
 
-    assert delivered is candidate
-    assert provider._last_live_closed_bar is candidate
+    assert list(provider._pending_bars) == [candidate]
+    assert provider._last_live_closed_bar is anchor
     assert [event for event, _payload in provider.connected_gap_events] == [
         "started",
         "failed",
     ]
     failed = provider.connected_gap_events[-1][1]
-    assert failed["candidate_released"] is True
+    assert failed["candidate_released"] is False
     assert failed["recovered_timestamps"] == []
 
 

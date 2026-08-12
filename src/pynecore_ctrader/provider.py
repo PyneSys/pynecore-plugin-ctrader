@@ -100,6 +100,7 @@ class _LiveHistoryCollection:
     bars: tuple[OHLCV, ...]
     failure: CTraderWireError | None
     response_received_monotonic_ns: int
+    complete: bool
 
 
 class _ProviderMixin(_CTraderBase):
@@ -840,7 +841,7 @@ class _ProviderMixin(_CTraderBase):
         cursor = anchor_timestamp + (_MIN_MONTH_MS if calendar_period else period_ms)
         response_received_ns = monotonic_time.monotonic_ns()
         if cursor >= query_ceiling:
-            return _LiveHistoryCollection((), None, response_received_ns)
+            return _LiveHistoryCollection((), None, response_received_ns, True)
 
         try:
             symbol_id = await self._resolve_symbol_id(wire, account_id)
@@ -848,13 +849,14 @@ class _ProviderMixin(_CTraderBase):
             raise
         except CTraderWireError as exc:
             return _LiveHistoryCollection(
-                (), exc, monotonic_time.monotonic_ns()
+                (), exc, monotonic_time.monotonic_ns(), False
             )
 
         recovered_by_timestamp: dict[int, OHLCV] = {}
         window_ms = period_ms * 2000
         newest_expected = None if calendar_period else query_ceiling - period_ms
         failure: CTraderWireError | None = None
+        coverage_complete = False
 
         def settled() -> bool:
             """Whether the newest already-closed bar has been recovered."""
@@ -867,35 +869,39 @@ class _ProviderMixin(_CTraderBase):
 
         for attempt in range(self._live_history_settle_attempts):
             query_cursor = cursor
+            attempt_complete = True
             try:
                 while query_cursor < query_ceiling:
                     window_end = min(query_cursor + window_ms, query_ceiling)
-                    response = cast(_oa.ProtoOAGetTrendbarsRes, await wire.send_request(
-                        _oa.ProtoOAGetTrendbarsReq(
-                            ctidTraderAccountId=account_id,
-                            symbolId=symbol_id,
-                            period=exchange_period,
-                            fromTimestamp=query_cursor,
-                            toTimestamp=window_end,
-                        )
-                    ))
+                    window_bars, window_complete = await self._fetch_trendbar_window(
+                        wire,
+                        account_id,
+                        symbol_id,
+                        exchange_period,
+                        query_cursor,
+                        window_end,
+                    )
                     response_received_ns = monotonic_time.monotonic_ns()
-                    for trendbar in response.trendbar:
-                        timestamp = trendbar.utcTimestampInMinutes * 60_000
+                    attempt_complete = attempt_complete and window_complete
+                    for timestamp, trendbar in window_bars.items():
                         if cursor <= timestamp < window_end:
                             recovered_by_timestamp[timestamp] = self._decode_trendbar(
                                 trendbar
                             )
                     query_cursor = window_end
                 failure = None
+                coverage_complete = attempt_complete
             except CTraderConnectionError:
                 raise
             except CTraderWireError as exc:
                 response_received_ns = monotonic_time.monotonic_ns()
                 failure = exc
+                coverage_complete = False
                 if not self._history_failure_is_transient(exc):
                     break
-            if settled() or attempt + 1 == self._live_history_settle_attempts:
+            if (
+                coverage_complete and settled()
+            ) or attempt + 1 == self._live_history_settle_attempts:
                 break
             await self._wait_live_history_retry(
                 self._live_history_settle_delay_seconds
@@ -906,13 +912,15 @@ class _ProviderMixin(_CTraderBase):
             if query_ceiling < newest + _MAX_MONTH_MS:
                 del recovered_by_timestamp[newest]
 
+        complete = coverage_complete
         return _LiveHistoryCollection(
             tuple(
                 recovered_by_timestamp[timestamp]
                 for timestamp in sorted(recovered_by_timestamp)
             ),
-            failure if not settled() else None,
+            failure if not complete else None,
             response_received_ns,
+            complete,
         )
 
     async def _backfill_live_gap(self, symbol: str, timeframe: str) -> None:
@@ -964,13 +972,18 @@ class _ProviderMixin(_CTraderBase):
             anchor_timestamp=anchor_ts,
             query_ceiling=query_ceiling,
         )
-        if collection.failure is not None:
-            # Degrade rather than halt: the live subscription is already
-            # restored, while downstream continuity checks retain authority over
-            # any slot that history did not return.
+        if not collection.complete:
+            # Preserve the accepted anchor and retry through a fresh connection;
+            # committing any partial page would permanently skip unknown slots.
             logger.warning(
                 'Reconnect backfill incomplete for %s %s (%d bar(s) recovered): %s',
-                symbol, timeframe, len(collection.bars), collection.failure,
+                symbol,
+                timeframe,
+                len(collection.bars),
+                collection.failure or 'history coverage incomplete',
+            )
+            raise CTraderConnectionError(
+                'reconnect history coverage remained incomplete'
             )
         self._pending_bars.extend(collection.bars)
         history_ids = getattr(self, '_live_history_bar_ids', set())
@@ -1089,9 +1102,28 @@ class _ProviderMixin(_CTraderBase):
             for bar in collection.bars
             if anchor_timestamp < int(bar.timestamp) < candidate_timestamp
         )
-        terminal_event = 'failed' if collection.failure is not None else 'completed'
+        if not collection.complete:
+            self._observe_connected_gap_repair(
+                'failed',
+                {
+                    **shared,
+                    'response_received_monotonic_ns': (
+                        collection.response_received_monotonic_ns
+                    ),
+                    'recovered_timestamps': [],
+                    'candidate_released': False,
+                    'failure_type': (
+                        type(collection.failure).__name__
+                        if collection.failure is not None
+                        else 'IncompleteHistory'
+                    ),
+                },
+            )
+            raise CTraderConnectionError(
+                'connected gap history coverage remained incomplete'
+            )
         self._observe_connected_gap_repair(
-            terminal_event,
+            'completed',
             {
                 **shared,
                 'response_received_monotonic_ns': (
@@ -1099,11 +1131,7 @@ class _ProviderMixin(_CTraderBase):
                 ),
                 'recovered_timestamps': [int(bar.timestamp) for bar in recovered],
                 'candidate_released': True,
-                'failure_type': (
-                    type(collection.failure).__name__
-                    if collection.failure is not None
-                    else None
-                ),
+                'failure_type': None,
             },
         )
         for bar in reversed(recovered):
@@ -1137,64 +1165,114 @@ class _ProviderMixin(_CTraderBase):
         spot_events = self._spot_events
         if spot_events is None:
             raise CTraderConnectionError("live event router not started")
+        expected_period = _model.ProtoOATrendbarPeriod.Value(
+            self.to_exchange_timeframe(timeframe)
+        )
 
-        while not self._pending_bars:
-            # The event router (see ``_CTraderBase._event_router_loop``) is the
-            # sole consumer of ``wire.events`` and forwards spot events here, so
-            # ``watch_ohlcv`` and ``watch_orders`` can stream concurrently
-            # without racing on the shared queue.
-            message = await spot_events.get()
-            if not isinstance(message, _oa.ProtoOASpotEvent):
+        bar: OHLCV | None = None
+        while bar is None:
+            while not self._pending_bars:
+                # The event router (see ``_CTraderBase._event_router_loop``) is the
+                # sole consumer of ``wire.events`` and forwards spot events here, so
+                # ``watch_ohlcv`` and ``watch_orders`` can stream concurrently
+                # without racing on the shared queue.
+                message = await spot_events.get()
+                if not isinstance(message, _oa.ProtoOASpotEvent):
+                    continue
+                if message.symbolId != self._watch_symbol_id:
+                    continue
+                # Normalize the repeated trendbar field before mutating live state:
+                # only the subscribed period participates, duplicate openings use
+                # the last payload, and openings are processed chronologically.
+                trendbars_by_timestamp: dict[int, _model.ProtoOATrendbar] = {}
+                for trendbar in message.trendbar:
+                    if trendbar.period != expected_period:
+                        continue
+                    trendbars_by_timestamp[
+                        trendbar.utcTimestampInMinutes * 60_000
+                    ] = trendbar
+                accepted_trendbar = False
+                for timestamp in sorted(trendbars_by_timestamp):
+                    accepted_trendbar = (
+                        self._ingest_live_bar(trendbars_by_timestamp[timestamp])
+                        or accepted_trendbar
+                    )
+                if len(message.trendbar) > 0 and not accepted_trendbar:
+                    # Quotes carried by an all-stale or wrong-period snapshot do
+                    # not belong to the current subscribed bar.
+                    continue
+                if message.bid:
+                    self._last_bid = message.bid / _PRICE_SCALE
+                if message.ask:
+                    self._track_ask(message.ask / _PRICE_SCALE)
+                if accepted_trendbar:
+                    current_bar = self._current_bar
+                    if current_bar is None:
+                        raise CTraderConnectionError(
+                            'accepted live trendbar did not establish current state'
+                        )
+                    self._pending_bars.append(
+                        self._finalize_bar(current_bar, is_closed=False)
+                    )
+
+            candidate = self._pending_bars[0]
+            history_ids = getattr(self, '_live_history_bar_ids', set())
+            self._live_history_bar_ids = history_ids
+            if (
+                candidate.is_closed
+                and id(candidate) not in history_ids
+                and self._last_live_closed_bar is not None
+                and int(candidate.timestamp) <= int(self._last_live_closed_bar.timestamp)
+            ):
+                stale = self._pending_bars.popleft()
+                history_ids.discard(id(stale))
                 continue
-            if message.symbolId != self._watch_symbol_id:
-                continue
-            # Roll the trendbars first (they finalize the prior bar against the
-            # bid/ask seen so far), then fold THIS event's quotes into the new
-            # current bar.
-            for trendbar in message.trendbar:
-                self._ingest_live_bar(trendbar)
-            if message.bid:
-                self._last_bid = message.bid / _PRICE_SCALE
-            if message.ask:
-                self._track_ask(message.ask / _PRICE_SCALE)
+            if (
+                candidate.is_closed
+                and id(candidate) not in history_ids
+                and self._last_live_closed_bar is not None
+                and self.to_exchange_timeframe(timeframe) != 'MN1'
+            ):
+                period_ms = max(1, int(in_seconds(timeframe))) * 1000
+                expected_timestamp = int(self._last_live_closed_bar.timestamp) + period_ms
+                if int(candidate.timestamp) > expected_timestamp:
+                    await self._repair_connected_gap(symbol, timeframe, candidate)
+                    history_ids = self._live_history_bar_ids
 
-        candidate = self._pending_bars[0]
-        history_ids = getattr(self, '_live_history_bar_ids', set())
-        self._live_history_bar_ids = history_ids
-        if (
-            candidate.is_closed
-            and id(candidate) not in history_ids
-            and self._last_live_closed_bar is not None
-            and self.to_exchange_timeframe(timeframe) != 'MN1'
-        ):
-            period_ms = max(1, int(in_seconds(timeframe))) * 1000
-            expected_timestamp = int(self._last_live_closed_bar.timestamp) + period_ms
-            if int(candidate.timestamp) > expected_timestamp:
-                await self._repair_connected_gap(symbol, timeframe, candidate)
-                history_ids = self._live_history_bar_ids
-
-        bar = self._pending_bars.popleft()
-        history_ids.discard(id(bar))
-        self._live_history_bar_ids = history_ids
-        if bar.is_closed:
-            self._last_live_closed_bar = bar
+            delivered = self._pending_bars.popleft()
+            history_ids.discard(id(delivered))
+            self._live_history_bar_ids = history_ids
+            if delivered.is_closed:
+                self._last_live_closed_bar = delivered
+            bar = delivered
         return bar
 
-    def _ingest_live_bar(self, bar: _model.ProtoOATrendbar) -> None:
-        """Fold a live trendbar into the pending-bar buffer.
+    def _ingest_live_bar(self, bar: _model.ProtoOATrendbar) -> bool:
+        """Fold a live trendbar into current state and the closed-bar buffer.
 
         When the bar's timestamp advances past the bar being tracked, the prior
         bar has closed: it is finalized (spot bid close, ask O/H/L/C) and queued,
         then the quote accumulators are reset for the new bar.
+
+        :return: ``True`` when the trendbar advanced live state, otherwise ``False``.
         """
         candle = self._decode_trendbar(bar, is_closed=False)
+        if (
+            self._last_live_closed_bar is not None
+            and candle.timestamp <= self._last_live_closed_bar.timestamp
+        ):
+            return False
+        if self._current_bar_ts is not None and candle.timestamp < self._current_bar_ts:
+            return False
         if self._current_bar_ts is not None and candle.timestamp > self._current_bar_ts:
             if self._current_bar is not None:
-                self._pending_bars.append(self._finalize_bar(self._current_bar, is_closed=True))
+                self._pending_bars.append(
+                    self._finalize_bar(self._current_bar, is_closed=True)
+                )
             self._reset_quotes()
         self._current_bar_ts = candle.timestamp
         self._current_bar = candle
-        self._pending_bars.append(self._finalize_bar(candle, is_closed=False))
+        return True
 
     def _track_ask(self, ask: float) -> None:
         """Fold a spot ``ask`` quote into the current bar's ask O/H/L/C."""
