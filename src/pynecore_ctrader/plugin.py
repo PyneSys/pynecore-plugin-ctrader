@@ -22,6 +22,7 @@ from .state import _StateMixin
 
 if TYPE_CHECKING:
     import typer
+    from pynecore.core.plugin.broker import PositionPort
 
 __all__ = ['CTrader', 'CTraderConfig']
 
@@ -63,3 +64,8 @@ class CTrader(
     def cli() -> "typer.Typer | None":
         from .cli import ctrader_app
         return ctrader_app
+
+
+if TYPE_CHECKING:
+    def _position_port_contract(instance: CTrader) -> PositionPort:
+        return instance

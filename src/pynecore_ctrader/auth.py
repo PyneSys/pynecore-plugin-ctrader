@@ -25,8 +25,8 @@ from typing import cast
 import httpx
 
 from . import helpers
-from .messages import OpenApiMessages_pb2 as _oa
-from .messages import OpenApiModelMessages_pb2 as _model
+from .messages import OpenApiMessages_pb2 as OpenApiMessages
+from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .wire import CTraderProtocolError, CTraderWireError, WireClient
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,7 @@ class CTraderAuthError(CTraderWireError):
 
 
 async def exchange_code(
-    *, client_id: str, client_secret: str, code: str, redirect_uri: str
+        *, client_id: str, client_secret: str, code: str, redirect_uri: str
 ) -> TokenSet:
     """Exchange a browser ``authorization_code`` for a token pair over HTTPS.
 
@@ -133,8 +133,8 @@ async def refresh_via_socket(wire: WireClient, refresh_token: str) -> TokenSet:
     :return: The refreshed token pair (the refresh token may be rotated; the old
         one is kept if the server omits it).
     """
-    response = await wire.send_request(_oa.ProtoOARefreshTokenReq(refreshToken=refresh_token))
-    result = cast(_oa.ProtoOARefreshTokenRes, response)
+    response = await wire.send_request(OpenApiMessages.ProtoOARefreshTokenReq(refreshToken=refresh_token))
+    result = cast(OpenApiMessages.ProtoOARefreshTokenRes, response)
     return TokenSet(
         access_token=result.accessToken,
         refresh_token=result.refreshToken or refresh_token,
@@ -144,8 +144,8 @@ async def refresh_via_socket(wire: WireClient, refresh_token: str) -> TokenSet:
 
 
 async def get_accounts(
-    wire: WireClient, access_token: str
-) -> list[_model.ProtoOACtidTraderAccount]:
+        wire: WireClient, access_token: str
+) -> list[OpenApiModelMessages.ProtoOACtidTraderAccount]:
     """List the trading accounts the access token grants.
 
     :param wire: A connected, application-authenticated client.
@@ -154,19 +154,19 @@ async def get_accounts(
         ``isLive`` flag.
     """
     response = await wire.send_request(
-        _oa.ProtoOAGetAccountListByAccessTokenReq(accessToken=access_token)
+        OpenApiMessages.ProtoOAGetAccountListByAccessTokenReq(accessToken=access_token)
     )
-    result = cast(_oa.ProtoOAGetAccountListByAccessTokenRes, response)
+    result = cast(OpenApiMessages.ProtoOAGetAccountListByAccessTokenRes, response)
     return list(result.ctidTraderAccount)
 
 
 async def authenticate(
-    wire: WireClient,
-    *,
-    client_id: str,
-    client_secret: str,
-    tokens: TokenSet,
-    account_id: int | None,
+        wire: WireClient,
+        *,
+        client_id: str,
+        client_secret: str,
+        tokens: TokenSet,
+        account_id: int | None,
 ) -> AuthResult:
     """Run the full socket authentication handshake.
 
@@ -195,7 +195,7 @@ async def authenticate(
         or more than one with no ``account_id`` set).
     """
     await wire.send_request(
-        _oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret)
+        OpenApiMessages.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret)
     )
 
     async def _token_phase(token_set: TokenSet) -> int:
@@ -203,7 +203,7 @@ async def authenticate(
         if resolved is None:
             resolved = _select_sole_account(await get_accounts(wire, token_set.access_token))
         await wire.send_request(
-            _oa.ProtoOAAccountAuthReq(
+            OpenApiMessages.ProtoOAAccountAuthReq(
                 ctidTraderAccountId=resolved, accessToken=token_set.access_token
             )
         )
@@ -220,7 +220,7 @@ async def authenticate(
     return AuthResult(account_id=resolved_id, tokens=tokens)
 
 
-def _select_sole_account(accounts: list[_model.ProtoOACtidTraderAccount]) -> int:
+def _select_sole_account(accounts: list[OpenApiModelMessages.ProtoOACtidTraderAccount]) -> int:
     """Pick the only trading account, or fail if the choice is not unambiguous.
 
     :param accounts: The accounts the access token grants.

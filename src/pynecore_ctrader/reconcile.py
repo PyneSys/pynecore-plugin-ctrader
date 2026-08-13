@@ -34,6 +34,7 @@ wire-send and its post-ack persist leaves no local row at all — that zero-row
 recovery is the M3 startup-recovery's job, not this loop's.
 """
 import logging
+from abc import ABC
 from dataclasses import dataclass
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator, cast
@@ -57,9 +58,9 @@ from pynecore.core.broker.models import (
 )
 
 from ._base import _CTraderBase
-from .helpers import money_value, volume_to_units
-from .messages import OpenApiMessages_pb2 as _oa
-from .messages import OpenApiModelMessages_pb2 as _model
+from .helpers import money_value, parse_protocol_id, volume_to_units
+from .messages import OpenApiMessages_pb2 as OpenApiMessages
+from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -124,7 +125,7 @@ class _DealBridgeResult:
         them must seed the de-dup channel too, or a late PUSH replay of the
         closing execution would re-book against the retired position.
     """
-    deal: '_model.ProtoOADeal | None'
+    deal: 'OpenApiModelMessages.ProtoOADeal | None'
     filled_cents: int
     avg_price: float | None
     fee: float
@@ -134,7 +135,7 @@ class _DealBridgeResult:
     closing_deal_ids: tuple[int, ...] = ()
 
 
-class _ReconcileMixin(_CTraderBase):
+class _ReconcileMixin(_CTraderBase, ABC):
     """Periodic reconcile-snapshot diff: gap-fills events the PUSH path missed."""
 
     async def _reconcile_snapshot(self) -> AsyncIterator[OrderEvent]:
@@ -168,7 +169,7 @@ class _ReconcileMixin(_CTraderBase):
         orders_by_id = {o.orderId: o for o in res.order}
         open_positions = {
             p.positionId: p for p in res.position
-            if p.positionStatus == _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+            if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
         }
         # In ``returnProtectionOrders=True`` mode the broker carries each
         # position's live SL/TP NOT on ``position.stopLoss`` / ``takeProfit`` but
@@ -177,14 +178,18 @@ class _ReconcileMixin(_CTraderBase):
         # contract). The fail-safe observe feed must read its levels from there.
         protection_by_position = {
             o.positionId: o for o in res.order
-            if o.orderType == _model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT
-            and o.positionId
+            if o.orderType == OpenApiModelMessages.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT
+               and o.positionId
         }
         now_ts = epoch_time()
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
-            order_id_str = extras.get('order_id')
-            order = orders_by_id.get(int(order_id_str)) if order_id_str else None
+            order_id_raw = extras.get('order_id')
+            order_id = (
+                parse_protocol_id(order_id_raw, field='order_id')
+                if order_id_raw is not None else None
+            )
+            order = orders_by_id.get(order_id) if order_id is not None else None
             if order is not None:
                 # The order is still in ``order[]`` — reconcile partial-fill
                 # progress from ``executedVolume``. A partial that already linked
@@ -203,7 +208,7 @@ class _ReconcileMixin(_CTraderBase):
                 # tracker's concern — ``tracked_refs`` maps it to the
                 # ``positions`` namespace for the presence feed below.
                 continue
-            if not order_id_str:
+            if order_id is None:
                 continue
             # The working order is gone from ``order[]`` — it either fully filled
             # (and left for ``position[]``) or was cancelled / expired. The
@@ -213,7 +218,7 @@ class _ReconcileMixin(_CTraderBase):
             # remaining quantity may have filled while the stream was down, so it
             # must be recovered through the same bridge — never treated as settled.
             async for event in self._recover_vanished_working_row(
-                    row, int(order_id_str), open_positions, now_ts):
+                    row, order_id, open_positions, now_ts):
                 yield event
         # Presence diff for the settled-position rows: stamp when the position
         # vanished from ``position[]``, clear the moment it is back. Runs AFTER
@@ -228,8 +233,8 @@ class _ReconcileMixin(_CTraderBase):
         self._feed_native_failsafe_observations(open_positions, protection_by_position)
 
     def _feed_native_failsafe_observations(
-            self, open_positions: 'dict[int, _model.ProtoOAPosition]',
-            protection_by_position: 'dict[int, _model.ProtoOAOrder]',
+            self, open_positions: 'dict[int, OpenApiModelMessages.ProtoOAPosition]',
+            protection_by_position: 'dict[int, OpenApiModelMessages.ProtoOAOrder]',
     ) -> None:
         """Feed the fail-safe observe sink for every live entry whose position
         is open — the M3 reconcile-based ``DEGRADING -> HEALTHY`` recovery.
@@ -246,17 +251,17 @@ class _ReconcileMixin(_CTraderBase):
         if self.store_ctx is None or self.native_failsafe_observed_sink is None:
             return
         for row in list(self.store_ctx.iter_live_orders()):
-            position_id = (row.extras or {}).get('position_id')
-            if not position_id:
+            position_id_raw = (row.extras or {}).get('position_id')
+            if position_id_raw is None:
                 continue
-            pid = int(position_id)
+            pid = parse_protocol_id(position_id_raw, field='position_id')
             if pid not in open_positions:
                 continue
             self._feed_native_failsafe_observed(
                 row.client_order_id, protection_by_position.get(pid))
 
     def _feed_native_failsafe_observed(
-            self, parent_ref: str, protection: '_model.ProtoOAOrder | None',
+            self, parent_ref: str, protection: 'OpenApiModelMessages.ProtoOAOrder | None',
     ) -> None:
         """Forward one live position's broker-observed bracket to the engine's
         §2.6.7 fail-safe recovery feed via the thread-safe observed sink.
@@ -384,23 +389,33 @@ class _ReconcileMixin(_CTraderBase):
           and applies the ``on_unexpected_cancel`` policy.
         """
         extras = row.extras or {}
-        order_id_str = extras.get('order_id')
-        position_id = extras.get('position_id')
-        if order_id_str:
+        order_id_raw = extras.get('order_id')
+        position_id_raw = extras.get('position_id')
+        position_id = (
+            parse_protocol_id(position_id_raw, field='position_id')
+            if position_id_raw is not None else None
+        )
+        if order_id_raw is not None:
+            order_id = parse_protocol_id(order_id_raw, field='order_id')
             anchor = extras.get('submitted_at_ms')
-            if anchor:
-                from_ms = int(anchor) - _SINCE_ANCHOR_SKEW_MS
+            if anchor is not None:
+                from_ms = (
+                    parse_protocol_id(anchor, field='submitted_at_ms')
+                    - _SINCE_ANCHOR_SKEW_MS
+                )
             else:
                 from_ms = int(epoch_time() * 1000) - int(_DEAL_LOOKBACK_S * 1000)
             bridge = await self._find_fill_deal(
-                int(order_id_str), from_ms,
-                close_position_id=int(position_id) if position_id else None)
+                order_id, from_ms, close_position_id=position_id,
+            )
             if not bridge.conclusive:
                 return MissingConfirmation(MissingResolution.INCONCLUSIVE)
             if bridge.closed_cents > 0 and (bridge.filled_cents > 0
                                             or position_id is not None):
-                close_pid = (bridge.deal.positionId if bridge.deal is not None
-                             else int(position_id))
+                close_pid = (
+                    bridge.deal.positionId if bridge.deal is not None else position_id
+                )
+                assert close_pid is not None
                 # Register the entry fills AND the closing deals: the
                 # closure is concluded from the closing evidence, whose
                 # deals usually belong to a DIFFERENT order (native TP/SL,
@@ -435,8 +450,8 @@ class _ReconcileMixin(_CTraderBase):
             r.client_order_id
             for r in self.store_ctx.iter_live_orders()
             if r.client_order_id != row.client_order_id
-            and (str((r.extras or {}).get('position_id') or '') == pid_ref
-                 or r.exchange_order_id == pid_ref)
+               and (str((r.extras or {}).get('position_id') or '') == pid_ref
+                    or r.exchange_order_id == pid_ref)
         ]
 
     def _register_recovered_deals(
@@ -470,7 +485,7 @@ class _ReconcileMixin(_CTraderBase):
         filled = volume_to_units(order.executedVolume)
         if filled <= row.filled_qty + 1e-9 or filled >= row.qty:
             return None
-        position_id = order.positionId or None
+        position_id: int | None = order.positionId or None
         patch: dict = {}
         if position_id and extras.get('position_id') is None:
             patch['position_id'] = position_id
@@ -487,7 +502,7 @@ class _ReconcileMixin(_CTraderBase):
                 exchange_order_id=str(order.orderId),
             ),
         )
-        if position_id:
+        if position_id is not None:
             self._link_position_ref(row.client_order_id, position_id)
         avg = (open_positions[position_id].price
                if position_id in open_positions else order.executionPrice)
@@ -517,8 +532,11 @@ class _ReconcileMixin(_CTraderBase):
             return
         extras = row.extras or {}
         anchor = extras.get('submitted_at_ms')
-        if anchor:
-            from_ms = int(anchor) - _SINCE_ANCHOR_SKEW_MS
+        if anchor is not None:
+            from_ms = (
+                parse_protocol_id(anchor, field='submitted_at_ms')
+                - _SINCE_ANCHOR_SKEW_MS
+            )
         else:
             # Zero-anchor fallback (the crash-before-persist row the M3 startup
             # recovery owns): a wide fixed window, never the runtime path.
@@ -561,7 +579,7 @@ class _ReconcileMixin(_CTraderBase):
         deal = bridge.deal
         if self.store_ctx is None or deal is None:
             return None
-        position_id = deal.positionId or None
+        position_id: int | None = deal.positionId or None
         position_open = bool(position_id) and position_id in open_positions
         # Closure classification. A vanished order whose ``positionId`` is no
         # longer open filled then closed during the stream gap. With positive
@@ -630,6 +648,7 @@ class _ReconcileMixin(_CTraderBase):
                 ),
             )
             if link_position:
+                assert position_id is not None
                 self._link_position_ref(row.client_order_id, position_id)
         if not new_deal_ids:
             # Every recovered deal was already applied by the PUSH path — the
@@ -695,8 +714,8 @@ class _ReconcileMixin(_CTraderBase):
             r.client_order_id
             for r in self.store_ctx.iter_live_orders()
             if r.client_order_id != row.client_order_id
-            and ((r.extras or {}).get('position_id') == position_id
-                 or r.exchange_order_id == pid_str)
+               and ((r.extras or {}).get('position_id') == position_id
+                    or r.exchange_order_id == pid_str)
         ]
         DispatchJournal(self.store_ctx).apply_reconcile_outcome(
             row.client_order_id,
@@ -750,7 +769,7 @@ class _ReconcileMixin(_CTraderBase):
         if wire is None or self._live_account_id is None:
             return _DealBridgeResult(None, 0, None, 0.0, False)
         to_ms = int(epoch_time() * 1000)
-        latest_deal: '_model.ProtoOADeal | None' = None
+        latest_deal: 'OpenApiModelMessages.ProtoOADeal | None' = None
         filled_cents = 0
         weighted_price = 0.0
         fee = 0.0
@@ -760,8 +779,8 @@ class _ReconcileMixin(_CTraderBase):
         closing_ids_by_position: dict[int, list[int]] = {}
         try:
             while True:
-                res = cast(_oa.ProtoOADealListRes, await wire.send_request(
-                    _oa.ProtoOADealListReq(
+                res = cast(OpenApiMessages.ProtoOADealListRes, await wire.send_request(
+                    OpenApiMessages.ProtoOADealListReq(
                         ctidTraderAccountId=self._live_account_id,
                         fromTimestamp=from_ms, toTimestamp=to_ms,
                         maxRows=_DEAL_PAGE_MAX_ROWS,
@@ -770,8 +789,8 @@ class _ReconcileMixin(_CTraderBase):
                 for deal in res.deal:
                     if deal.HasField('closePositionDetail'):
                         closed_by_position[deal.positionId] = (
-                            closed_by_position.get(deal.positionId, 0)
-                            + deal.closePositionDetail.closedVolume)
+                                closed_by_position.get(deal.positionId, 0)
+                                + deal.closePositionDetail.closedVolume)
                         # Only a deal that actually closed volume is closure
                         # EVIDENCE — a zero-volume detail must not enter the
                         # dedup channel or the forensic audit.
@@ -779,7 +798,7 @@ class _ReconcileMixin(_CTraderBase):
                             closing_ids_by_position.setdefault(
                                 deal.positionId, []).append(deal.dealId)
                     if (deal.orderId == order_id
-                            and deal.dealStatus == _model.ProtoOADealStatus.FILLED):
+                            and deal.dealStatus == OpenApiModelMessages.ProtoOADealStatus.FILLED):
                         filled_cents += deal.filledVolume
                         weighted_price += deal.executionPrice * deal.filledVolume
                         fee += money_value(deal.commission, deal.moneyDigits)
@@ -795,7 +814,7 @@ class _ReconcileMixin(_CTraderBase):
                 if oldest <= from_ms:
                     break
                 to_ms = oldest - 1
-        except Exception as exc:  # noqa: BLE001 - read-completeness signal, not a handler
+        except Exception as exc:  # noqa: BLE001 - read failure is inconclusive evidence
             logger.warning(
                 "cTrader deal-history bridge for order %d failed: %s", order_id, exc,
             )
@@ -851,7 +870,8 @@ class _ReconcileMixin(_CTraderBase):
                 {'positions': None}, epoch_time()):
             yield event
 
-    def _cancelled_event(self, row, now_ts: float) -> OrderEvent:
+    @staticmethod
+    def _cancelled_event(row, now_ts: float) -> OrderEvent:
         """Build the synthetic cancelled event for a vanished bot-owned row.
 
         Carries the row's Pine identity (``pine_entry_id`` / ``LegType.ENTRY``)
@@ -894,9 +914,12 @@ class _ReconcileMixin(_CTraderBase):
             if other.client_order_id == row.client_order_id:
                 continue
             other_extras = other.extras or {}
-            other_order_id: str | None = other_extras.get('order_id')
-            if not other_order_id:
+            other_order_id_raw = other_extras.get('order_id')
+            if other_order_id_raw is None:
                 continue
+            other_order_id = parse_protocol_id(
+                other_order_id_raw, field='order_id',
+            )
             # A filled row keeps its original ``order_id`` even after the order
             # left ``order[]`` for ``position[]`` (the fill / promotion paths
             # never strip it), so ``order_id`` alone does NOT prove the row is
@@ -913,9 +936,9 @@ class _ReconcileMixin(_CTraderBase):
                 continue
             try:
                 event = await self._dispatch_order(
-                    _oa.ProtoOACancelOrderReq(
+                    OpenApiMessages.ProtoOACancelOrderReq(
                         ctidTraderAccountId=self._live_account_id,
-                        orderId=int(other_order_id),
+                        orderId=other_order_id,
                     ),
                     coid=other.client_order_id, context="cancel",
                 )
@@ -944,7 +967,7 @@ class _ReconcileMixin(_CTraderBase):
                 # ``ORDER_CANCELLED`` retires the row; everything else keeps it so
                 # a surfaced fill can still book against it.
                 if (event.executionType
-                        != _model.ProtoOAExecutionType.ORDER_CANCELLED):
+                        != OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED):
                     continue
             cascade.apply_reconcile_outcome(
                 other.client_order_id,
@@ -959,8 +982,9 @@ class _ReconcileMixin(_CTraderBase):
                 ),
             )
 
+    @staticmethod
     def _fill_event(
-            self, row, *, event_type: str, status: OrderStatus, exchange_id: str,
+            row, *, event_type: str, status: OrderStatus, exchange_id: str,
             cumulative: float, fill_qty: float, avg_price: float | None,
             fill_price: float | None, fee: float, timestamp: float,
     ) -> OrderEvent:

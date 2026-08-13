@@ -72,7 +72,9 @@ class _FakeBroker(CTrader):
     async def _get_symbol_rules(self, symbol: str) -> _SymbolRules:
         return _RULES
 
-    async def _dispatch_order(self, req, *, coid, context):
+    async def _dispatch_order(
+            self, req, *, coid, context, predecessor_cancel_ids=None,
+    ):
         self.sent.append(req)
         self.coid_at_dispatch = coid
         if self.store_ctx is not None:

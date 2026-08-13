@@ -48,6 +48,7 @@ Resolution rules:
   double-applied after the event stream opens.
 """
 import logging
+from abc import ABC
 from dataclasses import dataclass
 from time import time as epoch_time
 from typing import cast
@@ -55,9 +56,9 @@ from typing import cast
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.store_helpers import find_pending_dispatch
 
-from .helpers import volume_to_units
-from .messages import OpenApiMessages_pb2 as _oa
-from .messages import OpenApiModelMessages_pb2 as _model
+from .helpers import parse_protocol_id, volume_to_units
+from .messages import OpenApiMessages_pb2 as OpenApiMessages
+from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .reconcile import _SINCE_ANCHOR_SKEW_MS, _ReconcileMixin
 
 logger = logging.getLogger(__name__)
@@ -82,18 +83,18 @@ class _OrderLookupResult:
         a transport error — a not-found result is then deterministic absence,
         never an inference from a truncated read.
     """
-    order: '_model.ProtoOAOrder | None'
+    order: 'OpenApiModelMessages.ProtoOAOrder | None'
     conclusive: bool
 
 
 _TERMINAL_ORDER_STATUSES = frozenset({
-    _model.ProtoOAOrderStatus.ORDER_STATUS_REJECTED,
-    _model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED,
-    _model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED,
+    OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_REJECTED,
+    OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED,
+    OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED,
 })
 
 
-class _RecoveryMixin(_ReconcileMixin):
+class _RecoveryMixin(_ReconcileMixin, ABC):
     """Persist-first crash recovery + startup-orphan retirement (architecture B)."""
 
     async def _recover_in_flight_submissions(self) -> None:
@@ -114,7 +115,7 @@ class _RecoveryMixin(_ReconcileMixin):
         orders_by_coid = {o.clientOrderId: o for o in res.order if o.clientOrderId}
         open_positions = {
             p.positionId: p for p in res.position
-            if p.positionStatus == _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+            if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
         }
         promoted_coids: set[str] = set()
         for row in pending:
@@ -123,8 +124,8 @@ class _RecoveryMixin(_ReconcileMixin):
         self._retire_startup_orphans(res, promoted_coids)
 
     async def _recover_one_pending_row(
-            self, row, orders_by_coid: 'dict[str, _model.ProtoOAOrder]',
-            open_positions: 'dict[int, _model.ProtoOAPosition]',
+            self, row, orders_by_coid: 'dict[str, OpenApiModelMessages.ProtoOAOrder]',
+            open_positions: 'dict[int, OpenApiModelMessages.ProtoOAPosition]',
     ) -> bool:
         """Resolve one pending row from the two authoritative sources.
 
@@ -200,7 +201,7 @@ class _RecoveryMixin(_ReconcileMixin):
         return False
 
     async def _resolve_recovered_order(
-            self, row, order, open_positions: 'dict[int, _model.ProtoOAPosition]',
+            self, row, order, open_positions: 'dict[int, OpenApiModelMessages.ProtoOAPosition]',
             from_ms: int,
     ) -> bool:
         """Classify a recovered order's disposition from order + deal history."""
@@ -465,9 +466,11 @@ class _RecoveryMixin(_ReconcileMixin):
         terminal event can never sit before the window.
         """
         candidates = [row.created_ts_ms]
-        submitted_at_ms: int | None = (row.extras or {}).get('submitted_at_ms')
+        submitted_at_ms = (row.extras or {}).get('submitted_at_ms')
         if submitted_at_ms is not None:
-            candidates.append(int(submitted_at_ms))
+            candidates.append(parse_protocol_id(
+                submitted_at_ms, field='submitted_at_ms',
+            ))
         return min(candidates) - _SINCE_ANCHOR_SKEW_MS
 
     async def _find_order_by_coid(
@@ -488,8 +491,8 @@ class _RecoveryMixin(_ReconcileMixin):
         to_ms = int(epoch_time() * 1000)
         try:
             while True:
-                res = cast(_oa.ProtoOAOrderListRes, await wire.send_request(
-                    _oa.ProtoOAOrderListReq(
+                res = cast(OpenApiMessages.ProtoOAOrderListRes, await wire.send_request(
+                    OpenApiMessages.ProtoOAOrderListReq(
                         ctidTraderAccountId=self._live_account_id,
                         fromTimestamp=from_ms, toTimestamp=to_ms,
                     )
@@ -504,14 +507,14 @@ class _RecoveryMixin(_ReconcileMixin):
                 if not oldest or oldest <= from_ms:
                     break
                 to_ms = oldest - 1
-        except Exception as exc:  # noqa: BLE001 - read-completeness signal, not a handler
+        except Exception as exc:  # noqa: BLE001 - read failure is inconclusive evidence
             logger.warning(
                 "cTrader order-history recovery for coid %s failed: %s", coid, exc)
             return _OrderLookupResult(None, False)
         return _OrderLookupResult(None, True)
 
     def _retire_startup_orphans(
-            self, res: '_oa.ProtoOAReconcileRes', promoted_coids: set[str],
+            self, res: 'OpenApiMessages.ProtoOAReconcileRes', promoted_coids: set[str],
     ) -> None:
         """Retire live rows whose broker counterpart is gone (single pass).
 
@@ -543,9 +546,9 @@ class _RecoveryMixin(_ReconcileMixin):
             position_id = extras.get('position_id')
             ref = row.exchange_order_id
             present = (
-                (ref is not None and (ref in live_order_ids or ref in live_position_ids))
-                or (order_id is not None and str(order_id) in live_order_ids)
-                or (position_id is not None and str(position_id) in live_position_ids)
+                    (ref is not None and (ref in live_order_ids or ref in live_position_ids))
+                    or (order_id is not None and str(order_id) in live_order_ids)
+                    or (position_id is not None and str(position_id) in live_position_ids)
             )
             if present:
                 continue

@@ -20,6 +20,7 @@ are M3 — the ``store_ctx`` writes here are a best-effort audit + ref-mapping
 trail, guarded so the plugin still runs without persistence (test paths).
 """
 import asyncio
+from abc import ABC
 from collections.abc import Callable
 from time import time as epoch_time
 from typing import TYPE_CHECKING, cast
@@ -71,9 +72,15 @@ from .exceptions import (
     map_error_code,
     map_protocol_error,
 )
-from .helpers import quantize_volume, raw_volume, round_price, volume_to_units
-from .messages import OpenApiMessages_pb2 as _oa
-from .messages import OpenApiModelMessages_pb2 as _model
+from .helpers import (
+    parse_protocol_id,
+    quantize_volume,
+    raw_volume,
+    round_price,
+    volume_to_units,
+)
+from .messages import OpenApiMessages_pb2 as OpenApiMessages
+from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .models import _SymbolRules
 from .wire import (
     CTraderConnectionError,
@@ -86,12 +93,12 @@ if TYPE_CHECKING:
     from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
 
 _SIDE_TO_TRADE_SIDE = {
-    'buy': _model.ProtoOATradeSide.BUY,
-    'sell': _model.ProtoOATradeSide.SELL,
+    'buy': OpenApiModelMessages.ProtoOATradeSide.BUY,
+    'sell': OpenApiModelMessages.ProtoOATradeSide.SELL,
 }
 
 
-class _ExecutionMixin(_CTraderBase):
+class _ExecutionMixin(_CTraderBase, ABC):
     """Order execution mix-in: every ``execute_*`` and ``modify_*`` path."""
 
     # --- order-sizing rules + position discovery --------------------------
@@ -110,12 +117,14 @@ class _ExecutionMixin(_CTraderBase):
         if wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
         if symbol not in self._symbols_by_name:
-            await self._fetch_light_symbols(wire, self._live_account_id, recover=True)
+            await self._fetch_light_symbols(
+                wire, self._live_account_id, recover=True,
+            )
         symbol_id = self._symbols_by_name.get(symbol)
         if symbol_id is None:
             raise ExchangeOrderRejectedError(f"cTrader: unknown symbol {symbol!r}")
-        detail_res = cast(_oa.ProtoOASymbolByIdRes, await self._account_request(
-            _oa.ProtoOASymbolByIdReq(
+        detail_res = cast(OpenApiMessages.ProtoOASymbolByIdRes, await self._account_request(
+            OpenApiMessages.ProtoOASymbolByIdReq(
                 ctidTraderAccountId=self._live_account_id, symbolId=[symbol_id],
             )
         ))
@@ -155,7 +164,7 @@ class _ExecutionMixin(_CTraderBase):
         # no entry row). Cross-run leg selection is a HEDGING concern and lives
         # in the emulator's ``fetch_raw_positions`` (owned-scoped there).
         for position in res.position:
-            if position.positionStatus != _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+            if position.positionStatus != OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue
             if position.tradeData.symbolId != want_id:
                 continue
@@ -175,8 +184,8 @@ class _ExecutionMixin(_CTraderBase):
             if row.pine_entry_id != pine_id:
                 continue
             order_id = (row.extras or {}).get('order_id')
-            if order_id:
-                return int(order_id)
+            if order_id is not None:
+                return parse_protocol_id(order_id, field='order_id')
         return None
 
     # --- dispatch helper --------------------------------------------------
@@ -184,7 +193,7 @@ class _ExecutionMixin(_CTraderBase):
     async def _dispatch_order(
             self, req, *, coid: str, context: str,
             predecessor_cancel_ids: tuple[str, ...] | None = None,
-    ) -> _oa.ProtoOAExecutionEvent:
+    ) -> OpenApiMessages.ProtoOAExecutionEvent:
         """Send an order request and return its acknowledging execution event.
 
         Translates the wire failure modes into the broker taxonomy: a protocol
@@ -230,7 +239,7 @@ class _ExecutionMixin(_CTraderBase):
             mapped = map_protocol_error(exc)
             if isinstance(mapped, ExchangeRateLimitError):
                 self._order_rate_limit_until = (
-                    asyncio.get_running_loop().time() + max(0.0, mapped.retry_after)
+                        asyncio.get_running_loop().time() + max(0.0, mapped.retry_after)
                 )
                 raise ExchangeConnectionError(str(mapped)) from exc
             raise mapped from exc
@@ -253,7 +262,7 @@ class _ExecutionMixin(_CTraderBase):
         except CTraderConnectionError as exc:
             raise ExchangeConnectionError(str(exc) or "connection lost") from exc
 
-        if isinstance(message, _oa.ProtoOAOrderErrorEvent):
+        if isinstance(message, OpenApiMessages.ProtoOAOrderErrorEvent):
             # Chain the raw code as a ``CTraderProtocolError`` cause so the
             # cancel paths can still recognise a not-found race
             # (``ORDER_NOT_FOUND`` / ``POSITION_NOT_FOUND``) when the server
@@ -262,19 +271,19 @@ class _ExecutionMixin(_CTraderBase):
             mapped = map_error_code(message.errorCode, message.description)
             if isinstance(mapped, ExchangeRateLimitError):
                 self._order_rate_limit_until = (
-                    asyncio.get_running_loop().time() + max(0.0, mapped.retry_after)
+                        asyncio.get_running_loop().time() + max(0.0, mapped.retry_after)
                 )
                 raise ExchangeConnectionError(str(mapped)) from cause
             raise mapped from cause
-        if isinstance(message, _oa.ProtoOAExecutionEvent):
-            if (message.executionType == _model.ProtoOAExecutionType.ORDER_REJECTED
+        if isinstance(message, OpenApiMessages.ProtoOAExecutionEvent):
+            if (message.executionType == OpenApiModelMessages.ProtoOAExecutionType.ORDER_REJECTED
                     or message.errorCode):
                 cause = CTraderProtocolError(message.errorCode, "")
                 mapped = map_error_code(message.errorCode, "")
                 if isinstance(mapped, ExchangeRateLimitError):
                     self._order_rate_limit_until = (
-                        asyncio.get_running_loop().time()
-                        + max(0.0, mapped.retry_after)
+                            asyncio.get_running_loop().time()
+                            + max(0.0, mapped.retry_after)
                     )
                     raise ExchangeConnectionError(str(mapped)) from cause
                 raise mapped from cause
@@ -284,7 +293,7 @@ class _ExecutionMixin(_CTraderBase):
             f"cTrader {context}: unexpected response {type(message).__name__}"
         )
 
-    def _surface_correlated_fill(self, message: _oa.ProtoOAExecutionEvent) -> None:
+    def _surface_correlated_fill(self, message: OpenApiMessages.ProtoOAExecutionEvent) -> None:
         """Re-inject a correlated fill onto the order-event stream.
 
         ``send_request`` consumes the correlated ``ProtoOAExecutionEvent`` off
@@ -303,12 +312,12 @@ class _ExecutionMixin(_CTraderBase):
         if execq is None:
             return
         if message.executionType in (
-                _model.ProtoOAExecutionType.ORDER_FILLED,
-                _model.ProtoOAExecutionType.ORDER_PARTIAL_FILL):
+                OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED,
+                OpenApiModelMessages.ProtoOAExecutionType.ORDER_PARTIAL_FILL):
             execq.put_nowait(message)
 
     def _surface_correlated_cancel(
-            self, message: _oa.ProtoOAExecutionEvent,
+            self, message: OpenApiMessages.ProtoOAExecutionEvent,
     ) -> None:
         """Re-inject a correlated ``ORDER_CANCELLED`` onto the order-event stream.
 
@@ -358,8 +367,9 @@ class _ExecutionMixin(_CTraderBase):
         rules = await self._get_symbol_rules(intent.symbol)
         return await self._place_entry_order(envelope, intent, rules, intent.qty)
 
+    @staticmethod
     def _reject_out_of_range_entry(
-            self, intent: EntryIntent, rules: _SymbolRules, qty: float,
+            intent: EntryIntent, rules: _SymbolRules, qty: float,
     ) -> None:
         """Skip the entry when ``qty`` falls outside cTrader's volume bounds.
 
@@ -378,7 +388,7 @@ class _ExecutionMixin(_CTraderBase):
                 intent_key=intent.intent_key, reason="below_min_volume",
                 context={'symbol': intent.symbol, 'qty': qty, 'min_qty': min_units},
             )
-        if rules.max_volume > 0 and requested > rules.max_volume:
+        if 0 < rules.max_volume < requested:
             max_units = volume_to_units(rules.max_volume)
             raise OrderSkippedByPlugin(
                 f"Skipping {intent.symbol} {intent.side.upper()} entry "
@@ -403,7 +413,7 @@ class _ExecutionMixin(_CTraderBase):
                       if intent.order_type == OrderType.MARKET
                       else ENTRY_KIND_WORKING)
 
-        req = _oa.ProtoOANewOrderReq(
+        req = OpenApiMessages.ProtoOANewOrderReq(
             ctidTraderAccountId=self._live_account_id,
             symbolId=rules.symbol_id,
             tradeSide=_SIDE_TO_TRADE_SIDE[intent.side],
@@ -414,23 +424,23 @@ class _ExecutionMixin(_CTraderBase):
         if intent.comment:
             req.comment = intent.comment
         if intent.order_type == OrderType.MARKET:
-            req.orderType = _model.ProtoOAOrderType.MARKET
+            req.orderType = OpenApiModelMessages.ProtoOAOrderType.MARKET
         elif intent.order_type == OrderType.LIMIT:
             if intent.limit is None:
                 raise ExchangeOrderRejectedError(
                     f"cTrader LIMIT entry needs a limit price (id={intent.pine_id!r})"
                 )
-            req.orderType = _model.ProtoOAOrderType.LIMIT
+            req.orderType = OpenApiModelMessages.ProtoOAOrderType.LIMIT
             req.limitPrice = round_price(intent.limit, rules.digits)
-            req.timeInForce = _model.ProtoOATimeInForce.GOOD_TILL_CANCEL
+            req.timeInForce = OpenApiModelMessages.ProtoOATimeInForce.GOOD_TILL_CANCEL
         else:  # STOP
             if intent.stop is None:
                 raise ExchangeOrderRejectedError(
                     f"cTrader STOP entry needs a stop price (id={intent.pine_id!r})"
                 )
-            req.orderType = _model.ProtoOAOrderType.STOP
+            req.orderType = OpenApiModelMessages.ProtoOAOrderType.STOP
             req.stopPrice = round_price(intent.stop, rules.digits)
-            req.timeInForce = _model.ProtoOATimeInForce.GOOD_TILL_CANCEL
+            req.timeInForce = OpenApiModelMessages.ProtoOATimeInForce.GOOD_TILL_CANCEL
 
         # Persist-first: write the ``submitted`` row + audit BEFORE the wire send,
         # so a crash between send and ack leaves a recoverable dispatch row keyed
@@ -485,7 +495,7 @@ class _ExecutionMixin(_CTraderBase):
         self._persist_entry(coid, intent, order, qty_units, filled)
 
         status = (OrderStatus.FILLED
-                  if event.executionType == _model.ProtoOAExecutionType.ORDER_FILLED
+                  if event.executionType == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED
                   else OrderStatus.OPEN)
         return [ExchangeOrder(
             id=str(order.orderId),
@@ -586,7 +596,7 @@ class _ExecutionMixin(_CTraderBase):
                 f"{intent.symbol!r} (from_entry={intent.from_entry!r})"
             )
 
-        req = _oa.ProtoOAAmendPositionSLTPReq(
+        req = OpenApiMessages.ProtoOAAmendPositionSLTPReq(
             ctidTraderAccountId=self._live_account_id,
             positionId=position_id,
         )
@@ -674,8 +684,9 @@ class _ExecutionMixin(_CTraderBase):
                   else ref + trail_offset)
         return round_price(anchor, rules.digits)
 
+    @staticmethod
     def _build_bracket_legs(
-            self, intent: ExitIntent, envelope: DispatchEnvelope,
+            intent: ExitIntent, envelope: DispatchEnvelope,
             position_id: int, rules: _SymbolRules,
     ) -> list[ExchangeOrder]:
         """Synthesise the TP / SL :class:`ExchangeOrder` legs for a bracket."""
@@ -708,8 +719,9 @@ class _ExecutionMixin(_CTraderBase):
             ))
         return legs
 
+    @staticmethod
     def _bracket_attach_reject(
-            self, intent: ExitIntent, position_id: int,
+            intent: ExitIntent, position_id: int,
             cause: ExchangeOrderRejectedError,
     ) -> BracketAttachAfterFillRejectedError:
         """Build the defensive-close error for a rejected bracket amend.
@@ -774,8 +786,8 @@ class _ExecutionMixin(_CTraderBase):
             if extras.get('kind') != ENTRY_KIND_WORKING:
                 continue
             order_id = extras.get('order_id')
-            if order_id:
-                refs.append(str(order_id))
+            if order_id is not None:
+                refs.append(str(parse_protocol_id(order_id, field='order_id')))
         return refs
 
     @override
@@ -795,7 +807,7 @@ class _ExecutionMixin(_CTraderBase):
         coid = f"__pyne_residual_cancel__{ref}"
         try:
             event = await self._dispatch_order(
-                _oa.ProtoOACancelOrderReq(
+                OpenApiMessages.ProtoOACancelOrderReq(
                     ctidTraderAccountId=self._live_account_id, orderId=int(ref),
                 ),
                 coid=coid, context="residual cancel",
@@ -806,7 +818,7 @@ class _ExecutionMixin(_CTraderBase):
                 return
             raise
         if (event.executionType
-                == _model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED):
+                == OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCEL_REJECTED):
             raise OrderDispositionUnknownError(
                 f"cTrader residual cancel for order {ref} was rejected by a "
                 f"cancel/fill race; the order may still be live",
@@ -851,7 +863,7 @@ class _ExecutionMixin(_CTraderBase):
                 pine_id = row.pine_entry_id
         self._close_dispatch_pine_by_position[int(leg_id)] = pine_id
         await self._dispatch_order(
-            _oa.ProtoOAClosePositionReq(
+            OpenApiMessages.ProtoOAClosePositionReq(
                 ctidTraderAccountId=self._live_account_id,
                 positionId=int(leg_id), volume=volume,
             ),
@@ -920,7 +932,7 @@ class _ExecutionMixin(_CTraderBase):
             # it without a duplicate write until normal quoted operation resumes.
             return
         rules = await self._get_symbol_rules(symbol)
-        req = _oa.ProtoOAAmendPositionSLTPReq(
+        req = OpenApiMessages.ProtoOAAmendPositionSLTPReq(
             ctidTraderAccountId=self._live_account_id, positionId=position_id,
         )
         self._apply_bracket_levels(
@@ -954,22 +966,22 @@ class _ExecutionMixin(_CTraderBase):
         if position is None:
             return
         trailing = (
-            position.HasField("trailingStopLoss") and position.trailingStopLoss
+                position.HasField("trailingStopLoss") and position.trailingStopLoss
         )
-        requests: list[_oa.ProtoOAAmendPositionSLTPReq] = []
+        requests: list[OpenApiMessages.ProtoOAAmendPositionSLTPReq] = []
         if trailing:
             if not position.HasField("stopLoss"):
                 raise CTraderBrokerError(
                     "cannot disable cTrader trailing protection without an "
                     f"authenticated Stop Loss on position {position_id}"
                 )
-            requests.append(_oa.ProtoOAAmendPositionSLTPReq(
+            requests.append(OpenApiMessages.ProtoOAAmendPositionSLTPReq(
                 ctidTraderAccountId=self._live_account_id,
                 positionId=position_id,
                 stopLoss=position.stopLoss,
                 trailingStopLoss=False,
             ))
-        requests.append(_oa.ProtoOAAmendPositionSLTPReq(
+        requests.append(OpenApiMessages.ProtoOAAmendPositionSLTPReq(
             ctidTraderAccountId=self._live_account_id,
             positionId=position_id,
         ))
@@ -993,10 +1005,10 @@ class _ExecutionMixin(_CTraderBase):
             if position.positionId != position_id:
                 continue
             return (
-                position.HasField('stopLoss')
-                and position.HasField('trailingStopLoss')
-                and position.trailingStopLoss
-                and not position.HasField('takeProfit')
+                    position.HasField('stopLoss')
+                    and position.HasField('trailingStopLoss')
+                    and position.trailingStopLoss
+                    and not position.HasField('takeProfit')
             )
         return False
 
@@ -1026,10 +1038,10 @@ class _ExecutionMixin(_CTraderBase):
         # startup-adopted position reverse-maps through this record when no
         # entry row carries the ``position_id`` ref.
         self._close_dispatch_pine_by_position[position_id] = (
-            intent.pine_id or None
+                intent.pine_id or None
         )
         event = await self._dispatch_order(
-            _oa.ProtoOAClosePositionReq(
+            OpenApiMessages.ProtoOAClosePositionReq(
                 ctidTraderAccountId=self._live_account_id,
                 positionId=position_id, volume=volume,
             ),
@@ -1051,7 +1063,7 @@ class _ExecutionMixin(_CTraderBase):
             price=None, stop_price=None,
             average_fill_price=order.executionPrice or None,
             status=(OrderStatus.FILLED
-                    if event.executionType == _model.ProtoOAExecutionType.ORDER_FILLED
+                    if event.executionType == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED
                     else OrderStatus.OPEN),
             timestamp=epoch_time(), fee=0.0, fee_currency='',
             reduce_only=True, client_order_id=coid,
@@ -1091,7 +1103,7 @@ class _ExecutionMixin(_CTraderBase):
             return True
         try:
             event = await self._dispatch_order(
-                _oa.ProtoOACancelOrderReq(
+                OpenApiMessages.ProtoOACancelOrderReq(
                     ctidTraderAccountId=self._live_account_id, orderId=order_id,
                 ),
                 coid=envelope.client_order_id(KIND_CANCEL), context="cancel",
@@ -1108,9 +1120,9 @@ class _ExecutionMixin(_CTraderBase):
         # the order is still live and may later fill; ``False`` keeps it pending
         # so reconcile retries.
         if (event.executionType
-                == _model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED):
+                == OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCEL_REJECTED):
             return False
-        if event.executionType == _model.ProtoOAExecutionType.ORDER_CANCELLED:
+        if event.executionType == OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED:
             self._retire_cancelled_working_order(order_id)
             self._surface_correlated_cancel(event)
         return True
@@ -1156,7 +1168,7 @@ class _ExecutionMixin(_CTraderBase):
             return CancelDispositionOutcome.UNKNOWN
         try:
             event = await self._dispatch_order(
-                _oa.ProtoOACancelOrderReq(
+                OpenApiMessages.ProtoOACancelOrderReq(
                     ctidTraderAccountId=self._live_account_id, orderId=order_id,
                 ),
                 coid=envelope.client_order_id(KIND_CANCEL), context="cancel",
@@ -1169,11 +1181,11 @@ class _ExecutionMixin(_CTraderBase):
                 return CancelDispositionOutcome.UNKNOWN
             raise
         exec_type = event.executionType
-        if exec_type == _model.ProtoOAExecutionType.ORDER_CANCELLED:
+        if exec_type == OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED:
             self._retire_cancelled_working_order(order_id)
             self._surface_correlated_cancel(event)
             return CancelDispositionOutcome.CANCEL_CONFIRMED
-        if exec_type == _model.ProtoOAExecutionType.ORDER_FILLED:
+        if exec_type == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED:
             return CancelDispositionOutcome.ALREADY_FILLED
         # ``ORDER_CANCEL_REJECTED`` says only that the cancel request was
         # refused — a cancel/modify race. It does NOT carry the no-fill
@@ -1207,7 +1219,7 @@ class _ExecutionMixin(_CTraderBase):
         rules = await self._get_symbol_rules(intent.symbol)
         volume = quantize_volume(intent.qty, rules.step_volume)
         coid = new.client_order_id(KIND_MODIFY_ENTRY)
-        req = _oa.ProtoOAAmendOrderReq(
+        req = OpenApiMessages.ProtoOAAmendOrderReq(
             ctidTraderAccountId=self._live_account_id,
             orderId=order_id, volume=volume,
         )
@@ -1249,7 +1261,7 @@ class _ExecutionMixin(_CTraderBase):
         position_id = await self._find_open_position_id(intent.symbol)
         if position_id is None:
             return await super().modify_exit(old, new)
-        req = _oa.ProtoOAAmendPositionSLTPReq(
+        req = OpenApiMessages.ProtoOAAmendPositionSLTPReq(
             ctidTraderAccountId=self._live_account_id, positionId=position_id,
         )
         self._apply_bracket_levels(
@@ -1315,7 +1327,7 @@ class _ExecutionMixin(_CTraderBase):
                 )
             position_ids = [single]
         for position_id in position_ids:
-            req = _oa.ProtoOAAmendPositionSLTPReq(
+            req = OpenApiMessages.ProtoOAAmendPositionSLTPReq(
                 ctidTraderAccountId=self._live_account_id, positionId=position_id,
             )
             if snapshot.stop_level is not None:
@@ -1379,8 +1391,8 @@ class _ExecutionMixin(_CTraderBase):
         if row is None:
             return None
         pid = (row.extras or {}).get('position_id')
-        if pid:
-            return int(pid)
+        if pid is not None:
+            return parse_protocol_id(pid, field='position_id')
         xid = row.exchange_order_id
         if xid and xid.isdigit():
             return int(xid)

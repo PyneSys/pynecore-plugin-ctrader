@@ -19,7 +19,7 @@ import logging
 import time
 import urllib.parse
 import webbrowser
-from typing import cast
+from typing import Any, cast
 
 import typer
 
@@ -52,8 +52,9 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        self.server.oauth_code = code  # type: ignore[attr-defined]
-        self.server.oauth_error = error  # type: ignore[attr-defined]
+        server = cast(_OAuthCallbackServer, self.server)
+        server.oauth_code = code
+        server.oauth_error = error
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -63,6 +64,18 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *args) -> None:  # noqa: D401 - silence default logging
         """Suppress the default per-request stderr logging."""
+
+
+class _OAuthCallbackServer(http.server.HTTPServer):
+    """Single-use loopback server carrying the OAuth redirect result."""
+
+    oauth_code: str
+    oauth_error: str
+
+    def __init__(self, address: tuple[str, int]) -> None:
+        super().__init__(address, cast(Any, _CallbackHandler))
+        self.oauth_code = ""
+        self.oauth_error = ""
 
 
 @ctrader_app.command("auth")
@@ -84,7 +97,7 @@ def ctrader_auth(
     # The OAuth consent/token exchange is environment-agnostic; ``demo`` only
     # selects which session key the token is stored under. Default it from the
     # config so the stored env matches the one the runtime will connect to.
-    demo_env = config.demo if demo is None else demo
+    demo_env = bool(config.demo if demo is None else demo)
 
     client_id = (config.client_id or "").strip()
     client_secret = (config.client_secret or "").strip()
@@ -107,7 +120,7 @@ def ctrader_auth(
     })
 
     try:
-        server = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
+        server = _OAuthCallbackServer(("127.0.0.1", port))
     except OSError as exc:
         typer.secho(
             f"Error: cannot listen on port {port} ({exc}). "
@@ -116,8 +129,6 @@ def ctrader_auth(
         )
         raise typer.Exit(1)
     server.timeout = timeout
-    server.oauth_code = ""  # type: ignore[attr-defined]
-    server.oauth_error = ""  # type: ignore[attr-defined]
 
     if no_browser or not webbrowser.open(consent_url):
         typer.echo("Open this URL in your browser to authorize:")
@@ -130,7 +141,7 @@ def ctrader_auth(
     # one request and returns early on a stray one (e.g. /favicon.ico), so the
     # timeout is enforced by a monotonic deadline, not by the request count.
     deadline = time.monotonic() + timeout
-    while not server.oauth_code and not server.oauth_error:  # type: ignore[attr-defined]
+    while not server.oauth_code and not server.oauth_error:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             typer.secho("Error: timed out waiting for the authorization redirect.",
@@ -141,15 +152,15 @@ def ctrader_auth(
         server.handle_request()
     server.server_close()
 
-    if server.oauth_error:  # type: ignore[attr-defined]
-        typer.secho(f"Error: authorization failed: {server.oauth_error}",  # type: ignore[attr-defined]
+    if server.oauth_error:
+        typer.secho(f"Error: authorization failed: {server.oauth_error}",
                     err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
 
     try:
         tokens = asyncio.run(auth.exchange_code(
             client_id=client_id, client_secret=client_secret,
-            code=server.oauth_code, redirect_uri=redirect_uri,  # type: ignore[attr-defined]
+            code=server.oauth_code, redirect_uri=redirect_uri,
         ))
     except auth.CTraderAuthError as exc:
         typer.secho(f"Error: token exchange failed: {exc}", err=True, fg=typer.colors.RED)

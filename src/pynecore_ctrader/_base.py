@@ -24,10 +24,11 @@ the shared base every cTrader mix-in derives from.
 """
 import asyncio
 import logging
-import threading
+from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import TYPE_CHECKING, cast
+from concurrent.futures import ThreadPoolExecutor
+from collections.abc import AsyncIterator, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from google.protobuf.message import Message
 
@@ -46,8 +47,8 @@ from .exceptions import (
     is_token_invalid,
     map_protocol_error,
 )
-from .messages import OpenApiMessages_pb2 as _oa
-from .messages import OpenApiModelMessages_pb2 as _model
+from .messages import OpenApiMessages_pb2 as OpenApiMessages
+from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .wire import (
     CTraderConnectionError,
     CTraderProtocolError,
@@ -68,6 +69,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ResultT = TypeVar('_ResultT')
+
+
 #: Hard ceiling on a single mid-session account re-authorization (token refresh
 #: + app/account auth round-trips). A recovery that overruns is cancelled —
 #: releasing :attr:`_reauth_lock` (so a stalled re-auth cannot wedge the lock
@@ -79,14 +83,12 @@ logger = logging.getLogger(__name__)
 _REAUTH_TIMEOUT = 20.0
 
 
-class _CTraderBase(BrokerPlugin[CTraderConfig]):
+class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     """Connection, authentication and account/broker resolution for cTrader.
 
-    Also the shared base every cTrader mix-in derives from: it declares the
-    cross-mix-in instance state and the plugin-private method surface (type
-    -only stubs with a ``...`` body) so static analysers resolve the
-    ``self.<x>`` references one mix-in makes against another's implementation.
-    The real method always wins at runtime via the MRO.
+    This is the concrete shared state/lifecycle base of the final plugin. The
+    feature layers remain explicit abstract mix-ins until their methods are
+    composed by :class:`pynecore_ctrader.plugin.CTrader`.
     """
 
     plugin_name = "cTrader"
@@ -282,7 +284,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         return WireClient(helpers.protobuf_host(self._demo))
 
     async def _token_call(
-        self, wire: WireClient, call: Callable[[str], Awaitable[Message]]
+            self, wire: WireClient,
+            call: Callable[[str], Coroutine[Any, Any, Message]],
     ) -> Message:
         """Run an access-token-scoped request, refreshing once on failure.
 
@@ -311,18 +314,22 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         """Send the application-auth request on a freshly connected socket."""
         client_id, client_secret = self._credentials()
         await wire.send_request(
-            _oa.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret)
+            OpenApiMessages.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret)
         )
 
-    async def _get_accounts(self, wire: WireClient) -> list[_model.ProtoOACtidTraderAccount]:
+    async def _get_accounts(self, wire: WireClient) -> list[OpenApiModelMessages.ProtoOACtidTraderAccount]:
         """List the trading accounts the access token grants (refresh-aware)."""
+
         async def call(token: str) -> Message:
-            response = await wire.send_request(
-                _oa.ProtoOAGetAccountListByAccessTokenReq(accessToken=token)
+            return await wire.send_request(
+                OpenApiMessages.ProtoOAGetAccountListByAccessTokenReq(accessToken=token)
             )
-            return response
-        response = cast(_oa.ProtoOAGetAccountListByAccessTokenRes, await self._token_call(wire, call))
-        return list(response.ctidTraderAccount)
+
+        account_list = cast(
+            OpenApiMessages.ProtoOAGetAccountListByAccessTokenRes,
+            await self._token_call(wire, call),
+        )
+        return list(account_list.ctidTraderAccount)
 
     async def _account_auth(self, wire: WireClient, account_id: int) -> None:
         """Authorize one trading account on the channel (refresh-aware).
@@ -333,10 +340,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         :param wire: A connected, application-authenticated client.
         :param account_id: The ``ctidTraderAccountId`` to authorize.
         """
+
         async def call(token: str) -> Message:
             return await wire.send_request(
-                _oa.ProtoOAAccountAuthReq(ctidTraderAccountId=account_id, accessToken=token)
+                OpenApiMessages.ProtoOAAccountAuthReq(ctidTraderAccountId=account_id, accessToken=token)
             )
+
         await self._token_call(wire, call)
 
     # --- mid-session account re-authorization recovery ----------------------
@@ -351,7 +360,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         :param wire: The live, application-authenticated connection.
         """
         try:
-            await wire.send_request(_oa.ProtoOAAccountAuthReq(
+            await wire.send_request(OpenApiMessages.ProtoOAAccountAuthReq(
                 ctidTraderAccountId=self._live_account_id,
                 accessToken=self._tokens.access_token,
             ))
@@ -377,6 +386,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
 
         :param wire: The live, application-authenticated connection.
         """
+
         async def refresh() -> None:
             self._tokens = await auth.refresh_via_socket(wire, self._tokens.refresh_token)
             session.save_session(self._tokens, demo=self._demo)
@@ -391,8 +401,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         await asyncio.shield(task)
 
     async def _reauth_account(
-        self, *, force_refresh: bool = False, reauth_app: bool = False,
-        seen_generation: int | None = None,
+            self, *, force_refresh: bool = False, reauth_app: bool = False,
+            seen_generation: int | None = None,
     ) -> None:
         """Re-win the account session on the LIVE wire (mid-session recovery).
 
@@ -466,7 +476,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
             logger.info("cTrader account re-authorized on the live connection")
 
     async def _recover_account_session(
-        self, exc: CTraderProtocolError, seen_generation: int,
+            self, exc: CTraderProtocolError, seen_generation: int,
     ) -> None:
         """Re-win the account session after an auth-loss error, or surface it.
 
@@ -525,9 +535,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         :param message: A response returned (not raised) by ``send_request``.
         :return: The synthesized protocol error, or ``None`` if not an auth loss.
         """
-        if isinstance(message, _oa.ProtoOAOrderErrorEvent):
+        if isinstance(message, OpenApiMessages.ProtoOAOrderErrorEvent):
             error_code, description = message.errorCode, message.description
-        elif isinstance(message, _oa.ProtoOAExecutionEvent) and message.errorCode:
+        elif isinstance(message, OpenApiMessages.ProtoOAExecutionEvent) and message.errorCode:
             error_code, description = message.errorCode, ""
         else:
             return None
@@ -677,10 +687,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
                 self._reauth_account(force_refresh=force_refresh, reauth_app=reauth_app),
                 timeout=_REAUTH_TIMEOUT,
             )
-        except Exception as exc:  # noqa: BLE001 - proactive; error path owns recovery
+        except (CTraderProtocolError, CTraderConnectionError, CTraderTimeoutError,
+                asyncio.TimeoutError, OSError) as exc:
             logger.warning("cTrader proactive re-authorization failed: %s", exc)
 
-    async def _broker_name(self, wire: WireClient, account_id: int) -> str:
+    @staticmethod
+    async def _broker_name(wire: WireClient, account_id: int) -> str:
         """Fetch the broker whitelabel slug for an authorized account.
 
         ``ProtoOATrader.brokerName`` is the short, space-free broker identifier
@@ -692,13 +704,13 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         :param account_id: The authorized account's ``ctidTraderAccountId``.
         :return: The broker slug (possibly empty if the broker set none).
         """
-        response = cast(_oa.ProtoOATraderRes, await wire.send_request(
-            _oa.ProtoOATraderReq(ctidTraderAccountId=account_id)
+        response = cast(OpenApiMessages.ProtoOATraderRes, await wire.send_request(
+            OpenApiMessages.ProtoOATraderReq(ctidTraderAccountId=account_id)
         ))
         return response.trader.brokerName
 
     async def _resolve_account(
-        self, wire: WireClient, accounts: list[_model.ProtoOACtidTraderAccount]
+            self, wire: WireClient, accounts: list[OpenApiModelMessages.ProtoOACtidTraderAccount]
     ) -> int:
         """Authorize and return the ``ctidTraderAccountId`` to trade on.
 
@@ -784,39 +796,32 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
 
     # --- one-shot synchronous bridge ----------------------------------------
 
-    def _run(self, coro: Awaitable) -> object:
-        """Run ``coro`` to completion on a private event loop.
+    @staticmethod
+    def _run(coro: Coroutine[Any, Any, _ResultT]) -> _ResultT:
+        """Run one coroutine object to completion on exactly one private loop.
 
         Used by the synchronous CLI data methods. When called from outside any
         running loop (the offline ``pyne data`` path) it uses :func:`asyncio.run`
         directly; when a loop is already running (e.g. live warmup inside the
-        async runner) it runs the coroutine on a fresh loop in a worker thread so
-        it never clashes with the caller's loop.
+        async runner) ownership of the same not-yet-started coroutine object moves
+        to one worker thread, where one fresh loop awaits it exactly once.
 
-        :param coro: The coroutine to run.
-        :return: The coroutine's result.
+        :param coro: The coroutine object to run once.
+        :return: The coroutine result.
         """
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(coro)
-        box: dict[str, object] = {}
-        error: dict[str, BaseException] = {}
+        with ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ctrader-oneshot",
+        ) as executor:
+            return executor.submit(asyncio.run, coro).result()
 
-        def worker() -> None:
-            try:
-                box['value'] = asyncio.run(coro)
-            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
-                error['error'] = exc
-
-        thread = threading.Thread(target=worker, name="ctrader-oneshot")
-        thread.start()
-        thread.join()
-        if error:
-            raise error['error']
-        return box['value']
-
-    async def _authed_session(self, work: Callable[[WireClient, int], Awaitable]) -> object:
+    async def _authed_session(
+            self,
+            work: Callable[[WireClient, int], Coroutine[Any, Any, _ResultT]],
+    ) -> _ResultT:
         """Connect, run the full handshake, run ``work`` and disconnect.
 
         :param work: Coroutine factory receiving the connected client and the
@@ -831,7 +836,10 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         finally:
             await wire.disconnect()
 
-    async def _app_session(self, work: Callable[[WireClient], Awaitable]) -> object:
+    async def _app_session(
+            self,
+            work: Callable[[WireClient], Coroutine[Any, Any, _ResultT]],
+    ) -> _ResultT:
         """Connect, app-authenticate only, run ``work`` and disconnect.
 
         Used for account enumeration (``--list-brokers``), which must run before
@@ -885,16 +893,18 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         self._current_bar = None
         self._current_bar_ts = None
         self._pending_bars.clear()
-        self._wire = self._make_wire()
-        await self._wire.connect()
+        wire = self._make_wire()
+        self._wire = wire
+        await wire.connect()
         # ``_full_handshake`` also latches the plugin-qualified
         # ``BrokerPlugin.account_id`` (``ctrader-<env>-<account>``) so the
         # BrokerStore run-tag / persisted state are scoped to THIS account (two
         # cTrader accounts on the same script + symbol + timeframe must not
         # share state). Mirrors the documented ``capitalcom-<env>-<account>``
         # pattern on ``BrokerPlugin._account_id``.
-        self._live_account_id = await self._full_handshake(self._wire)
-        await self._probe_account(self._wire, self._live_account_id)
+        account_id = await self._full_handshake(wire)
+        self._live_account_id = account_id
+        await self._probe_account(wire, account_id)
         if self._hedging_enabled:
             # HEDGED account: opt into core one-way emulation. The Order Sync
             # Engine then drives reducing / closing / reversing / bracket intents
@@ -936,7 +946,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         if self._exec_events is None:
             self._exec_events = asyncio.Queue()
         self._event_router_task = asyncio.create_task(
-            self._event_router_loop(self._wire), name="ctrader-event-router"
+            self._event_router_loop(wire), name="ctrader-event-router"
         )
 
     async def disconnect(self) -> None:
@@ -1003,14 +1013,14 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         :param wire: A connected client with ``account_id`` authorized.
         :param account_id: The authorized ``ctidTraderAccountId``.
         """
-        response = cast(_oa.ProtoOATraderRes, await wire.send_request(
-            _oa.ProtoOATraderReq(ctidTraderAccountId=account_id)
+        response = cast(OpenApiMessages.ProtoOATraderRes, await wire.send_request(
+            OpenApiMessages.ProtoOATraderReq(ctidTraderAccountId=account_id)
         ))
         trader = response.trader
         self._money_digits = trader.moneyDigits
         self._deposit_asset_id = trader.depositAssetId
         self._hedging_enabled = (
-            trader.accountType == _model.ProtoOAAccountType.HEDGED
+                trader.accountType == OpenApiModelMessages.ProtoOAAccountType.HEDGED
         )
 
     async def _event_router_loop(self, wire: WireClient) -> None:
@@ -1035,11 +1045,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         try:
             while True:
                 message = await wire.events.get()
-                if isinstance(message, _oa.ProtoOASpotEvent):
+                if isinstance(message, OpenApiMessages.ProtoOASpotEvent):
                     if spot is not None:
                         spot.put_nowait(message)
-                elif isinstance(message, (_oa.ProtoOAExecutionEvent,
-                                          _oa.ProtoOAOrderErrorEvent)):
+                elif isinstance(message, (OpenApiMessages.ProtoOAExecutionEvent,
+                                          OpenApiMessages.ProtoOAOrderErrorEvent)):
                     # Broker-slug account resolution authorizes every candidate
                     # account on this channel to read ``brokerName`` (see
                     # ``_resolve_account``), and cTrader then pushes execution
@@ -1052,7 +1062,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
                                  or message.ctidTraderAccountId
                                  == self._live_account_id)):
                         execq.put_nowait(message)
-                elif isinstance(message, _oa.ProtoOAAccountDisconnectEvent):
+                elif isinstance(message, OpenApiMessages.ProtoOAAccountDisconnectEvent):
                     # The account's session was dropped on this channel while the
                     # socket stays up; re-send ProtoOAAccountAuthReq to re-win it.
                     if message.ctidTraderAccountId == self._live_account_id:
@@ -1060,7 +1070,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
                             "cTrader pushed account-disconnect; "
                             "re-authorizing the live session")
                         self._schedule_reauth(force_refresh=False)
-                elif isinstance(message, _oa.ProtoOAAccountsTokenInvalidatedEvent):
+                elif isinstance(message, OpenApiMessages.ProtoOAAccountsTokenInvalidatedEvent):
                     # The access token is no longer valid for these accounts;
                     # refresh the token before re-authorizing. ctidTraderAccountIds
                     # is a repeated field — match by membership.
@@ -1069,7 +1079,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
                             "cTrader pushed token-invalidated (%s); refreshing "
                             "the token and re-authorizing", message.reason or "")
                         self._schedule_reauth(force_refresh=True)
-                elif isinstance(message, _oa.ProtoOAClientDisconnectEvent):
+                elif isinstance(message, OpenApiMessages.ProtoOAClientDisconnectEvent):
                     # Channel-wide disconnect (no account id): the server
                     # cancelled the APPLICATION connection, so ALL account
                     # sessions are terminated. Re-authenticate the application
@@ -1128,8 +1138,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
         owned: set[int] = set()
         for row in self.store_ctx.iter_live_orders():
             pid = (row.extras or {}).get('position_id')
-            if pid:
-                owned.add(int(pid))
+            if pid is not None:
+                owned.add(helpers.parse_protocol_id(pid, field='position_id'))
                 continue
             xoid = row.exchange_order_id
             if xoid and xoid.isdigit():
@@ -1235,56 +1245,63 @@ class _CTraderBase(BrokerPlugin[CTraderConfig]):
             intent_key=row.intent_key,
         )
 
-    # === Cross-mix-in private surface (type-only) ===========================
-    # Implementations live in the provider / execution / state / events
-    # mix-ins; declared here with a ``...`` body so each mix-in can call
-    # ``self.<name>`` against another's implementation without analyser
-    # warnings. The real method always wins at runtime via the MRO.
+    # --- assembled feature surface -----------------------------------------
 
+    @abstractmethod
     async def _fetch_light_symbols(
-        self, wire, account_id: int, *, recover: bool = False,
-    ) -> list: ...
+            self, wire: WireClient, account_id: int, *, recover: bool = False,
+    ) -> list[OpenApiModelMessages.ProtoOALightSymbol]: ...
 
+    @abstractmethod
     async def _get_symbol_rules(self, symbol: str) -> '_SymbolRules': ...
 
+    @abstractmethod
     async def _reconcile(
             self, *, return_protection_orders: bool = False,
-    ) -> '_oa.ProtoOAReconcileRes': ...
+    ) -> OpenApiMessages.ProtoOAReconcileRes: ...
 
+    @abstractmethod
     def _reconcile_snapshot(self) -> 'AsyncIterator[OrderEvent]': ...
 
+    @abstractmethod
     def _emit_unexpected_cancellations(self) -> 'AsyncIterator[OrderEvent]': ...
 
+    @abstractmethod
     async def _dispatch_order(
-            self, req, *, coid: str, context: str,
-    ) -> '_oa.ProtoOAExecutionEvent': ...
+            self, req: Message, *, coid: str, context: str,
+            predecessor_cancel_ids: tuple[str, ...] | None = None,
+    ) -> OpenApiMessages.ProtoOAExecutionEvent: ...
 
+    @abstractmethod
     async def _recover_in_flight_submissions(self) -> None: ...
 
+    @abstractmethod
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...
 
+    @abstractmethod
     async def fetch_raw_positions(self, symbol: str) -> 'list[PositionLeg]': ...
 
-    # PositionPort transport surface — real bodies on the execution mix-in;
-    # declared here so the assembled plugin structurally satisfies the protocol
-    # and ``connect()`` can assign ``self.position_port = self`` on a HEDGED
-    # account.
+    @abstractmethod
     async def get_volume_quantizer(
             self, symbol: str,
     ) -> 'Callable[[float], int]': ...
 
+    @abstractmethod
     async def close_leg(
             self, symbol: str, leg_id: str, volume: int, coid: str,
     ) -> None: ...
 
+    @abstractmethod
     async def reject_out_of_range(
             self, envelope: 'DispatchEnvelope', qty: float,
     ) -> None: ...
 
+    @abstractmethod
     async def place_leg(
             self, envelope: 'DispatchEnvelope', qty: float,
     ) -> 'list[ExchangeOrder]': ...
 
+    @abstractmethod
     async def amend_bracket(
             self, symbol: str, leg_id: str, *,
             side: str, tp_price: float | None, sl_price: float | None,

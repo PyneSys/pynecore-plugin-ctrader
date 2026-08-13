@@ -203,7 +203,7 @@ class _ProviderMixin(_CTraderBase, ABC):
                     titles.setdefault(slug, a.brokerTitleShort or "")
             return [Broker(id=slug, name=titles[slug]) for slug in sorted(titles)]
 
-        return cast("list[Broker]", self._run(self._app_session(work)))
+        return self._run(self._app_session(work))
 
     # --- symbol listing + resolution ----------------------------------------
 
@@ -221,7 +221,7 @@ class _ProviderMixin(_CTraderBase, ABC):
             symbols = await self._fetch_light_symbols(wire, account_id)
             return sorted(s.symbolName for s in symbols if s.symbolName and s.enabled)
 
-        return cast(list[str], self._run(self._authed_session(work)))
+        return self._run(self._authed_session(work))
 
     async def _fetch_light_symbols(
             self, wire, account_id: int, *, recover: bool = False
@@ -281,7 +281,7 @@ class _ProviderMixin(_CTraderBase, ABC):
             detail = detail_res.symbol[0]
             return self._build_sym_info(match, detail, asset_names)
 
-        syminfo = cast(SymInfo, self._run(self._authed_session(work)))
+        syminfo = self._run(self._authed_session(work))
         self.syminfo = syminfo
         return syminfo
 

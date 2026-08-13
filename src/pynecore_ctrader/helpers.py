@@ -10,6 +10,7 @@ Hosts, ports and the OAuth endpoints are taken from the official Spotware
 ``OpenApiPy`` reference (``ctrader_open_api/endpoints.py``); the wire-level
 constants mirror its ``TcpProtocol`` (``Int32StringReceiver``).
 """
+from typing import cast
 
 #: Protobuf API hosts. Demo and live are fully separate systems.
 PROTOBUF_DEMO_HOST = "demo.ctraderapi.com"
@@ -70,6 +71,33 @@ def protobuf_host(demo: bool) -> str:
     :return: The hostname to connect to.
     """
     return PROTOBUF_DEMO_HOST if demo else PROTOBUF_LIVE_HOST
+
+
+def parse_protocol_id(value: object, *, field: str) -> int:
+    """Parse one persisted protobuf identifier without coercive truncation.
+
+    Broker-store ``extras`` are JSON-shaped and therefore expose values as
+    ``object``/``Any`` to callers. Protocol identifiers are nevertheless exact,
+    positive integers: accepting ``True`` as ``1``, truncating a float, or treating
+    ``None`` as zero could target the wrong live order or position. Accept only an
+    actual ``int`` (excluding ``bool``) or an ASCII decimal string and reject every
+    other representation.
+
+    :param value: Persisted identifier representation.
+    :param field: Field name included in validation errors.
+    :return: The positive protocol identifier.
+    :raises ValueError: If the value is absent, boolean, non-integral, malformed,
+        or non-positive.
+    """
+    if type(value) is int:
+        parsed = cast(int, value)
+    elif isinstance(value, str) and value.isascii() and value.isdecimal():
+        parsed = int(value)
+    else:
+        raise ValueError(f"{field} must be a positive integer")
+    if parsed <= 0:
+        raise ValueError(f"{field} must be positive, got {parsed}")
+    return parsed
 
 
 # === Unit conversions (broker order layer) ===============================

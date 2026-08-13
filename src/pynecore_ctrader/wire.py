@@ -29,13 +29,13 @@ import ssl
 import struct
 from dataclasses import dataclass
 
-from google.protobuf.message import Message
+from google.protobuf.message import DecodeError, Message
 
 from pynecore.core.plugin import ProviderError
 
 from . import helpers
-from .messages import OpenApiCommonMessages_pb2 as _common
-from .messages import OpenApiMessages_pb2 as _oa
+from .messages import OpenApiCommonMessages_pb2 as OpenApiCommonMessages
+from .messages import OpenApiMessages_pb2 as OpenApiMessages
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +59,10 @@ class CTraderWireError(ProviderError):
 #: NOT here, so they keep failing fast. ``CANT_ROUTE_REQUEST`` is the code
 #: Pepperstone returns while a broker backend is in maintenance.
 _CONNECTION_CLASS_CODES = frozenset({
-    'CANT_ROUTE_REQUEST',         # common: "Connection to Server is lost"
-    'TIMEOUT_ERROR',              # common: server-side execution timeout
+    'CANT_ROUTE_REQUEST',  # common: "Connection to Server is lost"
+    'TIMEOUT_ERROR',  # common: server-side execution timeout
     'SERVER_IS_UNDER_MAINTENANCE',
-    'CH_SERVER_NOT_REACHABLE',    # "Trading service is not available"
+    'CH_SERVER_NOT_REACHABLE',  # "Trading service is not available"
 })
 
 
@@ -126,7 +126,7 @@ def _build_payload_type_map() -> dict[int, type[Message]]:
     :return: Mapping from a numeric payload type to its concrete message class.
     """
     mapping: dict[int, type[Message]] = {}
-    for module in (_common, _oa):
+    for module in (OpenApiCommonMessages, OpenApiMessages):
         for name in dir(module):
             if not name.startswith("Proto"):
                 continue
@@ -146,7 +146,7 @@ def _build_payload_type_map() -> dict[int, type[Message]]:
 _PAYLOAD_TYPE_TO_CLASS = _build_payload_type_map()
 
 #: The payload type of a heartbeat event, special-cased on receive.
-_HEARTBEAT_TYPE = _common.ProtoHeartbeatEvent().payloadType
+_HEARTBEAT_TYPE = OpenApiCommonMessages.ProtoHeartbeatEvent().payloadType
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +163,7 @@ def _raise_on_error(message: Message) -> None:
 
     :param message: A decoded response message.
     """
-    if isinstance(message, (_common.ProtoErrorRes, _oa.ProtoOAErrorRes)):
+    if isinstance(message, (OpenApiCommonMessages.ProtoErrorRes, OpenApiMessages.ProtoOAErrorRes)):
         raise CTraderProtocolError(message.errorCode, message.description)
 
 
@@ -296,7 +296,7 @@ class WireClient:
         await self._send_message(message)
 
     async def send_request(
-        self, message: Message, *, timeout: float = helpers.REQUEST_TIMEOUT
+            self, message: Message, *, timeout: float = helpers.REQUEST_TIMEOUT
     ) -> Message:
         """Send a request and await its correlated response.
 
@@ -338,7 +338,8 @@ class WireClient:
         _raise_on_error(result)
         return result
 
-    def _frame(self, message: Message, client_msg_id: str) -> bytes:
+    @staticmethod
+    def _frame(message: Message, client_msg_id: str) -> bytes:
         """Wrap a concrete message into a length-prefixed ``ProtoMessage`` envelope.
 
         :param message: The concrete message to wrap.
@@ -346,7 +347,7 @@ class WireClient:
         :return: The bytes to write to the socket.
         """
         payload_type = message.DESCRIPTOR.fields_by_name["payloadType"].default_value
-        envelope = _common.ProtoMessage(
+        envelope = OpenApiCommonMessages.ProtoMessage(
             payloadType=payload_type, payload=message.SerializeToString()
         )
         if client_msg_id:
@@ -402,11 +403,11 @@ class WireClient:
                     )
                 body = await reader.readexactly(length)
                 self._last_recv = asyncio.get_running_loop().time()
-                envelope = _common.ProtoMessage()
+                envelope = OpenApiCommonMessages.ProtoMessage()
                 envelope.ParseFromString(body)
                 if envelope.payloadType == _HEARTBEAT_TYPE:
                     self._inbound_heartbeats += 1
-                    await self._send_message(_common.ProtoHeartbeatEvent())
+                    await self._send_message(OpenApiCommonMessages.ProtoHeartbeatEvent())
                     continue
                 self._route(envelope)
         except asyncio.CancelledError:
@@ -414,13 +415,13 @@ class WireClient:
         except (asyncio.IncompleteReadError, ConnectionError, OSError, ssl.SSLError) as exc:
             logger.debug("cTrader wire receive loop stopped: %r", exc)
             self._close_writer()
-        except Exception:
-            logger.warning("cTrader wire receive loop stopped unexpectedly", exc_info=True)
+        except (DecodeError, KeyError, struct.error, CTraderProtocolError) as exc:
+            logger.warning("cTrader wire receive loop rejected an invalid frame: %s", exc)
             self._close_writer()
         finally:
             self._fail_pending(CTraderConnectionError("connection lost"))
 
-    def _route(self, envelope: _common.ProtoMessage) -> None:
+    def _route(self, envelope: OpenApiCommonMessages.ProtoMessage) -> None:
         """Decode an envelope payload and deliver it to its waiter or the queue.
 
         :param envelope: A parsed (non-heartbeat) ``ProtoMessage`` envelope.
@@ -430,7 +431,7 @@ class WireClient:
             return
         message = klass()
         message.ParseFromString(envelope.payload)
-        if isinstance(message, _oa.ProtoOASpotEvent):
+        if isinstance(message, OpenApiMessages.ProtoOASpotEvent):
             if message.trendbar:
                 self._spot_events_with_trendbar += 1
             else:
@@ -470,7 +471,7 @@ class WireClient:
                     return
                 if loop.time() - self._last_send >= interval:
                     try:
-                        await self._send_message(_common.ProtoHeartbeatEvent())
+                        await self._send_message(OpenApiCommonMessages.ProtoHeartbeatEvent())
                     except CTraderConnectionError:
                         return
         except asyncio.CancelledError:

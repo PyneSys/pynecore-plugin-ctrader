@@ -15,6 +15,7 @@ never silently dropped (the queue is unbounded; a backlog watermark only warns).
 """
 import asyncio
 import logging
+from abc import ABC
 from time import time as epoch_time
 from typing import AsyncIterator
 
@@ -28,9 +29,9 @@ from pynecore.core.broker.models import (
 )
 
 from ._base import _CTraderBase
-from .helpers import money_value, volume_to_units
-from .messages import OpenApiMessages_pb2 as _oa
-from .messages import OpenApiModelMessages_pb2 as _model
+from .helpers import money_value, parse_protocol_id, volume_to_units
+from .messages import OpenApiMessages_pb2 as OpenApiMessages
+from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .state import _ORDER_STATUS_MAP, _ORDER_TYPE_MAP
 from .wire import CTraderConnectionError
 
@@ -38,12 +39,12 @@ logger = logging.getLogger(__name__)
 
 #: ``ProtoOAExecutionType`` -> :class:`OrderEvent` ``event_type``.
 _EXEC_TYPE_TO_EVENT = {
-    _model.ProtoOAExecutionType.ORDER_ACCEPTED: 'created',
-    _model.ProtoOAExecutionType.ORDER_FILLED: 'filled',
-    _model.ProtoOAExecutionType.ORDER_PARTIAL_FILL: 'partial',
-    _model.ProtoOAExecutionType.ORDER_CANCELLED: 'cancelled',
-    _model.ProtoOAExecutionType.ORDER_REJECTED: 'rejected',
-    _model.ProtoOAExecutionType.ORDER_EXPIRED: 'cancelled',
+    OpenApiModelMessages.ProtoOAExecutionType.ORDER_ACCEPTED: 'created',
+    OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED: 'filled',
+    OpenApiModelMessages.ProtoOAExecutionType.ORDER_PARTIAL_FILL: 'partial',
+    OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED: 'cancelled',
+    OpenApiModelMessages.ProtoOAExecutionType.ORDER_REJECTED: 'rejected',
+    OpenApiModelMessages.ProtoOAExecutionType.ORDER_EXPIRED: 'cancelled',
 }
 
 #: ``qsize`` above which a consumer backlog is warned about (never dropped).
@@ -56,7 +57,7 @@ _BACKLOG_WATERMARK = 1000
 _RECONCILE_CADENCE_S = 5.0
 
 
-class _EventStreamMixin(_CTraderBase):
+class _EventStreamMixin(_CTraderBase, ABC):
     """Order-event PUSH stream: ``ProtoOAExecutionEvent`` -> ``OrderEvent``."""
 
     async def watch_orders(self) -> AsyncIterator[OrderEvent]:
@@ -181,9 +182,9 @@ class _EventStreamMixin(_CTraderBase):
         :return: The mapped :class:`OrderEvent`, or ``None`` when the message
             carries no order-lifecycle meaning.
         """
-        if isinstance(message, _oa.ProtoOAOrderErrorEvent):
+        if isinstance(message, OpenApiMessages.ProtoOAOrderErrorEvent):
             return self._order_error_to_event(message)
-        if not isinstance(message, _oa.ProtoOAExecutionEvent):
+        if not isinstance(message, OpenApiMessages.ProtoOAExecutionEvent):
             return None
         event_type = _EXEC_TYPE_TO_EVENT.get(message.executionType)
         if event_type is None:
@@ -325,7 +326,7 @@ class _EventStreamMixin(_CTraderBase):
         symbol_id = order.tradeData.symbolId
         qty = volume_to_units(order.tradeData.volume)
         filled = volume_to_units(order.executedVolume)
-        side = ('buy' if order.tradeData.tradeSide == _model.ProtoOATradeSide.BUY
+        side = ('buy' if order.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
                 else 'sell')
         return ExchangeOrder(
             id=str(order.orderId),
@@ -534,7 +535,8 @@ class _EventStreamMixin(_CTraderBase):
         self.store_ctx.upsert_order(target_coid, extras=extras)
         self._link_position_ref(target_coid, order.positionId)
 
-    def _position_is_flat(self, message) -> bool:
+    @staticmethod
+    def _position_is_flat(message) -> bool:
         """Report whether a closing fill left the net position flat.
 
         A partial ``ProtoOAClosePositionReq`` (engine-driven SOFTWARE partial
@@ -549,7 +551,7 @@ class _EventStreamMixin(_CTraderBase):
         if not message.HasField('position'):
             return True
         position = message.position
-        if position.positionStatus == _model.ProtoOAPositionStatus.POSITION_STATUS_CLOSED:
+        if position.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_CLOSED:
             return True
         return position.tradeData.volume == 0
 
@@ -567,12 +569,15 @@ class _EventStreamMixin(_CTraderBase):
         if self.store_ctx is None or not position_id:
             return
         pid_str = str(position_id)
-        targets = [
-            row.client_order_id
-            for row in self.store_ctx.iter_live_orders()
-            if (row.extras or {}).get('position_id') == position_id
-            or row.exchange_order_id == pid_str
-        ]
+        targets: list[str] = []
+        for row in self.store_ctx.iter_live_orders():
+            position_id_raw = (row.extras or {}).get('position_id')
+            matches_position = (
+                position_id_raw is not None
+                and parse_protocol_id(position_id_raw, field='position_id') == position_id
+            )
+            if matches_position or row.exchange_order_id == pid_str:
+                targets.append(row.client_order_id)
         if not targets:
             row = self.store_ctx.find_by_ref('position_id', pid_str)
             if row is not None:

@@ -12,6 +12,7 @@ NETTING accounts hold at most one open position per symbol, so
 :meth:`get_position` returns the single matching row (or ``None``).
 """
 import logging
+from abc import ABC
 from typing import cast
 
 from pynecore.core.broker.emulator import aggregate_positions
@@ -26,9 +27,9 @@ from pynecore.core.broker.models import (
 )
 
 from ._base import _CTraderBase
-from .helpers import money_value, round_price, volume_to_units
-from .messages import OpenApiMessages_pb2 as _oa
-from .messages import OpenApiModelMessages_pb2 as _model
+from .helpers import money_value, parse_protocol_id, round_price, volume_to_units
+from .messages import OpenApiMessages_pb2 as OpenApiMessages
+from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .wire import CTraderConnectionError
 
 logger = logging.getLogger(__name__)
@@ -37,22 +38,22 @@ logger = logging.getLogger(__name__)
 #: layer places are mapped; anything else (STOP_LOSS_TAKE_PROFIT protection
 #: orders, MARKET_RANGE, STOP_LIMIT) is reported as the closest plain type.
 _ORDER_TYPE_MAP = {
-    _model.ProtoOAOrderType.MARKET: OrderType.MARKET,
-    _model.ProtoOAOrderType.LIMIT: OrderType.LIMIT,
-    _model.ProtoOAOrderType.STOP: OrderType.STOP,
+    OpenApiModelMessages.ProtoOAOrderType.MARKET: OrderType.MARKET,
+    OpenApiModelMessages.ProtoOAOrderType.LIMIT: OrderType.LIMIT,
+    OpenApiModelMessages.ProtoOAOrderType.STOP: OrderType.STOP,
 }
 
 #: ``ProtoOAOrderStatus`` -> PyneCore order status.
 _ORDER_STATUS_MAP = {
-    _model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED: OrderStatus.OPEN,
-    _model.ProtoOAOrderStatus.ORDER_STATUS_FILLED: OrderStatus.FILLED,
-    _model.ProtoOAOrderStatus.ORDER_STATUS_REJECTED: OrderStatus.REJECTED,
-    _model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED: OrderStatus.EXPIRED,
-    _model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED: OrderStatus.CANCELLED,
+    OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED: OrderStatus.OPEN,
+    OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_FILLED: OrderStatus.FILLED,
+    OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_REJECTED: OrderStatus.REJECTED,
+    OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED: OrderStatus.EXPIRED,
+    OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED: OrderStatus.CANCELLED,
 }
 
 
-class _StateMixin(_CTraderBase):
+class _StateMixin(_CTraderBase, ABC):
     """Broker state queries + capability declaration."""
 
     def get_capabilities(self) -> ExchangeCapabilities:
@@ -85,7 +86,7 @@ class _StateMixin(_CTraderBase):
 
     async def _reconcile(
             self, *, return_protection_orders: bool = False,
-    ) -> _oa.ProtoOAReconcileRes:
+    ) -> OpenApiMessages.ProtoOAReconcileRes:
         """Fetch the account's open orders + positions snapshot.
 
         :param return_protection_orders: When ``True`` the snapshot's
@@ -102,14 +103,14 @@ class _StateMixin(_CTraderBase):
         # Route through ``_account_request`` so a mid-session account de-auth is
         # transparently re-authorized and the (idempotent) snapshot retried,
         # rather than raising a raw protocol error that crashes the dispatch.
-        return cast(_oa.ProtoOAReconcileRes, await self._account_request(
-            _oa.ProtoOAReconcileReq(
+        return cast(OpenApiMessages.ProtoOAReconcileRes, await self._account_request(
+            OpenApiMessages.ProtoOAReconcileReq(
                 ctidTraderAccountId=self._live_account_id,
                 returnProtectionOrders=return_protection_orders,
             )
         ))
 
-    def _apply_adoption_baseline(self, res: _oa.ProtoOAReconcileRes) -> None:
+    def _apply_adoption_baseline(self, res: OpenApiMessages.ProtoOAReconcileRes) -> None:
         """Silently baseline live rows' ``filled_qty`` to the adoption snapshot.
 
         The engine's startup ``reconcile`` adopts the broker's NET position
@@ -152,11 +153,15 @@ class _StateMixin(_CTraderBase):
         executed_by_order_id = {o.orderId: o.executedVolume for o in res.order}
         open_position_ids = {
             p.positionId for p in res.position
-            if p.positionStatus == _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+            if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
         }
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
-            order_id_str = extras.get('order_id')
+            order_id_raw = extras.get('order_id')
+            order_id = (
+                parse_protocol_id(order_id_raw, field='order_id')
+                if order_id_raw is not None else None
+            )
             baseline: float | None = None
             if extras.get('recovered_inconclusive'):
                 # In-flight recovery matched this row by coid but the deal-history
@@ -169,8 +174,8 @@ class _StateMixin(_CTraderBase):
                 # deal-id filter and be applied a second time. Leave it untouched;
                 # the runtime reconcile re-entry advances it once, with the deal ids.
                 continue
-            if order_id_str and int(order_id_str) in executed_by_order_id:
-                baseline = volume_to_units(executed_by_order_id[int(order_id_str)])
+            if order_id is not None and order_id in executed_by_order_id:
+                baseline = volume_to_units(executed_by_order_id[order_id])
             elif extras.get('recovered_partial_terminal'):
                 # In-flight recovery confirmed this row as a partially-filled
                 # TERMINAL LIMIT/STOP (cancelled / expired residual): the order is
@@ -180,9 +185,13 @@ class _StateMixin(_CTraderBase):
                 # partial, so leave the recovered cursor untouched.
                 continue
             else:
-                position_id = extras.get('position_id')
-                if position_id and position_id in open_position_ids:
-                    baseline = row.qty
+                position_id_raw = extras.get('position_id')
+                if position_id_raw is not None:
+                    position_id = parse_protocol_id(
+                        position_id_raw, field='position_id',
+                    )
+                    if position_id in open_position_ids:
+                        baseline = row.qty
             if baseline is None:
                 continue
             cumulative = min(row.qty, max(row.filled_qty, baseline))
@@ -209,9 +218,10 @@ class _StateMixin(_CTraderBase):
         if symbol_id is not None:
             return symbol_id
         wire = self._wire
-        if wire is None or self._live_account_id is None:
+        account_id = self._live_account_id
+        if wire is None or account_id is None:
             raise CTraderConnectionError("live connection not established")
-        await self._fetch_light_symbols(wire, self._live_account_id, recover=True)
+        await self._fetch_light_symbols(wire, account_id, recover=True)
         return self._symbols_by_name.get(symbol)
 
     async def get_open_orders(
@@ -247,7 +257,7 @@ class _StateMixin(_CTraderBase):
                 continue
             qty = volume_to_units(order.tradeData.volume)
             filled = volume_to_units(order.executedVolume)
-            side = ('buy' if order.tradeData.tradeSide == _model.ProtoOATradeSide.BUY
+            side = ('buy' if order.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
                     else 'sell')
             result.append(ExchangeOrder(
                 id=str(order.orderId),
@@ -295,13 +305,13 @@ class _StateMixin(_CTraderBase):
         owned = self._owned_position_ids()
         legs: list[PositionLeg] = []
         for position in res.position:
-            if position.positionStatus != _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+            if position.positionStatus != OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue
             if position.tradeData.symbolId != want_id:
                 continue
             if owned is not None and position.positionId not in owned:
                 continue
-            side = ('buy' if position.tradeData.tradeSide == _model.ProtoOATradeSide.BUY
+            side = ('buy' if position.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
                     else 'sell')
             legs.append(PositionLeg(
                 leg_id=str(position.positionId),
@@ -340,14 +350,14 @@ class _StateMixin(_CTraderBase):
         # shrink-to-zero reconcile).
         owned = self._owned_position_ids()
         for position in res.position:
-            if position.positionStatus != _model.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+            if position.positionStatus != OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue
             if position.tradeData.symbolId != want_id:
                 continue
             if owned is not None and position.positionId not in owned:
                 continue
             digits = self._symbol_rules[symbol].digits if symbol in self._symbol_rules else 5
-            side = ('long' if position.tradeData.tradeSide == _model.ProtoOATradeSide.BUY
+            side = ('long' if position.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
                     else 'short')
             return ExchangePosition(
                 symbol=symbol,
@@ -371,8 +381,8 @@ class _StateMixin(_CTraderBase):
         wire = self._wire
         if wire is None or self._live_account_id is None:
             raise CTraderConnectionError("live connection not established")
-        res = cast(_oa.ProtoOATraderRes, await self._account_request(
-            _oa.ProtoOATraderReq(ctidTraderAccountId=self._live_account_id)
+        res = cast(OpenApiMessages.ProtoOATraderRes, await self._account_request(
+            OpenApiMessages.ProtoOATraderReq(ctidTraderAccountId=self._live_account_id)
         ))
         trader = res.trader
         money_digits = trader.moneyDigits
@@ -388,8 +398,8 @@ class _StateMixin(_CTraderBase):
         through :meth:`_account_request` so a mid-session de-auth on this
         account-scoped read is recovered, not leaked as a raw protocol error.
         """
-        res = cast(_oa.ProtoOAAssetListRes, await self._account_request(
-            _oa.ProtoOAAssetListReq(ctidTraderAccountId=self._live_account_id)
+        res = cast(OpenApiMessages.ProtoOAAssetListRes, await self._account_request(
+            OpenApiMessages.ProtoOAAssetListReq(ctidTraderAccountId=self._live_account_id)
         ))
         for asset in res.asset:
             if asset.assetId == asset_id:
