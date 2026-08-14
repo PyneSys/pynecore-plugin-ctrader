@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pynecore_ctrader import CTrader, CTraderConfig
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
+from pynecore_ctrader.wire import CTraderProtocolError
 
 #: Monthly openings of 2027 — the calendar unit whose length no fixed number of
 #: seconds reproduces.
@@ -219,3 +220,53 @@ def __test_monthly_ask_ticks_bucket_into_the_venue_bars__():
     assert candle.extra_fields is not None
     assert candle.extra_fields['ask_high'] == 1.145
     assert candle.extra_fields['ask_low'] == 1.142
+
+
+class _ThrottledHistoryWire(_HistoryWire):
+    """History wire that rejects the first trendbar reads with a throttle."""
+
+    def __init__(self, opens: list[datetime], *, throttled_requests: int) -> None:
+        super().__init__(opens)
+        self.remaining_throttles = throttled_requests
+
+    async def send_request(self, request):
+        if (isinstance(request, _oa.ProtoOAGetTrendbarsReq)
+                and self.remaining_throttles > 0):
+            self.remaining_throttles -= 1
+            raise CTraderProtocolError(
+                "BLOCKED_PAYLOAD_TYPE", "You are being rate limited",
+            )
+        return await super().send_request(request)
+
+
+def __test_download_outlives_a_drained_history_quota__():
+    """A throttle outliving the tight default retry profile must not kill the
+    download: history reads run on the generous profile, and the waits grow
+    geometrically instead of hammering the venue's per-request pacing hint.
+    (Live incident: a restart burst drained the rolling quota and warmup died
+    with a raw BLOCKED_PAYLOAD_TYPE after five 1 s retries.)"""
+    minute_opens = [
+        datetime.fromtimestamp(1_800_000_000 + 60 * step, timezone.utc)
+        for step in range(3)
+    ]
+    # 8 consecutive throttles: more than the default 5-attempt profile could
+    # survive, well within the history profile's 12.
+    wire = _ThrottledHistoryWire(minute_opens, throttled_requests=8)
+    provider = _provider(wire, "1")
+    delays: list[float] = []
+
+    async def _capture(seconds: float) -> None:
+        delays.append(seconds)
+
+    provider._wait_rate_limit_retry = _capture  # type: ignore[method-assign]
+
+    provider.download_ohlcv(
+        datetime.fromtimestamp(1_800_000_000, timezone.utc).replace(tzinfo=None),
+        datetime.fromtimestamp(1_800_000_180, timezone.utc).replace(tzinfo=None),
+        limit=3,
+    )
+
+    assert [candle.timestamp for candle in provider.saved] == [  # type: ignore[attr-defined]
+        1_800_000_000_000 + 60_000 * step for step in range(3)
+    ]
+    assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 120.0]

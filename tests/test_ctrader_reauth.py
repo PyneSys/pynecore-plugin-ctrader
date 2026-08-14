@@ -250,7 +250,9 @@ def __test_reconcile_persistent_rate_limit_is_bounded__():
 
     assert caught.value.retry_after == 1.0
     assert len(wire.requests) == 5
-    assert broker.retry_delays == [1.0, 1.0, 1.0, 1.0]
+    # Without a venue retryAfter the waits grow geometrically from the
+    # fallback: flat 1 s pacing cannot outlive a drained rolling quota.
+    assert broker.retry_delays == [1.0, 2.0, 4.0, 8.0]
     assert wire.account_auth_calls == 0
     assert wire.refresh_calls == 0
 

@@ -27,6 +27,15 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.store_helpers import (
+    EXTRAS_KEY_BRACKET_OWN_LEG_ID,
+    STATE_CANCEL_PENDING,
+    STATE_CLOSING,
+    STATE_CONFIRMED,
+    STATE_DISPOSITION_UNKNOWN,
+    STATE_SERVER_REF_SEEN,
+    iter_active_bracket_ownerships,
+)
 
 from ._base import _CTraderBase
 from .helpers import money_value, parse_protocol_id, volume_to_units
@@ -46,6 +55,17 @@ _EXEC_TYPE_TO_EVENT = {
     OpenApiModelMessages.ProtoOAExecutionType.ORDER_REJECTED: 'rejected',
     OpenApiModelMessages.ProtoOAExecutionType.ORDER_EXPIRED: 'cancelled',
 }
+
+#: ``orders.state`` values of a real ENTRY dispatch row (as opposed to the
+#: book-keeping markers — bracket ownership, close legs, entry-stop watches —
+#: that carry no exchange order). Used by the venue-close attribution scan.
+_ENTRY_ROW_STATES = frozenset({
+    STATE_CONFIRMED,
+    STATE_CLOSING,
+    STATE_CANCEL_PENDING,
+    STATE_SERVER_REF_SEEN,
+    STATE_DISPOSITION_UNKNOWN,
+})
 
 #: ``qsize`` above which a consumer backlog is warned about (never dropped).
 _BACKLOG_WATERMARK = 1000
@@ -366,6 +386,12 @@ class _EventStreamMixin(_CTraderBase, ABC):
         shared ``positionId`` but only ever populated by our own
         ``execute_close`` / ``close_leg``).
 
+        A close the venue itself fired from the protective bracket armed on the
+        position (server-side SL / TP / trailing) is dispatched by neither side,
+        so it carries no run-unique handle at all; it is attributed from the
+        run's own exposure record instead — see
+        :meth:`_run_owned_position_entry`.
+
         A closing-order fill is reported as the entry's exit; a non-closing
         fill as the entry itself. A fill that maps to neither run-owned handle
         is another run's / external activity and returns ``(None, None, None)``
@@ -396,7 +422,78 @@ class _EventStreamMixin(_CTraderBase, ABC):
                 self._close_dispatch_pine_by_position[order.positionId],
                 LegType.CLOSE,
             )
+        # This run dispatched no close against the position — but the venue can
+        # close it on its OWN initiative through the protective bracket we
+        # armed on it (position-attribute SL / TP / trailing). That fill carries
+        # the venue's close ``orderId`` (never journaled) and no coid of ours,
+        # so both handles above miss and the fill used to be dropped as
+        # external: the engine's book then kept the stale open size for the rest
+        # of the cycle. The bracket is OURS whenever this run still holds the
+        # position, so the exposure record is the attribution proof.
+        if order.closingOrder and order.positionId:
+            owner = self._run_owned_position_entry(order.positionId)
+            if owner is not None:
+                self.store_ctx.log_event(
+                    'venue_close_attributed_to_entry',
+                    exchange_order_id=str(order.orderId) or None,
+                    payload={
+                        'order_id': order.orderId,
+                        'position_id': order.positionId,
+                        'order_type': int(order.orderType),
+                        'from_entry': owner,
+                    },
+                )
+                return None, owner, LegType.CLOSE
         return None, None, None
+
+    def _run_owned_position_entry(self, position_id: int) -> str | None:
+        """Pine entry id of the run-owned exposure a venue close just flattened.
+
+        Two proofs of ownership, both scoped to THIS run instance by
+        ``RunContext`` (``iter_live_orders`` filters on ``run_instance_id``), so
+        neither can adopt another run's book:
+
+        * a live bracket-ownership row (``bo:<intent_key>:<leg_id>``, state
+          ``bracket_own``) whose ``bracket_own_leg_id`` is this ``positionId``
+          — the core one-way emulator wrote it BEFORE amending our exit's
+          bracket onto that leg, so a protective fill on the leg is that exit's;
+        * a live ENTRY row of this run whose ``extras['position_id']`` mirror is
+          this ``positionId`` — the run holds open exposure in the netted
+          position, whose protective levels are the ones this run last amended.
+
+        Deliberately last in :meth:`_resolve_identity`: the run-unique handles
+        (``order_id`` ref, own close dispatch) are tried first, and a
+        ``positionId`` matching NOTHING this run owns still falls through to
+        external activity. A malformed persisted id is skipped rather than
+        raised on — one bad extras blob must not veto the attribution of the
+        remaining rows (or kill the PUSH stream).
+
+        :param position_id: The closing execution's ``positionId``.
+        :return: The owning entry's Pine id, or ``None`` when unowned.
+        """
+        if self.store_ctx is None:
+            return None
+        for row in iter_active_bracket_ownerships(self.store_ctx):
+            leg_id = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
+            if leg_id is None or not row.from_entry:
+                continue
+            try:
+                if parse_protocol_id(leg_id, field='bracket_own_leg_id') == position_id:
+                    return row.from_entry
+            except ValueError:
+                continue
+        for row in self.store_ctx.iter_live_orders():
+            if row.state not in _ENTRY_ROW_STATES or not row.pine_entry_id:
+                continue
+            raw = (row.extras or {}).get('position_id')
+            if raw is None:
+                continue
+            try:
+                if parse_protocol_id(raw, field='position_id') == position_id:
+                    return row.pine_entry_id
+            except ValueError:
+                continue
+        return None
 
     def _recover_parked_entry_by_coid(self, order) -> str | None:
         """Reverse-map a parked entry fill the order/position ref index missed.

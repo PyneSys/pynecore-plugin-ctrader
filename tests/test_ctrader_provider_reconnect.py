@@ -295,8 +295,13 @@ def __test_symbol_info_retries_blocked_payload_on_same_session__():
 
 
 def __test_symbol_info_persistent_payload_throttle_remains_bounded__():
-    """A persistent throttle exhausts the bounded startup retry budget."""
-    wire = _SymbolInfoWire(blocked_requests=10)
+    """A persistent throttle exhausts the bounded startup retry budget.
+
+    Startup metadata reads run on the generous history profile (12 attempts)
+    so a drained rolling quota is sat out instead of killing the run — but the
+    bound must still exist: a venue that never unblocks propagates the error.
+    """
+    wire = _SymbolInfoWire(blocked_requests=20)
     provider = _SymbolInfoProvider(wire)
 
     try:
@@ -306,7 +311,7 @@ def __test_symbol_info_persistent_payload_throttle_remains_bounded__():
     else:
         raise AssertionError("persistent rate limit did not propagate")
 
-    assert wire.symbol_list_requests == 5
+    assert wire.symbol_list_requests == 12
 
 
 def __test_trendbar_history_retries_blocked_payload_on_same_session__():

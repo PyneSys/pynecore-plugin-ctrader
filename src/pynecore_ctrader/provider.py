@@ -34,7 +34,11 @@ from pynecore.lib.timeframe import in_seconds
 from pynecore.types.ohlcv import OHLCV
 
 from . import auth
-from ._base import _CTraderBase
+from ._base import (
+    _CTraderBase,
+    _RATE_LIMIT_HISTORY_ATTEMPTS,
+    _RATE_LIMIT_HISTORY_BUDGET_SECONDS,
+)
 from .config import CTraderConfig
 from .exceptions import is_rate_limited
 from .helpers import VOLUME_SCALE
@@ -241,6 +245,8 @@ class _ProviderMixin(_CTraderBase, ABC):
             else self._retry_rate_limited(
                 lambda: wire.send_request(req),
                 context="light-symbol read",
+                attempts=_RATE_LIMIT_HISTORY_ATTEMPTS,
+                budget_seconds=_RATE_LIMIT_HISTORY_BUDGET_SECONDS,
             )
         )
         response = cast(ProtoOASymbolsListRes, response)
@@ -282,6 +288,8 @@ class _ProviderMixin(_CTraderBase, ABC):
                 await self._retry_rate_limited(
                     lambda: wire.send_request(assets_request),
                     context="asset metadata read",
+                    attempts=_RATE_LIMIT_HISTORY_ATTEMPTS,
+                    budget_seconds=_RATE_LIMIT_HISTORY_BUDGET_SECONDS,
                 ),
             )
             asset_names = {a.assetId: a.name for a in assets_res.asset}
@@ -295,6 +303,8 @@ class _ProviderMixin(_CTraderBase, ABC):
                 await self._retry_rate_limited(
                     lambda: wire.send_request(detail_request),
                     context="symbol detail read",
+                    attempts=_RATE_LIMIT_HISTORY_ATTEMPTS,
+                    budget_seconds=_RATE_LIMIT_HISTORY_BUDGET_SECONDS,
                 ),
             )
             if not detail_res.symbol:
@@ -575,6 +585,8 @@ class _ProviderMixin(_CTraderBase, ABC):
                 await self._retry_rate_limited(
                     lambda: wire.send_request(request),
                     context="trendbar history read",
+                    attempts=_RATE_LIMIT_HISTORY_ATTEMPTS,
+                    budget_seconds=_RATE_LIMIT_HISTORY_BUDGET_SECONDS,
                 ),
             )
             oldest = upper
@@ -644,6 +656,8 @@ class _ProviderMixin(_CTraderBase, ABC):
                 await self._retry_rate_limited(
                     lambda: wire.send_request(request),
                     context="ask-tick history read",
+                    attempts=_RATE_LIMIT_HISTORY_ATTEMPTS,
+                    budget_seconds=_RATE_LIMIT_HISTORY_BUDGET_SECONDS,
                 ),
             )
             ticks = self._decode_ticks(response.tickData)
@@ -1082,7 +1096,7 @@ class _ProviderMixin(_CTraderBase, ABC):
             account_id: int,
             timeframe: str,
             *,
-            anchor_timestamp: int,
+            cursor: int,
             query_ceiling: int,
     ) -> _LiveHistoryCollection:
         """Collect sorted closed trendbars inside an explicit live-gap window.
@@ -1094,7 +1108,10 @@ class _ProviderMixin(_CTraderBase, ABC):
         :param wire: Frozen wire used for every request in this collection.
         :param account_id: Frozen live account identity.
         :param timeframe: Timeframe in TradingView format.
-        :param anchor_timestamp: Last accepted closed bar opening in milliseconds.
+        :param cursor: Opening of the first bar the window must recover. Every
+            caller knows it directly — the bar after its accepted anchor, or,
+            when nothing has been accepted yet, the bar that was forming when
+            the stream died.
         :param query_ceiling: Exclusive upper opening bound in milliseconds.
         :return: Sorted closed bars plus terminal request evidence.
         :raises CTraderConnectionError: If the frozen wire disconnects.
@@ -1102,15 +1119,6 @@ class _ProviderMixin(_CTraderBase, ABC):
         exchange_period = self.to_exchange_timeframe(timeframe)
         calendar_period = exchange_period == 'MN1'
         period_ms = max(1, int(in_seconds(timeframe))) * 1000
-        if calendar_period:
-            month_cursor = self._next_month_opening(anchor_timestamp)
-            if month_cursor is None:
-                return _LiveHistoryCollection(
-                    (), None, monotonic_time.monotonic_ns(), False
-                )
-            cursor = month_cursor
-        else:
-            cursor = anchor_timestamp + period_ms
         response_received_ns = monotonic_time.monotonic_ns()
         if cursor >= query_ceiling:
             return _LiveHistoryCollection((), None, response_received_ns, True)
@@ -1133,7 +1141,7 @@ class _ProviderMixin(_CTraderBase, ABC):
         def settled() -> bool:
             """Whether every expected slot is recovered or calendar-closed."""
             if calendar_period:
-                expected_timestamp = self._next_month_opening(anchor_timestamp)
+                expected_timestamp = cursor
                 while (
                         expected_timestamp is not None
                         and expected_timestamp < query_ceiling
@@ -1238,39 +1246,53 @@ class _ProviderMixin(_CTraderBase, ABC):
         closed once a newer opening exists (the same rule the live path uses in
         :meth:`_ingest_live_bar`), or once no month can still be forming.
 
+        Before the stream has delivered its first closed bar there is no
+        anchor at all, and returning here would silently drop the whole
+        outage window: nothing else fetches those bars. ``_live_gap_cursor_ts``
+        carries the opening the run is missing from in exactly that case —
+        the bar that was forming when the link died, or the one after the
+        startup-gap query's newest bar.
+
         :param symbol: The cTrader symbol name.
         :param timeframe: Timeframe in TradingView format.
         :raises CTraderConnectionError: If the live connection is not open.
         """
         anchor = self._last_live_closed_bar
-        if anchor is None:
+        if anchor is None and self._live_gap_cursor_ts is None:
             return
         wire = self._wire
         account_id = self._live_account_id
         if wire is None or account_id is None:
             raise CTraderConnectionError('live connection not established')
 
-        anchor_ts = int(anchor.timestamp)
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         exchange_period = self.to_exchange_timeframe(timeframe)
         calendar_period = exchange_period == 'MN1'
         period_ms = max(1, int(in_seconds(timeframe))) * 1000
+        if anchor is None:
+            cursor = self._live_gap_cursor_ts
+        else:
+            anchor_ts = int(anchor.timestamp)
+            cursor = (
+                self._next_month_opening(anchor_ts)
+                if calendar_period
+                else anchor_ts + period_ms
+            )
+        if cursor is None:
+            return
+        # The grid phase comes from the cursor itself — it is a venue-produced
+        # opening, one whole period past the accepted anchor.
         if calendar_period:
             query_ceiling = now_ms
         else:
-            query_ceiling = anchor_ts + (now_ms - anchor_ts) // period_ms * period_ms
-        cursor = (
-            self._next_month_opening(anchor_ts)
-            if calendar_period
-            else anchor_ts + period_ms
-        )
-        if cursor is None or cursor >= query_ceiling:
+            query_ceiling = cursor + (now_ms - cursor) // period_ms * period_ms
+        if cursor >= query_ceiling:
             return
         collection = await self._collect_live_gap_history(
             wire,
             account_id,
             timeframe,
-            anchor_timestamp=anchor_ts,
+            cursor=cursor,
             query_ceiling=query_ceiling,
         )
         if not collection.complete:
@@ -1325,13 +1347,18 @@ class _ProviderMixin(_CTraderBase, ABC):
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         if exchange_period == 'MN1':
             query_ceiling = now_ms
+            cursor = self._next_month_opening(since_ms)
         else:
             query_ceiling = since_ms + (now_ms - since_ms) // period_ms * period_ms
+            cursor = since_ms + period_ms
+        if cursor is None:
+            logger.warning('Startup gap collection skipped: invalid monthly timezone')
+            return []
         collection = await self._collect_live_gap_history(
             wire,
             account_id,
             timeframe,
-            anchor_timestamp=since_ms,
+            cursor=cursor,
             query_ceiling=query_ceiling,
         )
         if not collection.complete:
@@ -1342,6 +1369,16 @@ class _ProviderMixin(_CTraderBase, ABC):
                 collection.failure or 'history coverage incomplete',
             )
             return []
+        # The framework splices these bars in ahead of the first live one, so
+        # after this call the run holds everything up to the newest of them.
+        # A drop before the stream closes its own first bar has no accepted
+        # anchor to resume from; this is what it falls back to.
+        newest_held = collection.bars[-1].timestamp if collection.bars else since_ms
+        self._live_gap_cursor_ts = (
+            self._next_month_opening(newest_held)
+            if exchange_period == 'MN1'
+            else newest_held + period_ms
+        )
         return list(collection.bars)
 
     async def _repair_connected_gap(
@@ -1394,7 +1431,7 @@ class _ProviderMixin(_CTraderBase, ABC):
                 wire,
                 account_id,
                 timeframe,
-                anchor_timestamp=anchor_timestamp,
+                cursor=requested_from_timestamp,
                 query_ceiling=candidate_timestamp,
             )
         except asyncio.CancelledError:
@@ -1626,6 +1663,15 @@ class _ProviderMixin(_CTraderBase, ABC):
             return False
         if self._current_bar_ts is not None and candle.timestamp < self._current_bar_ts:
             return False
+        if self._live_gap_cursor_ts is None:
+            # First opening this run ever saw on the stream: the warmup
+            # history (plus the startup-gap query) covers everything before
+            # it, so it is where a reconnect backfill must resume from until
+            # a closed bar is actually delivered. Only ever set once —
+            # a later opening would step over bars that never reached the
+            # runner, and the accepted anchor takes over from the first
+            # delivery onwards anyway.
+            self._live_gap_cursor_ts = candle.timestamp
         if self._current_bar_ts is not None and candle.timestamp > self._current_bar_ts:
             if self._current_bar is not None:
                 self._pending_bars.append(

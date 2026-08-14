@@ -89,6 +89,20 @@ _REAUTH_TIMEOUT = 20.0
 _RATE_LIMIT_REQUEST_ATTEMPTS = 5
 _RATE_LIMIT_RETRY_BUDGET_SECONDS = 120.0
 _RATE_LIMIT_FALLBACK_SECONDS = 1.0
+#: The venue's ``retryAfter`` hint describes the per-second request pacing, not
+#: the rolling history quota: when that quota is empty, obeying the small hint
+#: verbatim burns every attempt within seconds and the raise kills the run
+#: (observed live: a restart burst drained the quota and warmup died with a raw
+#: BLOCKED_PAYLOAD_TYPE). Retries therefore also grow geometrically from the
+#: fallback, capped per wait; the venue's own hint still wins when larger.
+_RATE_LIMIT_BACKOFF_CAP_SECONDS = 120.0
+#: Blocking startup reads (symbol metadata and the warmup history download) may
+#: legitimately have to sit out a drained rolling quota; a bot that dies there
+#: cannot recover on its own, while one that waits minutes can. Live-path reads
+#: keep the tight default profile so a throttled periodic pass fails fast and
+#: is skipped instead of stalling its loop.
+_RATE_LIMIT_HISTORY_ATTEMPTS = 12
+_RATE_LIMIT_HISTORY_BUDGET_SECONDS = 900.0
 
 
 class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
@@ -174,6 +188,13 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         # accumulators this survives reconnect so the provider can query the
         # venue for closed trendbars missed while the socket was down.
         self._last_live_closed_bar: OHLCV | None = None
+        # Opening of the first bar a reconnect backfill must recover while no
+        # closed bar has been delivered yet — everything before it came from
+        # the warmup history / the startup-gap query. Survives reconnect for
+        # the same reason ``_last_live_closed_bar`` does; without it an outage
+        # that starts before the stream's first close has nothing to resume
+        # from and its bars are lost.
+        self._live_gap_cursor_ts: int | None = None
         # Latest spot ``bid`` of the bar in progress. The live trendbar's close
         # lags the spot stream (it is not refreshed on every tick), so the spot
         # bid is the authoritative close. Reset on each rollover.
@@ -308,40 +329,48 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         call: Callable[[], Coroutine[Any, Any, _ResultT]],
         *,
         context: str,
+        attempts: int = _RATE_LIMIT_REQUEST_ATTEMPTS,
+        budget_seconds: float = _RATE_LIMIT_RETRY_BUDGET_SECONDS,
     ) -> _ResultT:
         """Retry one idempotent request after a definitive payload throttle.
 
         Retries stay on the same wire and preserve the authenticated session.
-        The venue-provided ``retryAfter`` interval is preferred; a short fallback
-        is used for older errors that omit it. Both the attempt count and total
-        timer budget are bounded.
+        Each wait is the larger of the venue-provided ``retryAfter`` and a
+        geometric backoff grown from the fallback (capped per wait), so a
+        drained rolling quota is sat out instead of being hammered with the
+        venue's per-request pacing hint. Both the attempt count and total timer
+        budget are bounded.
 
         :param call: Coroutine factory that re-sends the same safe request.
         :param context: Diagnostic name for the request group.
+        :param attempts: Bound on the number of attempts.
+        :param budget_seconds: Bound on the total time spent waiting.
         :return: The successful response.
         """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _RATE_LIMIT_RETRY_BUDGET_SECONDS
-        for attempt in range(_RATE_LIMIT_REQUEST_ATTEMPTS):
+        deadline = loop.time() + budget_seconds
+        for attempt in range(attempts):
             try:
                 return await call()
             except CTraderProtocolError as exc:
                 if not is_rate_limited(exc.error_code):
                     raise
-                delay = (
-                    _RATE_LIMIT_FALLBACK_SECONDS
-                    if exc.retry_after is None
+                backoff = min(
+                    _RATE_LIMIT_FALLBACK_SECONDS * 2.0 ** attempt,
+                    _RATE_LIMIT_BACKOFF_CAP_SECONDS,
+                )
+                venue_hint = (
+                    0.0 if exc.retry_after is None
                     else max(0.0, exc.retry_after)
                 )
+                delay = max(backoff, venue_hint)
                 remaining = deadline - loop.time()
-                if (
-                    attempt + 1 >= _RATE_LIMIT_REQUEST_ATTEMPTS
-                    or delay > remaining
-                ):
+                if attempt + 1 >= attempts or delay > remaining:
                     raise
                 logger.warning(
-                    "cTrader %s was rate-limited; retrying on the same session",
-                    context,
+                    "cTrader %s was rate-limited; retrying on the same session "
+                    "in %.0fs",
+                    context, delay,
                 )
                 await self._wait_rate_limit_retry(delay)
         raise AssertionError("rate-limit retry loop did not terminate")

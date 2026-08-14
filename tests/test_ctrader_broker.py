@@ -27,6 +27,7 @@ from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    create_bracket_ownership_row,
     create_entry_order_row,
     mark_disposition_unknown,
 )
@@ -694,6 +695,114 @@ def __test_translate_foreign_run_close_fill_on_shared_position_dropped__(tmp_pat
     assert out is None
     # This run's own entry row is untouched by the foreign close.
     assert broker.store_ctx.get_order('c1') is not None
+
+
+def _seed_owned_entry(broker, *, coid='c1', pine_id='L', position_id=54302872,
+                      order_id='70211174'):
+    """Seed a filled entry row of this run holding ``position_id``."""
+    create_entry_order_row(
+        broker.store_ctx, coid=coid, symbol='EURUSD', side='buy', qty=10.0,
+        intent_key=pine_id, pine_entry_id=pine_id,
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    broker.store_ctx.upsert_order(
+        coid, state='confirmed', filled_qty=10.0,
+        exchange_order_id=str(position_id),
+        extras={'kind': 'position', 'order_type': 'market',
+                'order_id': order_id, 'position_id': position_id},
+    )
+    broker.store_ctx.add_ref(coid, 'order_id', order_id)
+
+
+def _venue_bracket_close_event(*, position_id, order_id=70215164):
+    """A filled closing execution fired by the venue's own SL/TP bracket."""
+    order = _make_order(order_id=order_id, executed=1000,
+                        position_id=position_id, closing=True,
+                        order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    deal = _model.ProtoOADeal(dealId=60775467, filledVolume=1000,
+                             executionPrice=1.1)
+    return _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+                       deal=deal)
+
+
+def _ignored_external(broker) -> list:
+    return list(broker.store_ctx.iter_events_by_kind_since(
+        'external_activity_ignored', 0))
+
+
+def __test_venue_bracket_close_attributes_to_owning_entry__(tmp_path):
+    """The venue's own SL/TP fill on a run-owned position is NOT external.
+
+    Neither run-unique handle matches: the closing order's ``orderId`` is the
+    venue's (never journaled) and this run dispatched no close, so the fill used
+    to be dropped as external activity while the engine's book kept the stale
+    open size for the rest of the cycle. The live bracket-ownership row (and the
+    entry row's own ``position_id`` mirror) proves the protection that fired is
+    ours, so the fill must surface as that entry's CLOSE leg.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    create_bracket_ownership_row(
+        broker.store_ctx, coid='bo:L\0L:54302872', symbol='EURUSD',
+        side='sell', qty=10.0, intent_key='L\0L', pine_entry_id='exitL',
+        from_entry='L', leg_id='54302872', attach_coid='attach-1',
+        tp_price=None, sl_price=1.05, trail_price=None, trail_offset=None,
+    )
+
+    out = broker._translate_exec_event(
+        _venue_bracket_close_event(position_id=54302872))
+
+    assert out is not None
+    assert out.event_type == 'filled'
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry == 'L'
+    assert out.pine_id is None
+    assert out.fill_qty == 10.0
+    assert _ignored_external(broker) == []
+
+
+def __test_venue_bracket_close_attributes_via_entry_position_mirror__(tmp_path):
+    """A NETTING account has no ownership row — the entry mirror attributes it.
+
+    cTrader protective levels are position attributes, so a netting run never
+    writes a per-leg ownership row (those come from the core one-way emulator on
+    a hedging account). The live entry row's ``extras['position_id']`` is then
+    the run's exposure proof.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+
+    out = broker._translate_exec_event(
+        _venue_bracket_close_event(position_id=54302872))
+
+    assert out is not None
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry == 'L'
+    assert _ignored_external(broker) == []
+
+
+def __test_venue_close_on_unowned_position_stays_external__(tmp_path):
+    """A closing fill on a position this run does not own is still external.
+
+    Same shape as the attributed case, but the ``positionId`` matches neither an
+    ownership row nor any live entry row of this run (a manual trade or another
+    bot on the account). Attributing it would corrupt this strategy's position,
+    so it must be dropped and audited.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+
+    out = broker._translate_exec_event(
+        _venue_bracket_close_event(position_id=99999999))
+
+    assert out is None
+    ignored = _ignored_external(broker)
+    assert len(ignored) == 1
+    assert ignored[0]['position_id'] == 99999999
 
 
 def __test_watch_orders_survives_translation_failure__():
