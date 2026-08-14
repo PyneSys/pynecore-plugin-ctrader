@@ -1298,6 +1298,52 @@ class _ProviderMixin(_CTraderBase, ABC):
                 collection.bars[-1].timestamp,
             )
 
+    async def backfill_closed_bars(
+            self, symbol: str, timeframe: str, since_ms: int,
+    ) -> list[OHLCV]:
+        """Fetch trendbars that closed between the warmup history and the stream.
+
+        cTrader's handshake is the slowest of the supported venues (application
+        auth, account auth, symbol resolution, subscription), so an M1 bar can
+        easily close before the subscription is live. The window is collected
+        with the same paged reader the reconnect path uses; a partial collection
+        is discarded rather than committed, because committing one page would
+        silently skip the slots the other pages would have carried.
+
+        :param symbol: The cTrader symbol name (unused; the live subscription
+            already fixes the instrument).
+        :param timeframe: Timeframe in TradingView format.
+        :param since_ms: Opening of the last bar the framework already holds.
+        :return: Sorted closed bars strictly after ``since_ms``, possibly empty.
+        """
+        wire = self._wire
+        account_id = self._live_account_id
+        if wire is None or account_id is None:
+            return []
+        exchange_period = self.to_exchange_timeframe(timeframe)
+        period_ms = max(1, int(in_seconds(timeframe))) * 1000
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if exchange_period == 'MN1':
+            query_ceiling = now_ms
+        else:
+            query_ceiling = since_ms + (now_ms - since_ms) // period_ms * period_ms
+        collection = await self._collect_live_gap_history(
+            wire,
+            account_id,
+            timeframe,
+            anchor_timestamp=since_ms,
+            query_ceiling=query_ceiling,
+        )
+        if not collection.complete:
+            logger.warning(
+                'Startup gap collection incomplete for %s (%d bar(s) seen): %s',
+                timeframe,
+                len(collection.bars),
+                collection.failure or 'history coverage incomplete',
+            )
+            return []
+        return list(collection.bars)
+
     async def _repair_connected_gap(
             self,
             symbol: str,
