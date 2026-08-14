@@ -97,11 +97,18 @@ class CTraderProtocolError(CTraderWireError):
 
     :ivar error_code: The ``errorCode`` string from the error response.
     :ivar description: The optional human-readable description.
+    :ivar retry_after: Venue-provided seconds until a blocked payload unlocks.
     """
 
-    def __init__(self, error_code: str, description: str = "") -> None:
+    def __init__(
+        self,
+        error_code: str,
+        description: str = "",
+        retry_after: float | None = None,
+    ) -> None:
         self.error_code = error_code
         self.description = description
+        self.retry_after = retry_after
         super().__init__(f"{error_code}: {description}" if description else error_code)
 
     @property
@@ -164,7 +171,17 @@ def _raise_on_error(message: Message) -> None:
     :param message: A decoded response message.
     """
     if isinstance(message, (OpenApiCommonMessages.ProtoErrorRes, OpenApiMessages.ProtoOAErrorRes)):
-        raise CTraderProtocolError(message.errorCode, message.description)
+        retry_after = None
+        if (
+            isinstance(message, OpenApiMessages.ProtoOAErrorRes)
+            and message.HasField("retryAfter")
+        ):
+            retry_after = float(message.retryAfter)
+        raise CTraderProtocolError(
+            message.errorCode,
+            message.description,
+            retry_after=retry_after,
+        )
 
 
 class WireClient:
@@ -335,7 +352,15 @@ class WireClient:
             ) from None
         finally:
             self._pending.pop(client_msg_id, None)
-        _raise_on_error(result)
+        try:
+            _raise_on_error(result)
+        except CTraderProtocolError as exc:
+            if exc.error_code == "BLOCKED_PAYLOAD_TYPE":
+                logger.warning(
+                    "cTrader request %s was rate-limited",
+                    type(message).__name__,
+                )
+            raise
         return result
 
     @staticmethod

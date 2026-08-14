@@ -973,6 +973,8 @@ def __test_map_error_code_rate_limit__():
     from pynecore.core.broker.exceptions import ExchangeRateLimitError
     assert isinstance(map_error_code('REQUEST_FREQUENCY_EXCEEDED'),
                       ExchangeRateLimitError)
+    assert isinstance(map_error_code('BLOCKED_PAYLOAD_TYPE'),
+                      ExchangeRateLimitError)
 
 
 def __test_map_error_code_generic_reject__():

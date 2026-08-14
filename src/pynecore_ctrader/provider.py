@@ -235,7 +235,14 @@ class _ProviderMixin(_CTraderBase, ABC):
             paths leave it ``False`` (they run on a private, just-authed wire).
         """
         req = ProtoOASymbolsListReq(ctidTraderAccountId=account_id)
-        response = await (self._account_request(req) if recover else wire.send_request(req))
+        response = await (
+            self._account_request(req)
+            if recover
+            else self._retry_rate_limited(
+                lambda: wire.send_request(req),
+                context="light-symbol read",
+            )
+        )
         response = cast(ProtoOASymbolsListRes, response)
         symbols = list(response.symbol)
         self._symbols_by_name = {s.symbolName: s.symbolId for s in symbols}
@@ -258,28 +265,46 @@ class _ProviderMixin(_CTraderBase, ABC):
 
         async def work(wire, account_id: int) -> SymInfo:
             light = await self._fetch_light_symbols(wire, account_id)
-            match = next((s for s in light if s.symbolName == self.symbol), None)
+            match = next(
+                (s for s in light if s.symbolName == self.symbol), None
+            )
             if match is None:
                 raise auth.CTraderAuthError(
-                    "SYMBOL_NOT_FOUND", f"symbol '{self.symbol}' not on this account"
+                    "SYMBOL_NOT_FOUND",
+                    f"symbol '{self.symbol}' not on this account",
                 )
 
-            assets_res = cast(ProtoOAAssetListRes, await wire.send_request(
-                ProtoOAAssetListReq(ctidTraderAccountId=account_id)
-            ))
+            assets_request = ProtoOAAssetListReq(
+                ctidTraderAccountId=account_id,
+            )
+            assets_res = cast(
+                ProtoOAAssetListRes,
+                await self._retry_rate_limited(
+                    lambda: wire.send_request(assets_request),
+                    context="asset metadata read",
+                ),
+            )
             asset_names = {a.assetId: a.name for a in assets_res.asset}
 
-            detail_res = cast(ProtoOASymbolByIdRes, await wire.send_request(
-                ProtoOASymbolByIdReq(
-                    ctidTraderAccountId=account_id, symbolId=[match.symbolId]
-                )
-            ))
+            detail_request = ProtoOASymbolByIdReq(
+                ctidTraderAccountId=account_id,
+                symbolId=[match.symbolId],
+            )
+            detail_res = cast(
+                ProtoOASymbolByIdRes,
+                await self._retry_rate_limited(
+                    lambda: wire.send_request(detail_request),
+                    context="symbol detail read",
+                ),
+            )
             if not detail_res.symbol:
                 raise auth.CTraderAuthError(
-                    "SYMBOL_NOT_FOUND", f"no detail for symbol '{self.symbol}'"
+                    "SYMBOL_NOT_FOUND",
+                    f"no detail for symbol '{self.symbol}'",
                 )
-            detail = detail_res.symbol[0]
-            return self._build_sym_info(match, detail, asset_names)
+            return self._build_sym_info(
+                match, detail_res.symbol[0], asset_names
+            )
 
         syminfo = self._run(self._authed_session(work))
         self.syminfo = syminfo
@@ -514,9 +539,8 @@ class _ProviderMixin(_CTraderBase, ABC):
 
         self._run(self._authed_session(work))
 
-    @staticmethod
     async def _fetch_trendbar_window(
-            wire, account_id: int, symbol_id: int, period: str,
+            self, wire, account_id: int, symbol_id: int, period: str,
             from_ms: int, to_ms: int,
     ) -> tuple[dict[int, ProtoOATrendbar], bool]:
         """Read the trendbars the venue holds in ``[from_ms, to_ms]``.
@@ -539,12 +563,20 @@ class _ProviderMixin(_CTraderBase, ABC):
         upper = to_ms
         narrowed = False
         while upper > from_ms:
-            response = cast(ProtoOAGetTrendbarsRes, await wire.send_request(
-                ProtoOAGetTrendbarsReq(
-                    ctidTraderAccountId=account_id, symbolId=symbol_id,
-                    period=period, fromTimestamp=from_ms, toTimestamp=upper,
-                )
-            ))
+            request = ProtoOAGetTrendbarsReq(
+                ctidTraderAccountId=account_id,
+                symbolId=symbol_id,
+                period=period,
+                fromTimestamp=from_ms,
+                toTimestamp=upper,
+            )
+            response = cast(
+                ProtoOAGetTrendbarsRes,
+                await self._retry_rate_limited(
+                    lambda: wire.send_request(request),
+                    context="trendbar history read",
+                ),
+            )
             oldest = upper
             added = False
             for bar in response.trendbar:
@@ -600,13 +632,20 @@ class _ProviderMixin(_CTraderBase, ABC):
         buckets: dict[int, list[float]] = {}
         upper = to_ms
         while upper > from_ms:
-            response = cast(ProtoOAGetTickDataRes, await wire.send_request(
-                ProtoOAGetTickDataReq(
-                    ctidTraderAccountId=account_id, symbolId=symbol_id,
-                    type=ProtoOAQuoteType.ASK,
-                    fromTimestamp=from_ms, toTimestamp=upper,
-                )
-            ))
+            request = ProtoOAGetTickDataReq(
+                ctidTraderAccountId=account_id,
+                symbolId=symbol_id,
+                type=ProtoOAQuoteType.ASK,
+                fromTimestamp=from_ms,
+                toTimestamp=upper,
+            )
+            response = cast(
+                ProtoOAGetTickDataRes,
+                await self._retry_rate_limited(
+                    lambda: wire.send_request(request),
+                    context="ask-tick history read",
+                ),
+            )
             ticks = self._decode_ticks(response.tickData)
             if not ticks:
                 break
@@ -740,6 +779,7 @@ class _ProviderMixin(_CTraderBase, ABC):
         self._connection_generation_for_wire(wire)
         symbol_id = await self._resolve_symbol_id(wire, self._live_account_id)
         period = self.to_exchange_timeframe(timeframe)
+        send_request = wire.send_request
         statuses: list[SubscribeStatus] = []
         for request in (
                 ProtoOASubscribeSpotsReq(
@@ -751,7 +791,10 @@ class _ProviderMixin(_CTraderBase, ABC):
                 ),
         ):
             try:
-                await wire.send_request(request)
+                await self._retry_rate_limited(
+                    lambda: send_request(request),
+                    context=type(request).__name__,
+                )
             except CTraderProtocolError as exc:
                 if exc.error_code != 'ALREADY_SUBSCRIBED':
                     raise
@@ -790,15 +833,15 @@ class _ProviderMixin(_CTraderBase, ABC):
         if getattr(self, '_live_generation_wire', None) is not wire:
             self._live_generation_wire = wire
             self._live_connection_generation = (
-                getattr(self, '_live_connection_generation', 0) + 1
+                    getattr(self, '_live_connection_generation', 0) + 1
             )
             self._live_wire_identity = getattr(self, '_live_wire_identity', 0) + 1
         return self._live_connection_generation
 
     def _observe_connected_gap_repair(
-        self,
-        event: str,
-        payload: dict[str, object],
+            self,
+            event: str,
+            payload: dict[str, object],
     ) -> None:
         """Observe a connected-stream history repair without changing behavior.
 
@@ -810,8 +853,8 @@ class _ProviderMixin(_CTraderBase, ABC):
         """
 
     @staticmethod
-    async def _wait_live_history_retry(seconds: float) -> None:
-        """Wait for one bounded retry timer without polling or a sleep task."""
+    async def _wait_provider_retry(seconds: float) -> None:
+        """Wait for one bounded provider retry timer without polling or sleep."""
         loop = asyncio.get_running_loop()
         elapsed = loop.create_future()
 
@@ -827,8 +870,8 @@ class _ProviderMixin(_CTraderBase, ABC):
 
     @staticmethod
     def _history_opening_hours_for_date(
-        syminfo: SymInfo,
-        local_date: date,
+            syminfo: SymInfo,
+            local_date: date,
     ) -> tuple[list[SymInfoInterval], bool]:
         """Resolve one date plus the prior date's possible overnight sessions."""
         previous_date = local_date - timedelta(days=1)
@@ -854,9 +897,9 @@ class _ProviderMixin(_CTraderBase, ABC):
 
     @staticmethod
     def _local_boundary_timestamps(
-        local_date: date,
-        local_time: time,
-        zone: ZoneInfo,
+            local_date: date,
+            local_time: time,
+            zone: ZoneInfo,
     ) -> tuple[int, ...]:
         """Return all valid absolute timestamps for one local wall boundary."""
         timestamps: set[int] = set()
@@ -867,21 +910,21 @@ class _ProviderMixin(_CTraderBase, ABC):
             timestamp_ms = int(local.timestamp() * 1000)
             round_trip = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=zone)
             if (
-                round_trip.date() == local_date
-                and round_trip.time().replace(tzinfo=None) == local_time
-                and round_trip.fold == fold
+                    round_trip.date() == local_date
+                    and round_trip.time().replace(tzinfo=None) == local_time
+                    and round_trip.fold == fold
             ):
                 timestamps.add(timestamp_ms)
         return tuple(sorted(timestamps))
 
     @classmethod
     def _history_segment_overlaps_sessions(
-        cls,
-        segment_start_ms: int,
-        segment_end_ms: int,
-        local_date: date,
-        opening_hours: list[SymInfoInterval],
-        zone: ZoneInfo,
+            cls,
+            segment_start_ms: int,
+            segment_end_ms: int,
+            local_date: date,
+            opening_hours: list[SymInfoInterval],
+            zone: ZoneInfo,
     ) -> bool | None:
         """Intersect one absolute segment with all relevant local sessions."""
         weekday = local_date.weekday()
@@ -915,19 +958,19 @@ class _ProviderMixin(_CTraderBase, ABC):
                 boundaries_known = False
                 continue
             if any(
-                end_ms > start_ms
-                and segment_end_ms > start_ms
-                and segment_start_ms < end_ms
-                for start_ms in starts
-                for end_ms in ends
+                    end_ms > start_ms
+                    and segment_end_ms > start_ms
+                    and segment_start_ms < end_ms
+                    for start_ms in starts
+                    for end_ms in ends
             ):
                 return True
         return False if boundaries_known else None
 
     def _history_interval_is_open(
-        self,
-        timestamp_ms: int,
-        next_timestamp_ms: int,
+            self,
+            timestamp_ms: int,
+            next_timestamp_ms: int,
     ) -> bool | None:
         """Classify a complete history interval across every local date it spans."""
         syminfo = self.syminfo
@@ -1010,9 +1053,9 @@ class _ProviderMixin(_CTraderBase, ABC):
         return int(next_open.timestamp() * 1000)
 
     def _history_month_is_open(
-        self,
-        timestamp_ms: int,
-        next_timestamp_ms: int,
+            self,
+            timestamp_ms: int,
+            next_timestamp_ms: int,
     ) -> bool | None:
         """Classify whether any venue session overlaps one calendar-month slot."""
         return self._history_interval_is_open(timestamp_ms, next_timestamp_ms)
@@ -1034,13 +1077,13 @@ class _ProviderMixin(_CTraderBase, ABC):
         return True
 
     async def _collect_live_gap_history(
-        self,
-        wire: WireClient,
-        account_id: int,
-        timeframe: str,
-        *,
-        anchor_timestamp: int,
-        query_ceiling: int,
+            self,
+            wire: WireClient,
+            account_id: int,
+            timeframe: str,
+            *,
+            anchor_timestamp: int,
+            query_ceiling: int,
     ) -> _LiveHistoryCollection:
         """Collect sorted closed trendbars inside an explicit live-gap window.
 
@@ -1092,8 +1135,8 @@ class _ProviderMixin(_CTraderBase, ABC):
             if calendar_period:
                 expected_timestamp = self._next_month_opening(anchor_timestamp)
                 while (
-                    expected_timestamp is not None
-                    and expected_timestamp < query_ceiling
+                        expected_timestamp is not None
+                        and expected_timestamp < query_ceiling
                 ):
                     following_timestamp = self._next_month_opening(
                         expected_timestamp
@@ -1104,8 +1147,8 @@ class _ProviderMixin(_CTraderBase, ABC):
                         if query_ceiling < following_timestamp:
                             return False
                         if self._history_month_is_open(
-                            expected_timestamp,
-                            following_timestamp,
+                                expected_timestamp,
+                                following_timestamp,
                         ) is not False:
                             return False
                     expected_timestamp = following_timestamp
@@ -1151,10 +1194,10 @@ class _ProviderMixin(_CTraderBase, ABC):
                 if not self._history_failure_is_transient(exc):
                     break
             if (
-                coverage_complete and settled()
+                    coverage_complete and settled()
             ) or attempt + 1 == self._live_history_settle_attempts:
                 break
-            await self._wait_live_history_retry(
+            await self._wait_provider_retry(
                 self._live_history_settle_delay_seconds
             )
 
@@ -1256,10 +1299,10 @@ class _ProviderMixin(_CTraderBase, ABC):
             )
 
     async def _repair_connected_gap(
-        self,
-        symbol: str,
-        timeframe: str,
-        candidate: OHLCV,
+            self,
+            symbol: str,
+            timeframe: str,
+            candidate: OHLCV,
     ) -> None:
         """Insert exact history bars before one frozen stream candidate."""
         anchor = self._last_live_closed_bar
@@ -1338,13 +1381,13 @@ class _ProviderMixin(_CTraderBase, ABC):
             int(current_anchor.timestamp) if current_anchor is not None else None
         )
         state_changed = (
-            self._wire is not wire
-            or self._live_subscription != subscription
-            or current_anchor is not anchor
-            or current_anchor_timestamp != anchor_timestamp
-            or getattr(self, '_live_connection_generation', None) != generation
-            or not self._pending_bars
-            or self._pending_bars[0] is not candidate
+                self._wire is not wire
+                or self._live_subscription != subscription
+                or current_anchor is not anchor
+                or current_anchor_timestamp != anchor_timestamp
+                or getattr(self, '_live_connection_generation', None) != generation
+                or not self._pending_bars
+                or self._pending_bars[0] is not candidate
         )
         if state_changed:
             self._observe_connected_gap_repair(
@@ -1456,12 +1499,12 @@ class _ProviderMixin(_CTraderBase, ABC):
                         continue
                     trendbars_by_timestamp[
                         trendbar.utcTimestampInMinutes * 60_000
-                    ] = trendbar
+                        ] = trendbar
                 accepted_trendbar = False
                 for timestamp in sorted(trendbars_by_timestamp):
                     accepted_trendbar = (
-                        self._ingest_live_bar(trendbars_by_timestamp[timestamp])
-                        or accepted_trendbar
+                            self._ingest_live_bar(trendbars_by_timestamp[timestamp])
+                            or accepted_trendbar
                     )
                 if len(message.trendbar) > 0 and not accepted_trendbar:
                     # Quotes carried by an all-stale or wrong-period snapshot do
@@ -1485,18 +1528,18 @@ class _ProviderMixin(_CTraderBase, ABC):
             history_ids = getattr(self, '_live_history_bar_ids', set())
             self._live_history_bar_ids = history_ids
             if (
-                candidate.is_closed
-                and id(candidate) not in history_ids
-                and self._last_live_closed_bar is not None
-                and int(candidate.timestamp) <= int(self._last_live_closed_bar.timestamp)
+                    candidate.is_closed
+                    and id(candidate) not in history_ids
+                    and self._last_live_closed_bar is not None
+                    and int(candidate.timestamp) <= int(self._last_live_closed_bar.timestamp)
             ):
                 stale = self._pending_bars.popleft()
                 history_ids.discard(id(stale))
                 continue
             if (
-                candidate.is_closed
-                and id(candidate) not in history_ids
-                and self._last_live_closed_bar is not None
+                    candidate.is_closed
+                    and id(candidate) not in history_ids
+                    and self._last_live_closed_bar is not None
             ):
                 anchor_timestamp = int(self._last_live_closed_bar.timestamp)
                 if self.to_exchange_timeframe(timeframe) == 'MN1':
@@ -1531,8 +1574,8 @@ class _ProviderMixin(_CTraderBase, ABC):
         """
         candle = self._decode_trendbar(bar, is_closed=False)
         if (
-            self._last_live_closed_bar is not None
-            and candle.timestamp <= self._last_live_closed_bar.timestamp
+                self._last_live_closed_bar is not None
+                and candle.timestamp <= self._last_live_closed_bar.timestamp
         ):
             return False
         if self._current_bar_ts is not None and candle.timestamp < self._current_bar_ts:

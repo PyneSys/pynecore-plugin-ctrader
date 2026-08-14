@@ -57,6 +57,7 @@ _MARGIN_CODES = frozenset({
 #: Recoverable via backoff — never a halt.
 _RATE_LIMIT_CODES = frozenset({
     'REQUEST_FREQUENCY_EXCEEDED',
+    'BLOCKED_PAYLOAD_TYPE',
 })
 
 #: ``errorCode`` strings meaning this connection's account session was lost
@@ -165,7 +166,11 @@ def is_rate_limited(error_code: str) -> bool:
     return error_code in _RATE_LIMIT_CODES
 
 
-def map_error_code(error_code: str, description: str = "") -> BrokerError:
+def map_error_code(
+    error_code: str,
+    description: str = "",
+    retry_after: float | None = None,
+) -> BrokerError:
     """Translate a cTrader ``errorCode`` string to the broker taxonomy.
 
     The raw code is logged for diagnostics; the returned exception carries an
@@ -174,14 +179,16 @@ def map_error_code(error_code: str, description: str = "") -> BrokerError:
 
     :param error_code: The cTrader ``errorCode`` string.
     :param description: The optional human-readable description.
+    :param retry_after: Venue-provided backoff in seconds, when available.
     :return: A :class:`BrokerError` subclass the execute path can raise.
     """
     logger.debug("cTrader order rejected: code=%s description=%s",
                  error_code, description)
     if error_code in _RATE_LIMIT_CODES:
-        # Conservative fixed backoff — cTrader does not return a retry-after.
+        delay = 1.0 if retry_after is None else max(0.0, retry_after)
         return ExchangeRateLimitError(
-            "cTrader request rate limit exceeded; backing off", retry_after=1.0,
+            "cTrader request rate limit exceeded; backing off",
+            retry_after=delay,
         )
     if error_code in _MARGIN_CODES:
         return InsufficientMarginError(
@@ -199,4 +206,8 @@ def map_protocol_error(exc: CTraderProtocolError) -> BrokerError:
     :param exc: The protocol error raised by the wire layer.
     :return: A :class:`BrokerError` subclass the execute path can raise.
     """
-    return map_error_code(exc.error_code, exc.description)
+    return map_error_code(
+        exc.error_code,
+        exc.description,
+        retry_after=exc.retry_after,
+    )

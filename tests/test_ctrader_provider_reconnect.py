@@ -74,6 +74,80 @@ class _HistoryWire:
         raise AssertionError(f"unexpected request: {type(request).__name__}")
 
 
+class _SymbolInfoWire:
+    """Symbol metadata wire with configurable initial rate limits."""
+
+    def __init__(self, blocked_requests: int = 1) -> None:
+        self.blocked_requests = blocked_requests
+        self.symbol_list_requests = 0
+
+    async def send_request(self, request):
+        if isinstance(request, _oa.ProtoOASymbolsListReq):
+            self.symbol_list_requests += 1
+            if self.symbol_list_requests <= self.blocked_requests:
+                raise CTraderProtocolError(
+                    "BLOCKED_PAYLOAD_TYPE", "You are being rate limited"
+                )
+            return _oa.ProtoOASymbolsListRes(
+                symbol=[
+                    _model.ProtoOALightSymbol(
+                        symbolId=1,
+                        symbolName="EURUSD",
+                        enabled=True,
+                        baseAssetId=1,
+                        quoteAssetId=2,
+                    )
+                ]
+            )
+        if isinstance(request, _oa.ProtoOAAssetListReq):
+            return _oa.ProtoOAAssetListRes(
+                asset=[
+                    _model.ProtoOAAsset(assetId=1, name="EUR"),
+                    _model.ProtoOAAsset(assetId=2, name="USD"),
+                ]
+            )
+        if isinstance(request, _oa.ProtoOASymbolByIdReq):
+            return _oa.ProtoOASymbolByIdRes(
+                symbol=[
+                    _model.ProtoOASymbol(
+                        symbolId=1,
+                        digits=5,
+                        pipPosition=4,
+                        stepVolume=1000,
+                        minVolume=1000,
+                        maxVolume=10_000_000,
+                        scheduleTimeZone="UTC",
+                        measurementUnits="EUR",
+                    )
+                ]
+            )
+        raise AssertionError(f"unexpected request: {type(request).__name__}")
+
+
+class _SymbolInfoProvider(CTrader):
+    """Run symbol metadata work on one supplied authenticated wire."""
+
+    def __init__(self, wire: _SymbolInfoWire) -> None:
+        super().__init__(
+            symbol="pepperstoneuk:EURUSD",
+            timeframe="1",
+            config=CTraderConfig(
+                demo=True,
+                client_id="client",
+                client_secret="secret",
+                account_id="999",
+            ),
+        )
+        self.symbol_info_wire = wire
+
+    async def _authed_session(self, work):
+        return await work(self.symbol_info_wire, 999)
+
+    @staticmethod
+    async def _wait_rate_limit_retry(seconds: float) -> None:
+        return None
+
+
 class _ObservedCTrader(CTrader):
     """Provider test seam collecting connected-gap observation hook calls."""
 
@@ -87,6 +161,10 @@ class _ObservedCTrader(CTrader):
         payload: dict[str, object],
     ) -> None:
         self.connected_gap_events.append((event, dict(payload)))
+
+    @staticmethod
+    async def _wait_rate_limit_retry(seconds: float) -> None:
+        return None
 
 
 def _calendar(*, open_all_week: bool) -> SymInfo:
@@ -201,6 +279,65 @@ class _BlockingHistoryWire(_HistoryWire):
             await self.release.wait()
             return _oa.ProtoOAGetTrendbarsRes(trendbar=self.history)
         return await super().send_request(request)
+
+
+def __test_symbol_info_retries_blocked_payload_on_same_session__():
+    """Startup metadata survives one recoverable payload throttle."""
+    wire = _SymbolInfoWire()
+    provider = _SymbolInfoProvider(wire)
+
+    syminfo = provider.update_symbol_info()
+
+    assert wire.symbol_list_requests == 2
+    assert syminfo.ticker == "EURUSD"
+    assert syminfo.currency == "USD"
+    assert syminfo.basecurrency == "EUR"
+
+
+def __test_symbol_info_persistent_payload_throttle_remains_bounded__():
+    """A persistent throttle exhausts the bounded startup retry budget."""
+    wire = _SymbolInfoWire(blocked_requests=10)
+    provider = _SymbolInfoProvider(wire)
+
+    try:
+        provider.update_symbol_info()
+    except CTraderProtocolError as exc:
+        assert exc.error_code == "BLOCKED_PAYLOAD_TYPE"
+    else:
+        raise AssertionError("persistent rate limit did not propagate")
+
+    assert wire.symbol_list_requests == 5
+
+
+def __test_trendbar_history_retries_blocked_payload_on_same_session__():
+    """Historical warmup retries a definitive payload throttle in place."""
+    timestamp = 1_800_000_060
+    wire = _HistoryWire(
+        [_trendbar(timestamp, 114_000)],
+        history_faults=[
+            CTraderProtocolError(
+                "BLOCKED_PAYLOAD_TYPE",
+                "injected trendbar throttle",
+                retry_after=5.0,
+            )
+        ],
+    )
+    provider = _provider(wire)
+
+    bars, covered = asyncio.run(
+        provider._fetch_trendbar_window(
+            wire,
+            999,
+            1,
+            "M1",
+            timestamp * 1000,
+            (timestamp + 60) * 1000,
+        )
+    )
+
+    assert covered is True
+    assert list(bars) == [timestamp * 1000]
+    assert len(wire.requests) == 2
 
 
 def __test_invalid_nonempty_schedule_timezone_fails_closed__():

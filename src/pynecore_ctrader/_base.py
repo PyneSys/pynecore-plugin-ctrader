@@ -44,6 +44,7 @@ from .config import CTraderConfig
 from .exceptions import (
     is_account_auth_lost,
     is_client_auth_lost,
+    is_rate_limited,
     is_token_invalid,
     map_protocol_error,
 )
@@ -82,6 +83,13 @@ _ResultT = TypeVar('_ResultT')
 #: timeouts) — it is the lock-cascade guard, not a dispatch-deadline guarantee.
 _REAUTH_TIMEOUT = 20.0
 
+#: Idempotent reads rejected by a cTrader payload throttle are retried on the
+#: same authenticated wire instead of opening another session and increasing
+#: the startup request burst.
+_RATE_LIMIT_REQUEST_ATTEMPTS = 5
+_RATE_LIMIT_RETRY_BUDGET_SECONDS = 120.0
+_RATE_LIMIT_FALLBACK_SECONDS = 1.0
+
 
 class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     """Connection, authentication and account/broker resolution for cTrader.
@@ -94,6 +102,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     plugin_name = "cTrader"
     Config = CTraderConfig
     multi_broker = True
+    initial_connect_timeout = 180.0
 
     def __init__(self, *, symbol: str | None = None, timeframe: str | None = None,
                  ohlcv_dir=None, config: CTraderConfig | None = None) -> None:
@@ -283,6 +292,60 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         """Build a wire client for the configured demo/live host."""
         return WireClient(helpers.protobuf_host(self._demo))
 
+    @staticmethod
+    async def _wait_rate_limit_retry(seconds: float) -> None:
+        """Wait for one venue-requested retry interval without polling or sleep."""
+        loop = asyncio.get_running_loop()
+        elapsed = loop.create_future()
+        handle = loop.call_later(max(0.0, seconds), elapsed.set_result, None)
+        try:
+            await elapsed
+        finally:
+            handle.cancel()
+
+    async def _retry_rate_limited(
+        self,
+        call: Callable[[], Coroutine[Any, Any, _ResultT]],
+        *,
+        context: str,
+    ) -> _ResultT:
+        """Retry one idempotent request after a definitive payload throttle.
+
+        Retries stay on the same wire and preserve the authenticated session.
+        The venue-provided ``retryAfter`` interval is preferred; a short fallback
+        is used for older errors that omit it. Both the attempt count and total
+        timer budget are bounded.
+
+        :param call: Coroutine factory that re-sends the same safe request.
+        :param context: Diagnostic name for the request group.
+        :return: The successful response.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _RATE_LIMIT_RETRY_BUDGET_SECONDS
+        for attempt in range(_RATE_LIMIT_REQUEST_ATTEMPTS):
+            try:
+                return await call()
+            except CTraderProtocolError as exc:
+                if not is_rate_limited(exc.error_code):
+                    raise
+                delay = (
+                    _RATE_LIMIT_FALLBACK_SECONDS
+                    if exc.retry_after is None
+                    else max(0.0, exc.retry_after)
+                )
+                remaining = deadline - loop.time()
+                if (
+                    attempt + 1 >= _RATE_LIMIT_REQUEST_ATTEMPTS
+                    or delay > remaining
+                ):
+                    raise
+                logger.warning(
+                    "cTrader %s was rate-limited; retrying on the same session",
+                    context,
+                )
+                await self._wait_rate_limit_retry(delay)
+        raise AssertionError("rate-limit retry loop did not terminate")
+
     async def _token_call(
             self, wire: WireClient,
             call: Callable[[str], Coroutine[Any, Any, Message]],
@@ -290,31 +353,42 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         """Run an access-token-scoped request, refreshing once on failure.
 
         The expired-token error arrives as a server-defined ``errorCode`` string
-        (not a typed enum), so the retry triggers on any protocol error rather
-        than a hard-coded code: a genuinely non-token error simply fails again on
-        the retry and propagates.
+        (not a typed enum), so non-rate-limit protocol errors retain the existing
+        refresh-once behavior. Payload throttles instead wait and retry the same
+        request on the same wire without rotating a valid token.
 
         :param wire: A connected, application-authenticated client.
         :param call: Builds the coroutine for one attempt, given the access token.
         :return: The successful response.
         """
         try:
-            return await call(self._tokens.access_token)
-        except CTraderProtocolError:
-            if not self._tokens.refresh_token:
+            return await self._retry_rate_limited(
+                lambda: call(self._tokens.access_token),
+                context="token-scoped request",
+            )
+        except CTraderProtocolError as exc:
+            if is_rate_limited(exc.error_code) or not self._tokens.refresh_token:
                 raise
             logger.debug("cTrader token-scoped request failed; refreshing on socket")
             self._tokens = await auth.refresh_via_socket(wire, self._tokens.refresh_token)
             # cTrader may rotate the refresh token on refresh; persist the new pair
             # so it survives a restart (the old refresh token may now be invalid).
             session.save_session(self._tokens, demo=self._demo)
-            return await call(self._tokens.access_token)
+            return await self._retry_rate_limited(
+                lambda: call(self._tokens.access_token),
+                context="token-scoped request after refresh",
+            )
 
     async def _app_auth(self, wire: WireClient) -> None:
         """Send the application-auth request on a freshly connected socket."""
         client_id, client_secret = self._credentials()
-        await wire.send_request(
-            OpenApiMessages.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret)
+        request = OpenApiMessages.ProtoOAApplicationAuthReq(
+            clientId=client_id,
+            clientSecret=client_secret,
+        )
+        await self._retry_rate_limited(
+            lambda: wire.send_request(request),
+            context="application authentication",
         )
 
     async def _get_accounts(self, wire: WireClient) -> list[OpenApiModelMessages.ProtoOACtidTraderAccount]:
@@ -359,11 +433,15 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
         :param wire: The live, application-authenticated connection.
         """
+        request = OpenApiMessages.ProtoOAAccountAuthReq(
+            ctidTraderAccountId=self._live_account_id,
+            accessToken=self._tokens.access_token,
+        )
         try:
-            await wire.send_request(OpenApiMessages.ProtoOAAccountAuthReq(
-                ctidTraderAccountId=self._live_account_id,
-                accessToken=self._tokens.access_token,
-            ))
+            await self._retry_rate_limited(
+                lambda: wire.send_request(request),
+                context="account re-authorization",
+            )
         except CTraderProtocolError as exc:
             if exc.error_code == 'ALREADY_LOGGED_IN':
                 return
@@ -549,7 +627,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         """Send an account-scoped request, parking a transient connection loss.
 
         Wraps :meth:`_account_request_raw` (mid-session de-auth re-auth + single
-        retry) and translates a wire-level connection loss / timeout into the
+        retry), retries definitive payload throttles on the same authenticated
+        wire, and translates a wire-level connection loss / timeout into the
         recoverable :class:`ExchangeConnectionError` the engine parks. A net drop
         during the per-bar broker sync — the reconcile / balance reads and the
         symbol-rule / open-position prefetch — then retries on the next bar
@@ -569,7 +648,10 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         :raises ExchangeRateLimitError: When cTrader asks the caller to back off.
         """
         try:
-            return await self._account_request_raw(req)
+            return await self._retry_rate_limited(
+                lambda: self._account_request_raw(req),
+                context=type(req).__name__,
+            )
         except CTraderProtocolError as exc:
             mapped = map_protocol_error(exc)
             if isinstance(mapped, ExchangeRateLimitError):
@@ -691,8 +773,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
                 asyncio.TimeoutError, OSError) as exc:
             logger.warning("cTrader proactive re-authorization failed: %s", exc)
 
-    @staticmethod
-    async def _broker_name(wire: WireClient, account_id: int) -> str:
+    async def _broker_name(self, wire: WireClient, account_id: int) -> str:
         """Fetch the broker whitelabel slug for an authorized account.
 
         ``ProtoOATrader.brokerName`` is the short, space-free broker identifier
@@ -704,9 +785,16 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         :param account_id: The authorized account's ``ctidTraderAccountId``.
         :return: The broker slug (possibly empty if the broker set none).
         """
-        response = cast(OpenApiMessages.ProtoOATraderRes, await wire.send_request(
-            OpenApiMessages.ProtoOATraderReq(ctidTraderAccountId=account_id)
-        ))
+        request = OpenApiMessages.ProtoOATraderReq(
+            ctidTraderAccountId=account_id,
+        )
+        response = cast(
+            OpenApiMessages.ProtoOATraderRes,
+            await self._retry_rate_limited(
+                lambda: wire.send_request(request),
+                context="broker-name read",
+            ),
+        )
         return response.trader.brokerName
 
     async def _resolve_account(
@@ -904,7 +992,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         # pattern on ``BrokerPlugin._account_id``.
         account_id = await self._full_handshake(wire)
         self._live_account_id = account_id
-        await self._probe_account(wire, account_id)
+        await self._probe_account(account_id)
         if self._hedging_enabled:
             # HEDGED account: opt into core one-way emulation. The Order Sync
             # Engine then drives reducing / closing / reversing / bracket intents
@@ -998,7 +1086,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         """
         return self._hedging_enabled
 
-    async def _probe_account(self, wire: WireClient, account_id: int) -> None:
+    async def _probe_account(self, account_id: int) -> None:
         """Read the trader record once: detect HEDGED mode and cache money/asset.
 
         A HEDGED account is not refused — the broker-side execution and state
@@ -1010,12 +1098,16 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         exponent) and ``depositAssetId`` (balance currency), cached
         unconditionally for the broker state queries.
 
-        :param wire: A connected client with ``account_id`` authorized.
         :param account_id: The authorized ``ctidTraderAccountId``.
         """
-        response = cast(OpenApiMessages.ProtoOATraderRes, await wire.send_request(
-            OpenApiMessages.ProtoOATraderReq(ctidTraderAccountId=account_id)
-        ))
+        response = cast(
+            OpenApiMessages.ProtoOATraderRes,
+            await self._account_request(
+                OpenApiMessages.ProtoOATraderReq(
+                    ctidTraderAccountId=account_id,
+                )
+            ),
+        )
         trader = response.trader
         self._money_digits = trader.moneyDigits
         self._deposit_asset_id = trader.depositAssetId

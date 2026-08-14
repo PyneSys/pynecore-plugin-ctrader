@@ -25,6 +25,7 @@ from pynecore_ctrader.wire import (
     CTraderProtocolError,
     CTraderRequestSentConnectionError,
     CTraderTimeoutError,
+    _raise_on_error,
 )
 
 
@@ -77,6 +78,7 @@ class _ReauthWire:
         self.refresh_gate: asyncio.Event | None = None
         self.account_auth_calls = 0
         self.app_auth_calls = 0
+        self.app_auth_outcomes: list = []
         self.refresh_calls = 0
 
     def script(self, req_cls, *outcomes):
@@ -88,6 +90,11 @@ class _ReauthWire:
         self.requests.append(req)
         if isinstance(req, _oa.ProtoOAApplicationAuthReq):
             self.app_auth_calls += 1
+            if self.app_auth_outcomes:
+                outcome = self.app_auth_outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
             return _oa.ProtoOAApplicationAuthRes()
         if isinstance(req, _oa.ProtoOAAccountAuthReq):
             self.account_auth_calls += 1
@@ -145,6 +152,20 @@ class _ReauthBroker(CTrader):
         )
 
 
+class _RateLimitBroker(_ReauthBroker):
+    """Capture rate-limit timers without waiting in focused retry tests."""
+
+    retry_delays: list[float] = []
+
+    def __init__(self, wire: _ReauthWire):
+        super().__init__(wire)
+        type(self).retry_delays = []
+
+    @staticmethod
+    async def _wait_rate_limit_retry(seconds: float) -> None:
+        _RateLimitBroker.retry_delays.append(seconds)
+
+
 _AUTH_LOST = CTraderProtocolError('ACCOUNT_NOT_AUTHORIZED', 'Trading account is not authorized')
 _AUTH_LOST_GENERIC = CTraderProtocolError('INVALID_REQUEST', 'Trading account is not authorized')
 
@@ -169,23 +190,141 @@ def __test_is_token_invalid_only_for_token_codes__():
     assert not is_token_invalid('ACCOUNT_NOT_AUTHORIZED')
 
 
+def __test_wire_preserves_rate_limit_retry_after__():
+    message = _oa.ProtoOAErrorRes(
+        errorCode="BLOCKED_PAYLOAD_TYPE",
+        description="injected payload throttle",
+        retryAfter=11,
+    )
+
+    with pytest.raises(CTraderProtocolError) as caught:
+        _raise_on_error(message)
+
+    assert caught.value.retry_after == 11.0
+
+
 # === Read path: re-auth + retry ===========================================
 
 
-def __test_reconcile_maps_rate_limit_for_engine_backoff__():
+def __test_reconcile_retries_rate_limit_on_same_session__():
     wire = _ReauthWire().script(
         _oa.ProtoOAReconcileReq,
         CTraderProtocolError(
-            "REQUEST_FREQUENCY_EXCEEDED", "injected bounded throttle",
+            "BLOCKED_PAYLOAD_TYPE",
+            "injected bounded throttle",
+            retry_after=7.0,
         ),
+        _oa.ProtoOAReconcileRes(),
     )
-    broker = _ReauthBroker(wire)
+    broker = _RateLimitBroker(wire)
+
+    result = asyncio.run(broker._reconcile())
+
+    assert isinstance(result, _oa.ProtoOAReconcileRes)
+    assert [type(request).__name__ for request in wire.requests] == [
+        "ProtoOAReconcileReq",
+        "ProtoOAReconcileReq",
+    ]
+    assert broker.retry_delays == [7.0]
+    assert wire.account_auth_calls == 0
+    assert wire.refresh_calls == 0
+
+
+def __test_reconcile_persistent_rate_limit_is_bounded__():
+    blocked = CTraderProtocolError(
+        "BLOCKED_PAYLOAD_TYPE",
+        "injected persistent throttle",
+    )
+    wire = _ReauthWire().script(
+        _oa.ProtoOAReconcileReq,
+        blocked,
+        blocked,
+        blocked,
+        blocked,
+        blocked,
+    )
+    broker = _RateLimitBroker(wire)
 
     with pytest.raises(ExchangeRateLimitError) as caught:
         asyncio.run(broker._reconcile())
 
     assert caught.value.retry_after == 1.0
-    assert len(wire.requests) == 1
+    assert len(wire.requests) == 5
+    assert broker.retry_delays == [1.0, 1.0, 1.0, 1.0]
+    assert wire.account_auth_calls == 0
+    assert wire.refresh_calls == 0
+
+
+def __test_application_auth_retries_rate_limit_on_same_wire__():
+    wire = _ReauthWire()
+    wire.app_auth_outcomes = [
+        CTraderProtocolError(
+            "BLOCKED_PAYLOAD_TYPE",
+            "injected application-auth throttle",
+            retry_after=4.0,
+        ),
+        _oa.ProtoOAApplicationAuthRes(),
+    ]
+    broker = _RateLimitBroker(wire)
+
+    asyncio.run(broker._app_auth(wire))
+
+    assert wire.app_auth_calls == 2
+    assert broker.retry_delays == [4.0]
+    assert wire.refresh_calls == 0
+
+
+def __test_token_scoped_rate_limit_does_not_refresh_valid_token__():
+    wire = _ReauthWire().script(
+        _oa.ProtoOAGetAccountListByAccessTokenReq,
+        CTraderProtocolError(
+            "BLOCKED_PAYLOAD_TYPE",
+            "injected token-scoped throttle",
+            retry_after=3.0,
+        ),
+        _oa.ProtoOAGetAccountListByAccessTokenRes(),
+    )
+    broker = _RateLimitBroker(wire)
+
+    accounts = asyncio.run(broker._get_accounts(wire))
+
+    assert accounts == []
+    assert [type(request).__name__ for request in wire.requests] == [
+        "ProtoOAGetAccountListByAccessTokenReq",
+        "ProtoOAGetAccountListByAccessTokenReq",
+    ]
+    assert broker.retry_delays == [3.0]
+    assert wire.refresh_calls == 0
+
+
+def __test_account_probe_uses_same_session_rate_limit_retry__():
+    trader = _model.ProtoOATrader(
+        ctidTraderAccountId=999,
+        depositAssetId=7,
+        accountType=_model.ProtoOAAccountType.HEDGED,
+        moneyDigits=2,
+    )
+    wire = _ReauthWire().script(
+        _oa.ProtoOATraderReq,
+        CTraderProtocolError(
+            "BLOCKED_PAYLOAD_TYPE",
+            "injected account probe throttle",
+            retry_after=2.0,
+        ),
+        _oa.ProtoOATraderRes(ctidTraderAccountId=999, trader=trader),
+    )
+    broker = _RateLimitBroker(wire)
+
+    asyncio.run(broker._probe_account(999))
+
+    assert [type(request).__name__ for request in wire.requests] == [
+        "ProtoOATraderReq",
+        "ProtoOATraderReq",
+    ]
+    assert broker.retry_delays == [2.0]
+    assert broker._money_digits == 2
+    assert broker._deposit_asset_id == 7
+    assert broker.hedging_enabled is True
 
 
 def __test_order_rate_limit_sets_local_prewrite_backoff__():
