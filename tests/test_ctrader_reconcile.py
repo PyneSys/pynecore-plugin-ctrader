@@ -495,6 +495,52 @@ def __test_adoption_baseline_vanished_order_open_position_marks_full__(tmp_path)
     assert broker.store_ctx.get_order('c12').filled_qty == qty
 
 
+def __test_adoption_baseline_retires_a_shrunk_position_exposure__(tmp_path):
+    # Restart over a position a partial close shrank while the process was
+    # down: the entry row's cumulative filled_qty (2000 centi = full entry) is
+    # still the truth about EXECUTION, but the venue position now holds only
+    # 1200. The baseline must not lower the monotone cursor; it books the
+    # difference into the journal_exposure_retired extras counter so ownership
+    # reconstruction sees the venue-remaining 12.0, not 20.0.
+    qty = volume_to_units(2000)
+    recon = _recon(positions=[_position(position_id=222, volume=1200)])
+    broker = _ReconcileBroker(recon)
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c30', position_id=222, qty=qty)
+
+    broker._apply_adoption_baseline(recon)
+
+    row = broker.store_ctx.get_order('c30')
+    assert row.filled_qty == qty, "the execution watermark must not move"
+    assert abs((row.extras or {})['journal_exposure_retired']
+               - volume_to_units(800)) < 1e-9
+
+    # Idempotent against a repeat over the same store state: the counter is
+    # baselined TO the venue difference, not blindly incremented.
+    broker._adoption_baselined = False
+    broker._apply_adoption_baseline(recon)
+    row = broker.store_ctx.get_order('c30')
+    assert abs((row.extras or {})['journal_exposure_retired']
+               - volume_to_units(800)) < 1e-9
+
+
+def __test_adoption_baseline_leaves_shared_pyramid_positions_alone__(tmp_path):
+    # Two live rows share one netted positionId: the venue snapshot cannot
+    # attribute the shrink to either row, so the conservative baseline must
+    # not guess — neither row gains a retired counter.
+    recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    broker = _ReconcileBroker(recon)
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c31', position_id=222, qty=volume_to_units(2000))
+    _seed_position(broker, 'c32', position_id=222, qty=volume_to_units(1000))
+
+    broker._apply_adoption_baseline(recon)
+
+    for coid in ('c31', 'c32'):
+        row = broker.store_ctx.get_order(coid)
+        assert 'journal_exposure_retired' not in (row.extras or {})
+
+
 def __test_adoption_baseline_is_one_shot__(tmp_path):
     # The baseline must run exactly once (the startup adoption call). A later
     # call with a higher executedVolume must NOT silently absorb a post-adoption

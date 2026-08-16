@@ -25,6 +25,10 @@ from pynecore.core.broker.models import (
     OrderType,
     PositionLeg,
 )
+from pynecore.types.strategy import (
+    ADOPTED_STARTUP_EXTRA_KEY,
+    JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY,
+)
 
 from ._base import _CTraderBase
 from .helpers import money_value, parse_protocol_id, round_price, volume_to_units
@@ -197,6 +201,74 @@ class _StateMixin(_CTraderBase, ABC):
             cumulative = min(row.qty, max(row.filled_qty, baseline))
             if cumulative > row.filled_qty + 1e-9:
                 self.store_ctx.set_filled(row.client_order_id, cumulative)
+        self._retire_shrunk_position_exposure(res)
+
+    def _retire_shrunk_position_exposure(
+            self, res: OpenApiMessages.ProtoOAReconcileRes,
+    ) -> None:
+        """Baseline the retired-exposure counter to a shrunk open position.
+
+        A partial close that landed while the process was DOWN (or one whose
+        PUSH fill a crash swallowed) leaves the entry row's cumulative
+        ``filled_qty`` truthfully at the full entry size while the venue
+        position now holds less. ``filled_qty`` is a monotone execution
+        watermark and must not be lowered; instead the difference is booked
+        into the row's :data:`JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY` counter —
+        the same counter the live PUSH partial-close path accumulates — so
+        startup ownership reconstruction and the cycle-end audit see the
+        venue-remaining exposure. Runs from the same one-shot adoption
+        snapshot as the cursor baseline above, AFTER it, so the comparison
+        uses the final post-baseline cursor.
+
+        Conservative by construction: only a position mapped by EXACTLY ONE
+        live row is baselined (with several pyramid rows sharing a netted
+        position the venue snapshot cannot attribute the shrink to a row),
+        rows flagged ``adopted_startup`` (excluded from ownership anyway) or
+        ``recovered_inconclusive`` (cursor not final) are skipped, and the
+        counter only ever grows toward the venue truth — never shrinks.
+        """
+        if self.store_ctx is None:
+            return
+        open_volume_by_id = {
+            p.positionId: volume_to_units(p.tradeData.volume)
+            for p in res.position
+            if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+        }
+        rows_by_position: dict[int, list] = {}
+        for row in self.store_ctx.iter_live_orders():
+            extras = row.extras or {}
+            if (extras.get(ADOPTED_STARTUP_EXTRA_KEY)
+                    or extras.get('recovered_inconclusive')):
+                continue
+            position_id_raw = extras.get('position_id')
+            if position_id_raw is None:
+                continue
+            position_id = parse_protocol_id(position_id_raw, field='position_id')
+            if position_id in open_volume_by_id:
+                rows_by_position.setdefault(position_id, []).append(row)
+        for position_id, rows in rows_by_position.items():
+            if len(rows) != 1:
+                continue
+            row = rows[0]
+            extras = dict(row.extras or {})
+            already_raw = extras.get(JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY)
+            already = (float(already_raw)
+                       if isinstance(already_raw, (int, float)) else 0.0)
+            journal_remaining = max(0.0, row.filled_qty - already)
+            venue_remaining = open_volume_by_id[position_id]
+            if venue_remaining >= journal_remaining - 1e-9:
+                continue
+            retired = already + (journal_remaining - venue_remaining)
+            extras[JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY] = retired
+            self.store_ctx.upsert_order(row.client_order_id, extras=extras)
+            self.store_ctx.log_event(
+                'journal_exposure_retired',
+                client_order_id=row.client_order_id,
+                exchange_order_id=str(position_id),
+                payload={'retired': journal_remaining - venue_remaining,
+                         'total_retired': retired,
+                         'source': 'adoption_baseline'},
+            )
 
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None:
         """Resolve ``symbol`` to its numeric ``symbolId``, fetching if needed.

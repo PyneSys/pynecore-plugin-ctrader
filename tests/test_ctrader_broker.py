@@ -805,6 +805,123 @@ def __test_venue_close_on_unowned_position_stays_external__(tmp_path):
     assert ignored[0]['position_id'] == 99999999
 
 
+def _partial_close_event(*, position_id, deal_id, closed_cents, remaining_cents,
+                         order_id=70215164):
+    """A run-owned close fill that leaves the position OPEN with a remainder."""
+    order = _make_order(order_id=order_id, executed=closed_cents,
+                        position_id=position_id, closing=True,
+                        order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    deal = _model.ProtoOADeal(dealId=deal_id, filledVolume=closed_cents,
+                              executionPrice=1.1)
+    ev = _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+                     deal=deal)
+    ev.position.CopyFrom(_model.ProtoOAPosition(
+        positionId=position_id,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        tradeData=_model.ProtoOATradeData(
+            symbolId=1, volume=remaining_cents,
+            tradeSide=_model.ProtoOATradeSide.BUY),
+    ))
+    return ev
+
+
+def __test_partial_close_fill_retires_exposure_not_the_watermark__(tmp_path):
+    """A run-owned partial close books its quantity as retired exposure.
+
+    The close executes under the venue's close ``orderId`` (never a journal
+    row of ours), so before the fix NOTHING in the durable book recorded that
+    the position shrank: the entry row kept its full ``filled_qty`` and the
+    cycle-end venue-vs-journal audit read 10.0 owned against a 6.0 venue
+    remainder. The ``filled_qty`` watermark must stay untouched (it is the
+    de-dup cursor the PUSH / reconcile paths diff ``executedVolume`` against);
+    the shrink lands in the ``journal_exposure_retired`` extras counter, and
+    consecutive partials accumulate it.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+
+    out = broker._translate_exec_event(_partial_close_event(
+        position_id=54302872, deal_id=61, closed_cents=400,
+        remaining_cents=600))
+
+    assert out is not None
+    assert out.leg_type is LegType.CLOSE
+    assert out.fill_qty == 4.0
+    row = broker.store_ctx.get_order('c1')
+    assert row is not None
+    assert row.closed_ts_ms is None, "a partial close must keep the entry live"
+    assert row.filled_qty == 10.0, "the execution watermark must not move"
+    assert (row.extras or {})['journal_exposure_retired'] == pytest.approx(4.0)
+
+    # A second partial (its own deal) accumulates onto the same counter.
+    out = broker._translate_exec_event(_partial_close_event(
+        position_id=54302872, deal_id=62, closed_cents=300,
+        remaining_cents=300, order_id=70215165))
+    assert out is not None
+    row = broker.store_ctx.get_order('c1')
+    assert row.filled_qty == 10.0
+    assert (row.extras or {})['journal_exposure_retired'] == pytest.approx(7.0)
+
+
+def __test_partial_close_retire_caps_at_the_rows_filled_exposure__(tmp_path):
+    """An overshooting close clamps the counter at the row's own fill.
+
+    The venue can report a closing volume larger than what the journal
+    attributes to this run (another run's slice folded into the same netted
+    position). The counter must saturate at ``filled_qty`` — a negative owned
+    contribution would flip the row's sign in the ownership sum.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+
+    out = broker._translate_exec_event(_partial_close_event(
+        position_id=54302872, deal_id=63, closed_cents=1500,
+        remaining_cents=500))
+
+    assert out is not None
+    row = broker.store_ctx.get_order('c1')
+    assert (row.extras or {})['journal_exposure_retired'] == pytest.approx(10.0)
+
+
+def __test_partial_close_retire_reduces_pyramid_rows_fifo__(tmp_path):
+    """With pyramid rows on one netted position the oldest absorbs first."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker.store_ctx.upsert_order('c1', filled_qty=4.0)
+    broker.store_ctx.upsert_order('c2', filled_qty=6.0)
+
+    out = broker._translate_exec_event(_partial_close_event(
+        position_id=54302872, deal_id=64, closed_cents=500,
+        remaining_cents=500))
+
+    assert out is not None
+    first = broker.store_ctx.get_order('c1')
+    second = broker.store_ctx.get_order('c2')
+    assert (first.extras or {})['journal_exposure_retired'] == pytest.approx(4.0)
+    assert (second.extras or {})['journal_exposure_retired'] == pytest.approx(1.0)
+    assert first.filled_qty == 4.0 and second.filled_qty == 6.0
+
+
+def __test_full_close_still_retires_the_rows_wholesale__(tmp_path):
+    """A flat close keeps taking the ``_mark_position_closed`` branch."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+
+    out = broker._translate_exec_event(
+        _venue_bracket_close_event(position_id=54302872))
+
+    assert out is not None
+    row = broker.store_ctx.get_order('c1')
+    assert row.closed_ts_ms is not None, "a flat close must retire the row"
+    assert 'journal_exposure_retired' not in (row.extras or {})
+
+
 def __test_watch_orders_survives_translation_failure__():
     """One poisonous PUSH message must not terminate the order-event stream.
 

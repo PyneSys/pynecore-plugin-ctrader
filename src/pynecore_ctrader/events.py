@@ -36,6 +36,7 @@ from pynecore.core.broker.store_helpers import (
     STATE_SERVER_REF_SEEN,
     iter_active_bracket_ownerships,
 )
+from pynecore.types.strategy import JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY
 
 from ._base import _CTraderBase
 from .helpers import money_value, parse_protocol_id, volume_to_units
@@ -310,6 +311,15 @@ class _EventStreamMixin(_CTraderBase, ABC):
         if (event_type == 'filled' and order.closingOrder
                 and self._position_is_flat(message)):
             self._mark_position_closed(order.positionId)
+        elif (event_type in ('filled', 'partial') and order.closingOrder
+              and leg_type is LegType.CLOSE and (fill_qty or 0.0) > 0.0):
+            # A run-owned close that left the position OPEN (a partial reduce).
+            # The close executes under the venue's close ``orderId`` — never a
+            # journal row of this run — so without this the durable book keeps
+            # the entry's full exposure and startup ownership / cycle-end
+            # reconciliation reads a position the venue no longer holds.
+            self._retire_partial_close_exposure(
+                order.positionId, fill_qty or 0.0)
         elif (event_type in ('filled', 'partial') and order.positionId
               and not order.closingOrder):
             # Position-linking mirrors ``positionId`` onto the ENTRY row a fill
@@ -681,6 +691,68 @@ class _EventStreamMixin(_CTraderBase, ABC):
                 targets.append(row.client_order_id)
         for coid in targets:
             self.store_ctx.close_order(coid)
+
+    def _retire_partial_close_exposure(
+            self, position_id: int, closed_qty: float,
+    ) -> None:
+        """Book a run-owned partial close's quantity as retired entry exposure.
+
+        A cTrader close executes under the venue's own close ``orderId`` and is
+        never a journal row of this run, so nothing in the durable book records
+        that the position shrank. The entry row's ``filled_qty`` cannot absorb
+        it either: that cursor is the MONOTONE cumulative-execution watermark
+        the PUSH / reconcile / recovery de-dup paths compare the venue's
+        ``executedVolume`` against — decrementing it would let those paths
+        re-emit an already-applied entry slice as fresh. Accumulate the closed
+        quantity in the entry row's
+        :data:`JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY` counter instead; startup
+        ownership reconstruction and the cycle-end audit subtract it, so the
+        owned net keeps tracking the venue's remaining exposure. A FULL close
+        never reaches this — the flat branch retires the rows wholesale via
+        :meth:`_mark_position_closed`.
+
+        Rows are matched exactly as :meth:`_mark_position_closed`
+        (``extras['position_id']`` mirror, ``exchange_order_id`` fallback) and
+        reduced in journal order — insertion order, i.e. FIFO oldest-first,
+        matching the netting reduce order the ``position_id`` alias pin also
+        assumes. Each row absorbs at most its own unretired remainder; an
+        overshoot (venue closed more than the journal attributes to this run)
+        is clamped rather than driven negative.
+
+        :param position_id: The netted ``positionId`` the close reduced.
+        :param closed_qty: The close fill's quantity in Pine units.
+        """
+        if self.store_ctx is None or not position_id or closed_qty <= 0.0:
+            return
+        pid_str = str(position_id)
+        remaining = closed_qty
+        for row in list(self.store_ctx.iter_live_orders()):
+            if remaining <= 1e-9:
+                break
+            position_id_raw = (row.extras or {}).get('position_id')
+            matches_position = (
+                position_id_raw is not None
+                and parse_protocol_id(position_id_raw, field='position_id') == position_id
+            )
+            if not matches_position and row.exchange_order_id != pid_str:
+                continue
+            extras = dict(row.extras or {})
+            already_raw = extras.get(JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY)
+            already = (float(already_raw)
+                       if isinstance(already_raw, (int, float)) else 0.0)
+            take = min(max(0.0, row.filled_qty - already), remaining)
+            if take <= 1e-9:
+                continue
+            extras[JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY] = already + take
+            self.store_ctx.upsert_order(row.client_order_id, extras=extras)
+            self.store_ctx.log_event(
+                'journal_exposure_retired',
+                client_order_id=row.client_order_id,
+                exchange_order_id=pid_str,
+                payload={'retired': take, 'total_retired': already + take,
+                         'source': 'partial_close_fill'},
+            )
+            remaining -= take
 
     def _order_error_to_event(self, error) -> OrderEvent | None:
         """Translate a ``ProtoOAOrderErrorEvent`` into a rejected OrderEvent."""
