@@ -165,21 +165,11 @@ class _ReconcileMixin(_CTraderBase, ABC):
             # path — or the terminal shutdown — owns recovery; the next pass runs
             # normally once the wire is back.
             return
-        res = await self._reconcile(return_protection_orders=True)
+        res = await self._reconcile()
         orders_by_id = {o.orderId: o for o in res.order}
         open_positions = {
             p.positionId: p for p in res.position
             if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
-        }
-        # In ``returnProtectionOrders=True`` mode the broker carries each
-        # position's live SL/TP NOT on ``position.stopLoss`` / ``takeProfit`` but
-        # as separate ``STOP_LOSS_TAKE_PROFIT`` entries in ``order[]`` linked by
-        # ``positionId`` (see the ``ProtoOAReconcileReq.returnProtectionOrders``
-        # contract). The fail-safe observe feed must read its levels from there.
-        protection_by_position = {
-            o.positionId: o for o in res.order
-            if o.orderType == OpenApiModelMessages.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT
-               and o.positionId
         }
         now_ts = epoch_time()
         for row in list(self.store_ctx.iter_live_orders()):
@@ -230,11 +220,10 @@ class _ReconcileMixin(_CTraderBase, ABC):
         self._disappearance_tracker().observe_presence(
             {'positions': {str(pid) for pid in open_positions}}, now_ts,
         )
-        self._feed_native_failsafe_observations(open_positions, protection_by_position)
+        self._feed_native_failsafe_observations(open_positions)
 
     def _feed_native_failsafe_observations(
             self, open_positions: 'dict[int, OpenApiModelMessages.ProtoOAPosition]',
-            protection_by_position: 'dict[int, OpenApiModelMessages.ProtoOAOrder]',
     ) -> None:
         """Feed the fail-safe observe sink for every live entry whose position
         is open — the M3 reconcile-based ``DEGRADING -> HEALTHY`` recovery.
@@ -258,26 +247,37 @@ class _ReconcileMixin(_CTraderBase, ABC):
             if pid not in open_positions:
                 continue
             self._feed_native_failsafe_observed(
-                row.client_order_id, protection_by_position.get(pid))
+                row.client_order_id, open_positions[pid])
 
     def _feed_native_failsafe_observed(
-            self, parent_ref: str, protection: 'OpenApiModelMessages.ProtoOAOrder | None',
+            self, parent_ref: str,
+            position: 'OpenApiModelMessages.ProtoOAPosition',
     ) -> None:
         """Forward one live position's broker-observed bracket to the engine's
         §2.6.7 fail-safe recovery feed via the thread-safe observed sink.
 
-        In ``returnProtectionOrders=True`` mode the broker reports each position's
-        live protective levels NOT on the ``ProtoOAPosition`` but as a separate
-        ``STOP_LOSS_TAKE_PROFIT`` ``ProtoOAOrder`` linked by ``positionId``. Its
-        ``stopLoss`` / ``takeProfit`` are absolute prices and ``trailingStopLoss``
-        is a bool flag (the live trailing price rides in ``stopLoss``) — there is
-        NO relative trailing-distance field. So ``trailing_stop`` is always
-        ``None``, and the absolute ``stop_level`` is surfaced only for a STATIC
-        stop: while trailing is active the stop is moving and cannot be matched
-        against the engine's relative desired-trailing, so it is reported as
-        ``None`` rather than fighting the desired snapshot into a false edit. A
-        position with no protection order (the bracket was cleared / never
-        landed) reports both levels as ``None`` so the manager degrades.
+        The levels are read off the ``ProtoOAPosition`` attributes themselves
+        (``stopLoss`` / ``takeProfit`` / ``trailingStopLoss``), which the
+        reconcile snapshot always carries. The separate
+        ``STOP_LOSS_TAKE_PROFIT`` protection order the
+        ``returnProtectionOrders=True`` mode adds to ``order[]`` is NOT a
+        usable source: live-measured on Pepperstone demo (probe114,
+        2026-08-17), that order reports the SL in ``stopPrice`` and the TP in
+        ``limitPrice`` while its ``stopLoss`` / ``takeProfit`` fields stay
+        unset. Reading those unset fields fed ``None`` levels for a position
+        whose stop was verifiably present, which the manager booked as an
+        external edit — flipping ownership to UNKNOWN and freezing the
+        symbol's entry gate in DEGRADED for the parent's whole lifetime.
+
+        ``trailingStopLoss`` is a bool flag (the live trailing price rides in
+        ``stopLoss``) — there is NO relative trailing-distance field. So
+        ``trailing_stop`` is always ``None``, and the absolute ``stop_level``
+        is surfaced only for a STATIC stop: while trailing is active the stop
+        is moving and cannot be matched against the engine's relative
+        desired-trailing, so it is reported as ``None`` rather than fighting
+        the desired snapshot into a false edit. A position with no protective
+        levels (the bracket was cleared / never landed) reports both levels as
+        ``None`` so the manager degrades.
 
         Routed through ``native_failsafe_observed_sink`` — the runner wires it
         to the engine's thread-safe ``enqueue_native_bracket_observed``, NOT the
@@ -290,18 +290,15 @@ class _ReconcileMixin(_CTraderBase, ABC):
         sink = self.native_failsafe_observed_sink
         if sink is None:
             return
-        if protection is None:
-            sink(parent_ref, stop_level=None, profit_level=None, trailing_stop=None)
-            return
-        trailing_active = (protection.HasField('trailingStopLoss')
-                           and protection.trailingStopLoss)
+        trailing_active = (position.HasField('trailingStopLoss')
+                           and position.trailingStopLoss)
         sink(
             parent_ref,
-            stop_level=(protection.stopLoss
-                        if protection.HasField('stopLoss') and not trailing_active
+            stop_level=(position.stopLoss
+                        if position.HasField('stopLoss') and not trailing_active
                         else None),
-            profit_level=(protection.takeProfit
-                          if protection.HasField('takeProfit') else None),
+            profit_level=(position.takeProfit
+                          if position.HasField('takeProfit') else None),
             trailing_stop=None,
         )
 

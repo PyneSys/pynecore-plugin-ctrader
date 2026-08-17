@@ -95,10 +95,11 @@ class _StateMixin(_CTraderBase, ABC):
 
         :param return_protection_orders: When ``True`` the snapshot's
             ``order[]`` also carries the position-attached SL/TP protection
-            orders (needed by the reconcile loop's bracket-disappearance
-            detection). The state-query callers leave it ``False`` — they map
-            only standalone working orders and read protective levels off the
-            position itself.
+            orders (the startup recovery pass asks for the fullest snapshot).
+            Note their levels ride in ``stopPrice`` / ``limitPrice``, not in
+            ``stopLoss`` / ``takeProfit`` (live-measured, probe114). Most
+            callers leave it ``False`` — they map only standalone working
+            orders and read protective levels off the position itself.
         :return: The ``ProtoOAReconcileRes`` for the live account.
         :raises CTraderConnectionError: If the live connection is not open.
         """

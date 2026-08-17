@@ -122,8 +122,10 @@ def _position(*, position_id, volume, price=1.1, side=_model.ProtoOATradeSide.BU
 
 def _protection_order(*, position_id, stop_loss=None, take_profit=None,
                       trailing=False):
-    # In ``returnProtectionOrders=True`` mode the broker reports a position's
-    # live SL/TP as a separate STOP_LOSS_TAKE_PROFIT order linked by positionId.
+    # A position's STOP_LOSS_TAKE_PROFIT protection order as the live venue
+    # actually shapes it (probe114, Pepperstone demo): the SL rides in
+    # ``stopPrice`` and the TP in ``limitPrice``; the order's ``stopLoss`` /
+    # ``takeProfit`` fields stay unset.
     order = _model.ProtoOAOrder(
         orderId=900_000 + position_id,
         orderType=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
@@ -134,9 +136,9 @@ def _protection_order(*, position_id, stop_loss=None, take_profit=None,
             tradeSide=_model.ProtoOATradeSide.BUY),
     )
     if stop_loss is not None:
-        order.stopLoss = stop_loss
+        order.stopPrice = stop_loss
     if take_profit is not None:
-        order.takeProfit = take_profit
+        order.limitPrice = take_profit
     if trailing:
         order.trailingStopLoss = True
     return order
@@ -1225,11 +1227,17 @@ def _capture_failsafe(broker) -> list:
 
 
 def __test_reconcile_feeds_native_failsafe_static_levels__(tmp_path):
-    # Each live entry whose broker position is open feeds the observed sink with
-    # the absolute stopLoss / takeProfit carried by the position's protection
-    # order (returnProtectionOrders=True mode), keyed by the row coid.
+    # Each live entry whose broker position is open feeds the observed sink
+    # with the absolute stopLoss / takeProfit carried by the POSITION
+    # attributes, keyed by the row coid. The snapshot also carries a
+    # venue-shaped protection order (levels in stopPrice/limitPrice, its
+    # stopLoss/takeProfit unset) to prove the feed does not read that order:
+    # reading its unset stopLoss fed None for a verifiably-present stop, which
+    # the manager booked as an external edit and froze the symbol's entry gate
+    # in DEGRADED for the parent's whole lifetime (task #114, cycles 19/20/25).
     qty = volume_to_units(2000)
-    pos = _position(position_id=222, volume=2000)
+    pos = _position(position_id=222, volume=2000,
+                    stop_loss=1.05, take_profit=1.15)
     prot = _protection_order(position_id=222, stop_loss=1.05, take_profit=1.15)
     broker = _ReconcileBroker(_recon(orders=[prot], positions=[pos]))
     captured = _capture_failsafe(broker)
@@ -1238,7 +1246,7 @@ def __test_reconcile_feeds_native_failsafe_static_levels__(tmp_path):
 
     _run(broker)
 
-    assert captured == [('p1', prot.stopLoss, prot.takeProfit, None)]
+    assert captured == [('p1', pos.stopLoss, pos.takeProfit, None)]
 
 
 def __test_reconcile_failsafe_trailing_suppresses_stop_level__(tmp_path):
@@ -1246,21 +1254,20 @@ def __test_reconcile_failsafe_trailing_suppresses_stop_level__(tmp_path):
     # moving stop is NOT reported as stop_level (it cannot be matched against
     # the engine's relative desired-trailing) and trailing_stop stays None.
     qty = volume_to_units(2000)
-    pos = _position(position_id=222, volume=2000)
-    prot = _protection_order(position_id=222, stop_loss=1.05,
-                             take_profit=1.15, trailing=True)
-    broker = _ReconcileBroker(_recon(orders=[prot], positions=[pos]))
+    pos = _position(position_id=222, volume=2000,
+                    stop_loss=1.05, take_profit=1.15, trailing=True)
+    broker = _ReconcileBroker(_recon(positions=[pos]))
     captured = _capture_failsafe(broker)
     _open(tmp_path, broker)
     _seed_position(broker, 'p1', position_id=222, qty=qty)
 
     _run(broker)
 
-    assert captured == [('p1', None, prot.takeProfit, None)]
+    assert captured == [('p1', None, pos.takeProfit, None)]
 
 
 def __test_reconcile_failsafe_no_protection_order_degrades__(tmp_path):
-    # An open position whose protection order is absent (bracket cleared / never
+    # An open position carrying no protective levels (bracket cleared / never
     # landed) is still observed, with both levels None so the manager degrades.
     qty = volume_to_units(2000)
     pos = _position(position_id=222, volume=2000)
