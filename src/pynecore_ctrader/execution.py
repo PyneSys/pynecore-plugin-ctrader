@@ -996,6 +996,17 @@ class _ExecutionMixin(_CTraderBase, ABC):
                 if isinstance(cause, CTraderProtocolError) and is_not_found(
                         cause.error_code):
                     return
+                # An amend on a position that already carries no protection
+                # rejects with ``INVALID_REQUEST: Nothing to amend.`` (live
+                # incident: reversal pre-clear raced the close-leg fills — the
+                # first clear had already stripped the shared bracket, and the
+                # forced-cancel retry re-drove the clear on the bare position,
+                # crashing the run). Nothing to amend IS the clear's goal
+                # state, so treat it as an idempotent success.
+                if (isinstance(cause, CTraderProtocolError)
+                        and cause.error_code == 'INVALID_REQUEST'
+                        and 'nothing to amend' in str(cause).lower()):
+                    return
                 raise
 
     async def _trail_only_position_already_armed(self, position_id: int) -> bool:

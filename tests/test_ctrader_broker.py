@@ -1172,6 +1172,40 @@ def __test_amend_bracket_all_none_clears_protection__():
     assert set_fields.isdisjoint({"stopLoss", "takeProfit", "trailingStopLoss"})
 
 
+def __test_amend_bracket_clear_of_a_bare_position_is_an_idempotent_noop__():
+    """``INVALID_REQUEST: Nothing to amend.`` on a clear must not raise.
+
+    Live incident (pyramid cycle): the reversal pre-clear raced the
+    close-leg fills — the first clear had already stripped the shared
+    bracket, and the engine's forced-cancel retry re-drove the clear on
+    the now-bare position. The venue rejects an amend with no fields on
+    a position with no protection, but that IS the clear's goal state;
+    the raw ``ExchangeOrderRejectedError`` escaped the retry loop and
+    crashed the run.
+    """
+    position = _model.ProtoOAPosition(
+        positionId=3,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        tradeData=_model.ProtoOATradeData(
+            symbolId=1,
+            volume=1000,
+            tradeSide=_model.ProtoOATradeSide.BUY,
+        ),
+    )
+    broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(position=[position]))
+    reject = ExchangeOrderRejectedError(
+        "cTrader rejected the order: Nothing to amend.",
+    )
+    reject.__cause__ = CTraderProtocolError("INVALID_REQUEST", "Nothing to amend.")
+    broker._raise_on_dispatch = reject
+    asyncio.run(broker.amend_bracket(
+        "EURUSD", "3", side="sell", tp_price=None, sl_price=None,
+        trail_offset=None, coid="coid-clear-bare",
+    ))
+    amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
+    assert len(amends) == 1
+
+
 def __test_reject_out_of_range_below_min_skips__():
     # 5 units -> 500 centi, below the 1000 minVolume -> non-halting skip.
     broker = _FakeBroker()
