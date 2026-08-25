@@ -115,7 +115,13 @@ class _ExecutionMixin(_CTraderBase, ABC):
             return cached
         wire = self._wire
         if wire is None or self._live_account_id is None:
-            raise CTraderConnectionError("live connection not established")
+            # Pre-write guard on a dispatch path: no request was (or can be)
+            # sent, so this must surface as the recoverable
+            # ``ExchangeConnectionError`` the engine parks — a raw
+            # ``CTraderConnectionError`` escaping an order dispatch is an
+            # untranslated fault the sync engine halts on (measured live:
+            # ctrader cycle 60, post-sleep offline window).
+            raise ExchangeConnectionError("cTrader live connection not established")
         if symbol not in self._symbols_by_name:
             await self._fetch_light_symbols(
                 wire, self._live_account_id, recover=True,

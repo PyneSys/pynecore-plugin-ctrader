@@ -16,6 +16,7 @@ from abc import ABC
 from typing import cast
 
 from pynecore.core.broker.emulator import aggregate_positions
+from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
@@ -34,7 +35,6 @@ from ._base import _CTraderBase
 from .helpers import money_value, parse_protocol_id, round_price, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
-from .wire import CTraderConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -101,10 +101,15 @@ class _StateMixin(_CTraderBase, ABC):
             callers leave it ``False`` — they map only standalone working
             orders and read protective levels off the position itself.
         :return: The ``ProtoOAReconcileRes`` for the live account.
-        :raises CTraderConnectionError: If the live connection is not open.
+        :raises ExchangeConnectionError: If the live connection is not open.
         """
         if self._wire is None or self._live_account_id is None:
-            raise CTraderConnectionError("live connection not established")
+            # Pre-write guard: nothing was sent, so surface the recoverable
+            # engine-taxonomy error — the dispatch pre-reads (symbol rules /
+            # open-position lookup) run through here, and a raw
+            # ``CTraderConnectionError`` escaping a dispatch is an untranslated
+            # fault the sync engine halts on.
+            raise ExchangeConnectionError("cTrader live connection not established")
         # Route through ``_account_request`` so a mid-session account de-auth is
         # transparently re-authorized and the (idempotent) snapshot retried,
         # rather than raising a raw protocol error that crashes the dispatch.
@@ -285,7 +290,7 @@ class _StateMixin(_CTraderBase, ABC):
 
         :param symbol: The symbol name to resolve.
         :return: The numeric ``symbolId``, or ``None`` if unknown to the account.
-        :raises CTraderConnectionError: If the live connection is not open.
+        :raises ExchangeConnectionError: If the live connection is not open.
         """
         symbol_id = self._symbols_by_name.get(symbol)
         if symbol_id is not None:
@@ -293,7 +298,8 @@ class _StateMixin(_CTraderBase, ABC):
         wire = self._wire
         account_id = self._live_account_id
         if wire is None or account_id is None:
-            raise CTraderConnectionError("live connection not established")
+            # Pre-write guard on dispatch-reachable lookups — see ``_reconcile``.
+            raise ExchangeConnectionError("cTrader live connection not established")
         await self._fetch_light_symbols(wire, account_id, recover=True)
         return self._symbols_by_name.get(symbol)
 
@@ -453,7 +459,9 @@ class _StateMixin(_CTraderBase, ABC):
         """
         wire = self._wire
         if wire is None or self._live_account_id is None:
-            raise CTraderConnectionError("live connection not established")
+            # Read-path guard: same taxonomy as ``_reconcile`` — parkable, not
+            # a raw wire error.
+            raise ExchangeConnectionError("cTrader live connection not established")
         res = cast(OpenApiMessages.ProtoOATraderRes, await self._account_request(
             OpenApiMessages.ProtoOATraderReq(ctidTraderAccountId=self._live_account_id)
         ))

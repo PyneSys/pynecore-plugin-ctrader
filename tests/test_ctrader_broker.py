@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from pynecore.core.broker.exceptions import (
+    ExchangeConnectionError,
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
@@ -296,6 +297,31 @@ def __test_entry_reject_marks_rejected__(tmp_path):
 
 
 # === execute_exit / close: bracket + position close =======================
+
+def __test_pre_write_guard_with_connection_down_raises_engine_connection_error__():
+    # Regression (ctrader cycle 60, post-sleep offline window): with the live
+    # connection down (_wire = None) the dispatch pre-write reads — symbol
+    # rules, the open-position lookup via _reconcile, the state symbol-id
+    # resolve and get_balance — used to raise the raw
+    # CTraderConnectionError("live connection not established"). Escaping an
+    # order dispatch untranslated, the sync engine's write bridge classified it
+    # as an unrecoverable fault and halted the run with
+    # BrokerManualInterventionError. No request was sent at these guards, so
+    # they must surface the parkable ExchangeConnectionError instead.
+    broker = CTrader(symbol=None, config=_make_config())
+    broker._wire = None
+    broker._live_account_id = None
+    intent = ExitIntent(pine_id="Exit", from_entry="Long", symbol="EURUSD",
+                        side="sell", qty=10.0, tp_price=1.30, sl_price=1.10)
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker.execute_exit(_envelope(intent)))
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker._reconcile())
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker._resolve_state_symbol_id("EURUSD"))
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker.get_balance())
+
 
 def __test_exit_amends_position_sltp__():
     res = _oa.ProtoOAReconcileRes()
