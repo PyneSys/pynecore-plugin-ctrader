@@ -4,12 +4,14 @@
 Regression coverage for cTrader live OHLCV reconnect backfill.
 """
 import asyncio
+import types
 from datetime import datetime, time, timedelta, timezone
 
 from pynecore.core.syminfo import SymInfo, SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
 
 from pynecore_ctrader import CTrader, CTraderConfig
+from pynecore_ctrader import provider as _provider_module
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
 from pynecore_ctrader.wire import (
@@ -1609,3 +1611,68 @@ def __test_connected_gap_wire_identity_is_provider_owned_and_monotonic__():
     second_wire = _HistoryWire([])
     assert provider._connection_generation_for_wire(second_wire) == 2  # type: ignore[arg-type]
     assert provider._live_wire_identity == first_identity + 1
+
+
+def __test_reconnect_accepts_a_proven_tickless_hole__(monkeypatch):
+    """A hole missing across aged fully-served passes settles as venue-empty."""
+    last_ts = 1_800_000_000
+    hole_ts = last_ts + 60
+    served_ts = last_ts + 120
+    current_ts = last_ts + 180
+    wire = _HistoryWire([_trendbar(served_ts, 114_020)])
+    provider = _provider(wire)
+    provider._live_history_settle_delay_seconds = 0
+    provider._last_live_closed_bar = _closed(last_ts)
+    _freeze(monkeypatch, datetime.fromtimestamp(current_ts + 2, timezone.utc))
+    ticks = iter(range(0, 10_000))
+    monkeypatch.setattr(
+        _provider_module,
+        "monotonic_time",
+        types.SimpleNamespace(
+            monotonic_ns=lambda: next(ticks) * 61_000_000_000,
+        ),
+    )
+
+    asyncio.run(provider.on_reconnect())
+
+    assert [bar.timestamp for bar in provider._pending_bars] == [served_ts * 1000]
+    # An accepted hole is still unrecovered, so its first-seen evidence stays
+    # in the ledger until a later window moves past the slot entirely.
+    assert hole_ts * 1000 in provider._history_hole_first_missing_ns
+
+
+def __test_reconnect_hole_needs_aged_evidence_before_settling__(monkeypatch):
+    """A freshly-missing slot keeps failing the backfill until evidence ages."""
+    last_ts = 1_800_000_000
+    hole_ts = last_ts + 60
+    served_ts = last_ts + 120
+    current_ts = last_ts + 180
+    wire = _HistoryWire([_trendbar(served_ts, 114_020)])
+    provider = _provider(wire)
+    provider._live_history_settle_delay_seconds = 0
+    provider._last_live_closed_bar = _closed(last_ts)
+    _freeze(monkeypatch, datetime.fromtimestamp(current_ts + 2, timezone.utc))
+
+    try:
+        asyncio.run(provider.on_reconnect())
+        raised = False
+    except CTraderConnectionError:
+        raised = True
+
+    assert raised
+    assert not provider._pending_bars
+    assert hole_ts * 1000 in provider._history_hole_first_missing_ns
+
+    # The first-seen ledger lives on the provider, so a later reconnect finds
+    # the already-aged evidence and settles the very same hole immediately.
+    first_seen = provider._history_hole_first_missing_ns[hole_ts * 1000]
+    monkeypatch.setattr(
+        _provider_module,
+        "monotonic_time",
+        types.SimpleNamespace(
+            monotonic_ns=lambda: first_seen + 200_000_000_000,
+        ),
+    )
+    asyncio.run(provider.on_reconnect())
+
+    assert [bar.timestamp for bar in provider._pending_bars] == [served_ts * 1000]

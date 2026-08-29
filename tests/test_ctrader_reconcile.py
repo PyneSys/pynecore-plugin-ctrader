@@ -168,11 +168,13 @@ def _deal_res(*deals, has_more=False) -> _oa.ProtoOADealListRes:
     return _oa.ProtoOADealListRes(deal=list(deals), hasMore=has_more)
 
 
-def _seed_working(broker, coid, *, order_id, qty):
+def _seed_working(broker, coid, *, order_id, qty, extras=None):
+    base = {'order_id': str(order_id), 'position_id': None}
+    base.update(extras or {})
     broker.store_ctx.upsert_order(
         coid, symbol='EURUSD', side='buy', qty=qty, filled_qty=0.0,
         state='confirmed', pine_entry_id='long', exchange_order_id=str(order_id),
-        extras={'order_id': str(order_id), 'position_id': None},
+        extras=base,
     )
     broker.store_ctx.add_ref(coid, 'order_id', str(order_id))
 
@@ -746,10 +748,13 @@ def _live_coids(broker) -> list[str]:
     return [r.client_order_id for r in broker.store_ctx.iter_live_orders()]
 
 
-def __test_grace_expired_missing_pending_retires_and_raises__(tmp_path):
-    # A bot-owned row stamped missing past the grace window, whose final
-    # deal-history re-check conclusively shows no fill and no close, is retired
-    # as a synthetic cancel and, under the default 'stop' policy, halts the bot.
+def __test_grace_expired_missing_settled_position_retires_benignly__(tmp_path):
+    # A FULLY FILLED row stamped missing past the grace window, whose final
+    # deal-history re-check shows no close and no further fill, is retired as
+    # a benign post-fill close under the core cross-venue contract (measured
+    # on Capital.com: venues surface late CANCELLED echoes for consumed
+    # orders): no cancelled event, no unexpected-cancel policy. A genuine
+    # exposure divergence is caught by the venue-vs-book reconcile instead.
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     _open(tmp_path, broker)
@@ -758,12 +763,13 @@ def __test_grace_expired_missing_pending_retires_and_raises__(tmp_path):
 
     events, err = _drive_tracker(broker)
 
-    assert len(events) == 1
-    assert events[0].event_type == 'cancelled'
-    assert events[0].order.status.name == 'CANCELLED'
-    assert events[0].pine_id == 'long'
-    assert isinstance(err, UnexpectedCancelError)
+    assert events == []
+    assert err is None
     assert 'c1' not in _live_coids(broker)
+    row = broker.store_ctx.get_order('c1')
+    assert row is not None
+    assert row.state == 'closed'
+    assert row.closed_ts_ms is not None
 
 
 def __test_grace_not_expired_missing_pending_is_noop__(tmp_path):
@@ -941,8 +947,8 @@ def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
     broker.quarantine_sink = lambda reason, context: latched.append(
         (reason, context))
     _open(tmp_path, broker)
-    _seed_position(broker, 'q1', position_id=222, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'q1', order_id=222, qty=qty,
+                  extras={'missing_pending_since': 0.0})
 
     events, err = _drive_tracker(broker)
 
@@ -960,8 +966,8 @@ def __test_policy_ignore_retires_without_halting__(tmp_path):
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 'ignore'
     _open(tmp_path, broker)
-    _seed_position(broker, 'c4', position_id=222, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'c4', order_id=222, qty=qty,
+                  extras={'missing_pending_since': 0.0})
 
     events, err = _drive_tracker(broker)
 
@@ -975,8 +981,8 @@ def __test_policy_re_place_retires_without_halting__(tmp_path):
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 're_place'
     _open(tmp_path, broker)
-    _seed_position(broker, 'c5', position_id=222, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'c5', order_id=222, qty=qty,
+                  extras={'missing_pending_since': 0.0})
 
     events, err = _drive_tracker(broker)
 
@@ -992,8 +998,8 @@ def __test_policy_stop_and_cancel_sweeps_siblings_then_halts__(tmp_path):
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 'stop_and_cancel'
     _open(tmp_path, broker)
-    _seed_position(broker, 'gone', position_id=500, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'gone', order_id=500, qty=qty,
+                  extras={'missing_pending_since': 0.0})
     _seed_working(broker, 'sibling', order_id=600, qty=qty)
 
     events, err = _drive_tracker(broker)
@@ -1014,8 +1020,8 @@ def __test_policy_stop_and_cancel_leaves_open_position_sibling__(tmp_path):
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 'stop_and_cancel'
     _open(tmp_path, broker)
-    _seed_position(broker, 'gone', position_id=500, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'gone', order_id=500, qty=qty,
+                  extras={'missing_pending_since': 0.0})
     _seed_working(broker, 'sibling', order_id=600, qty=qty)
     _seed_position(broker, 'open_pos', position_id=700, qty=qty)
 
@@ -1041,8 +1047,8 @@ def __test_policy_stop_and_cancel_leaves_partially_filled_sibling__(tmp_path):
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 'stop_and_cancel'
     _open(tmp_path, broker)
-    _seed_position(broker, 'gone', position_id=500, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'gone', order_id=500, qty=qty,
+                  extras={'missing_pending_since': 0.0})
     _seed_working(broker, 'sibling', order_id=600, qty=qty)
     _seed_partial_working(broker, 'partial', order_id=650, qty=qty,
                           filled=partial, position_id=750)
@@ -1086,8 +1092,8 @@ def __test_policy_stop_and_cancel_keeps_sibling_when_cancel_races_fill__(tmp_pat
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 'stop_and_cancel'
     _open(tmp_path, broker)
-    _seed_position(broker, 'gone', position_id=500, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'gone', order_id=500, qty=qty,
+                  extras={'missing_pending_since': 0.0})
     _seed_working(broker, 'sibling', order_id=600, qty=qty)
     broker._wire.cancel_responses[600] = _fill_exec_event(600)
 
@@ -1104,8 +1110,8 @@ def __test_policy_stop_and_cancel_keeps_sibling_on_cancel_rejected__(tmp_path):
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 'stop_and_cancel'
     _open(tmp_path, broker)
-    _seed_position(broker, 'gone', position_id=500, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'gone', order_id=500, qty=qty,
+                  extras={'missing_pending_since': 0.0})
     _seed_working(broker, 'sibling', order_id=600, qty=qty)
     broker._wire.cancel_responses[600] = _cancel_rejected_event(600)
 
@@ -1123,8 +1129,8 @@ def __test_policy_stop_and_cancel_keeps_sibling_on_ambiguous_cancel__(tmp_path):
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 'stop_and_cancel'
     _open(tmp_path, broker)
-    _seed_position(broker, 'gone', position_id=500, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'gone', order_id=500, qty=qty,
+                  extras={'missing_pending_since': 0.0})
     _seed_working(broker, 'sibling', order_id=600, qty=qty)
     broker._wire.cancel_responses[600] = OrderDispositionUnknownError(
         "cancel timed out", client_order_id='sibling',
@@ -1146,8 +1152,8 @@ def __test_policy_stop_and_cancel_keeps_sibling_on_not_found__(tmp_path):
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
     broker.on_unexpected_cancel = 'stop_and_cancel'
     _open(tmp_path, broker)
-    _seed_position(broker, 'gone', position_id=500, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'gone', order_id=500, qty=qty,
+                  extras={'missing_pending_since': 0.0})
     _seed_working(broker, 'sibling', order_id=600, qty=qty)
     not_found = ExchangeOrderRejectedError("order gone")
     not_found.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
@@ -1166,8 +1172,8 @@ def __test_reconcile_pass_propagates_unexpected_cancel_halt__(tmp_path):
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(_recon(positions=[]), deal_res=_deal_res())
     _open(tmp_path, broker)
-    _seed_position(broker, 'c6', position_id=222, qty=qty,
-                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'c6', order_id=222, qty=qty,
+                  extras={'missing_pending_since': 0.0})
 
     async def collect():
         events: list = []

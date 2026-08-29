@@ -87,6 +87,12 @@ _SCHEDULE_HISTORY_YEARS = 5
 _LIVE_HISTORY_SETTLE_ATTEMPTS = 5
 _LIVE_HISTORY_SETTLE_DELAY_SECONDS = 1.0
 
+#: How long a session-open slot must stay missing — across fully-served
+#: collection passes — before it is accepted as venue-empty (tickless).
+#: Far beyond any observed trendbar publication lag, yet short enough that a
+#: reconnect over a tick-sparse stretch cannot starve the live feed for long.
+_LIVE_HISTORY_HOLE_EVIDENCE_SECONDS = 120.0
+
 #: TradingView timeframe -> ``ProtoOATrendbarPeriod`` enum name.
 _TV_TO_PERIOD = {
     '1': 'M1', '2': 'M2', '3': 'M3', '4': 'M4', '5': 'M5', '10': 'M10',
@@ -126,7 +132,9 @@ class _ProviderMixin(_CTraderBase, ABC):
 
     _live_history_settle_attempts = _LIVE_HISTORY_SETTLE_ATTEMPTS
     _live_history_settle_delay_seconds = _LIVE_HISTORY_SETTLE_DELAY_SECONDS
+    _live_history_hole_evidence_seconds = _LIVE_HISTORY_HOLE_EVIDENCE_SECONDS
     _live_history_bar_ids: set[int]
+    _history_hole_first_missing_ns: dict[int, int]
     _live_generation_wire: WireClient
     _live_connection_generation: int
     _live_wire_identity: int
@@ -1137,6 +1145,30 @@ class _ProviderMixin(_CTraderBase, ABC):
         newest_expected = None if calendar_period else query_ceiling - period_ms
         failure: CTraderWireError | None = None
         coverage_complete = False
+        # Tick-sparse markets have session-open minutes with zero ticks, and
+        # the venue never materialises a trendbar for those slots (measured
+        # live: Pepperstone BTCUSD, Saturday). Such holes are indistinguishable
+        # from an incomplete page by the calendar alone, so they are classified
+        # from venue evidence instead: a slot that stays missing across
+        # fully-served collection passes for longer than any plausible trendbar
+        # publication lag is proven tickless. The first-seen ledger lives on
+        # the provider so evidence keeps accumulating across the reconnect
+        # attempts that each run one of these collections.
+        venue_empty: set[int] = set()
+        hole_first_missing_ns = getattr(
+            self, '_history_hole_first_missing_ns', None)
+        if hole_first_missing_ns is None:
+            hole_first_missing_ns = {}
+            self._history_hole_first_missing_ns = hole_first_missing_ns
+        hole_evidence_ns = int(self._live_history_hole_evidence_seconds * 1e9)
+
+        def unrecovered_slots() -> set[int]:
+            """Expected fixed-grid slots that no pass has recovered yet."""
+            return {
+                slot_timestamp
+                for slot_timestamp in range(cursor, query_ceiling, period_ms)
+                if slot_timestamp not in recovered_by_timestamp
+            }
 
         def settled() -> bool:
             """Whether every expected slot is recovered or calendar-closed."""
@@ -1164,6 +1196,8 @@ class _ProviderMixin(_CTraderBase, ABC):
             assert newest_expected is not None
             for expected_timestamp in range(cursor, query_ceiling, period_ms):
                 if expected_timestamp in recovered_by_timestamp:
+                    continue
+                if expected_timestamp in venue_empty:
                     continue
                 if self._history_slot_is_open(expected_timestamp, timeframe) is not False:
                     return False
@@ -1201,6 +1235,19 @@ class _ProviderMixin(_CTraderBase, ABC):
                 coverage_complete = False
                 if not self._history_failure_is_transient(exc):
                     break
+            if coverage_complete and not calendar_period:
+                now_ns = monotonic_time.monotonic_ns()
+                missing = unrecovered_slots()
+                # A slot recovered by any pass (this collection or a later
+                # window that moved the cursor past it) is no hole anymore.
+                for slot_timestamp in list(hole_first_missing_ns):
+                    if slot_timestamp not in missing:
+                        del hole_first_missing_ns[slot_timestamp]
+                for slot_timestamp in missing:
+                    first_missing_ns = hole_first_missing_ns.setdefault(
+                        slot_timestamp, now_ns)
+                    if now_ns - first_missing_ns >= hole_evidence_ns:
+                        venue_empty.add(slot_timestamp)
             if (
                     coverage_complete and settled()
             ) or attempt + 1 == self._live_history_settle_attempts:
