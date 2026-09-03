@@ -6,11 +6,11 @@ Translates the cTrader Open API ``errorCode`` strings — carried on
 exception taxonomy so the sync engine and risk layer can pattern-match on type
 instead of parsing message strings.
 
-Per project policy the raw cTrader code is NEVER copied into a user-facing
-message; it is logged for diagnostics only and the user sees a clean,
-own-worded reason.
+The messages are own-worded, but they carry the venue's ``errorCode`` (and
+``description`` when present) as the stated reason: a rejection logged from a
+live run must be diagnosable from that single line, and cTrader's execution-
+event rejections deliver nothing but the code.
 """
-import logging
 
 from pynecore.core.broker.exceptions import (
     BrokerError,
@@ -22,7 +22,6 @@ from pynecore.core.plugin import ProviderError
 
 from .wire import CTraderProtocolError
 
-logger = logging.getLogger(__name__)
 
 
 class CTraderBrokerError(ProviderError):
@@ -173,17 +172,17 @@ def map_error_code(
 ) -> BrokerError:
     """Translate a cTrader ``errorCode`` string to the broker taxonomy.
 
-    The raw code is logged for diagnostics; the returned exception carries an
-    own-worded message with no code mimicry (the broker's human ``description``
-    is appended for debugging, which is text, not a code).
+    The returned exception carries an own-worded message; the venue's reason
+    (``errorCode`` plus the human ``description`` when the message form carries
+    one) is appended so a live-log rejection line is diagnosable on its own.
+    ``ProtoOAExecutionEvent`` rejections arrive with a bare code and no
+    description, which is why the code itself must travel in the message.
 
     :param error_code: The cTrader ``errorCode`` string.
     :param description: The optional human-readable description.
     :param retry_after: Venue-provided backoff in seconds, when available.
     :return: A :class:`BrokerError` subclass the execute path can raise.
     """
-    logger.debug("cTrader order rejected: code=%s description=%s",
-                 error_code, description)
     if error_code in _RATE_LIMIT_CODES:
         delay = 1.0 if retry_after is None else max(0.0, retry_after)
         return ExchangeRateLimitError(
@@ -195,8 +194,9 @@ def map_error_code(
             "cTrader declined the order: insufficient margin or trading not "
             "permitted for this size",
         )
+    reason = f"{error_code}: {description}" if description else error_code
     return ExchangeOrderRejectedError(
-        "cTrader rejected the order" + (f": {description}" if description else ""),
+        f"cTrader rejected the order ({reason})" if reason else "cTrader rejected the order",
     )
 
 

@@ -1264,9 +1264,19 @@ def __test_map_error_code_rate_limit__():
 
 
 def __test_map_error_code_generic_reject__():
+    """A generic rejection names the venue reason code and its description."""
     from pynecore.core.broker.exceptions import ExchangeOrderRejectedError
     err = map_error_code('SOMETHING_ELSE', 'bad order')
     assert isinstance(err, ExchangeOrderRejectedError)
+    assert str(err) == "cTrader rejected the order (SOMETHING_ELSE: bad order)"
+
+
+def __test_map_error_code_bare_code_reject_still_names_the_reason__():
+    """``ProtoOAExecutionEvent`` rejections carry only a code — it must survive
+    into the message, otherwise the live log shows a reasonless rejection."""
+    err = map_error_code('POSITION_NOT_FOUND', '')
+    assert str(err) == "cTrader rejected the order (POSITION_NOT_FOUND)"
+    assert str(map_error_code('', '')) == "cTrader rejected the order"
 
 
 def __test_protocol_error_connection_class_is_retryable__():
