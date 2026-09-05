@@ -63,6 +63,7 @@ class _ReauthWire:
     def __init__(self):
         self.requests: list = []
         self.is_connected = True
+        self.disconnect_calls = 0
         self.events = None
         self._scripted: dict = {}
         #: Single "always" outcome for ProtoOAAccountAuthReq (Exception -> raise).
@@ -80,6 +81,10 @@ class _ReauthWire:
         self.app_auth_calls = 0
         self.app_auth_outcomes: list = []
         self.refresh_calls = 0
+
+    async def disconnect(self):
+        self.disconnect_calls += 1
+        self.is_connected = False
 
     def script(self, req_cls, *outcomes):
         """Queue per-request-class outcomes consumed in order on send."""
@@ -523,6 +528,22 @@ def __test_unrecoverable_auth_loss_surfaces_exchange_connection_error__():
 
     with pytest.raises(ExchangeConnectionError):
         asyncio.run(broker._reconcile())
+    # The socket is writable but useless: drop it so the runner's transport
+    # reconnect re-authenticates from scratch instead of waiting for the
+    # feed-staleness watchdog.
+    assert wire.disconnect_calls == 1
+    assert wire.is_connected is False
+
+
+def __test_unrecoverable_auth_loss_on_dead_socket_does_not_disconnect_again__():
+    wire = _ReauthWire().script(_oa.ProtoOAReconcileReq, _AUTH_LOST)
+    wire.account_auth_outcome = CTraderProtocolError('CONNECTIONS_LIMIT_EXCEEDED', 'too many')
+    wire.is_connected = False
+    broker = _ReauthBroker(wire)
+
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker._reconcile())
+    assert wire.disconnect_calls == 0
 
 
 def __test_dispatch_order_unrecoverable_surfaces_connection_error__():
@@ -624,6 +645,35 @@ def __test_account_disconnect_push_triggers_reauth__():
 
     asyncio.run(scenario())
     assert wire.account_auth_calls == 1
+    assert wire.disconnect_calls == 0          # re-won in place, socket kept
+
+
+def __test_failed_proactive_reauth_drops_the_wire_for_transport_reconnect__():
+    # Measured live (ctrader cycle 104): an account-disconnect push whose
+    # re-auth the server refuses ("No pooled connection to main server") left a
+    # writable-but-useless socket for 3 minutes, until the feed-staleness
+    # watchdog fired — position reads were unusable past the engine's grace the
+    # whole time. The failed re-auth must drop the socket so the runner
+    # reconnects (full handshake) right away.
+    wire = _ReauthWire()
+    wire.account_auth_outcome = CTraderProtocolError(
+        'UNKNOWN_ERROR', 'No pooled connection to main server')
+    wire.events = _OneShotEvents([_oa.ProtoOAAccountDisconnectEvent(ctidTraderAccountId=999)])
+    broker = _ReauthBroker(wire)
+
+    async def scenario():
+        try:
+            await broker._event_router_loop(wire)
+        except _StopLoop:
+            pass
+        assert broker._reauth_task is not None
+        await broker._reauth_task
+
+    asyncio.run(scenario())
+    assert wire.account_auth_calls == 1
+    assert wire.disconnect_calls == 1
+    assert wire.is_connected is False
+    assert broker.is_connected is False
 
 
 def __test_account_disconnect_for_other_account_ignored__():

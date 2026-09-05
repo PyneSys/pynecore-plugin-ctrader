@@ -618,9 +618,28 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
             )
         except (CTraderProtocolError, CTraderConnectionError, CTraderTimeoutError,
                 asyncio.TimeoutError) as reauth_exc:
+            await self._drop_live_wire_after_failed_reauth()
             raise ExchangeConnectionError(
                 "cTrader account authorization was lost and could not be restored"
             ) from reauth_exc
+
+    async def _drop_live_wire_after_failed_reauth(self) -> None:
+        """Take the live socket down so the transport reconnect starts now.
+
+        A failed in-place re-auth leaves a socket that is writable but useless:
+        cTrader answers every account request with the auth loss (measured live:
+        a pushed account-disconnect followed by ``UNKNOWN_ERROR: No pooled
+        connection to main server``). :attr:`is_connected` sees only the
+        transport, so the runner would notice through the feed-staleness
+        watchdog minutes later — with position reads unusable past the engine's
+        grace the whole time. Closing the socket flips :attr:`is_connected`, and
+        the runner's reconnect re-authenticates from scratch right away. A socket
+        that is already down needs nothing.
+        """
+        wire = self._wire
+        if wire is None or not wire.is_connected:
+            return
+        await wire.disconnect()
 
     @staticmethod
     def _account_auth_loss(message: Message) -> CTraderProtocolError | None:
@@ -767,8 +786,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
         Runs as a background task so the event router never blocks on the
         handshake, and coalesces a burst of pushes into one in-flight re-auth.
-        Failures are swallowed (logged): the next operational request retries
-        and surfaces an unrecovered loss as :class:`ExchangeConnectionError`.
+        A failed re-auth is logged and drops the live socket, so the transport
+        reconnect re-authenticates from scratch
+        (:meth:`_drop_live_wire_after_failed_reauth`).
 
         :param force_refresh: Refresh the token first (token-invalidated push).
         :param reauth_app: Re-authenticate the application channel first
@@ -782,7 +802,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         )
 
     async def _proactive_reauth(self, *, force_refresh: bool, reauth_app: bool = False) -> None:
-        """Background re-auth body: best-effort, never raises to the router.
+        """Background re-auth body: never raises to the router.
 
         Bounded by :data:`_REAUTH_TIMEOUT` for the same reason the reactive path
         is: this task holds :attr:`_reauth_lock` while it runs, and a slow cTrader
@@ -790,8 +810,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         request timeout) would otherwise wedge the lock far beyond the recovery
         budget — stalling every foreground :meth:`_account_request` that hits an
         auth loss and waits on the same lock, so they keep parking even though the
-        socket is up. An overrun is cancelled (releasing the lock) and logged; the
-        next operational request retries and surfaces an unrecovered loss.
+        socket is up. An overrun is cancelled (releasing the lock) and logged, and
+        the live socket is dropped like any other failed re-auth.
         """
         try:
             await asyncio.wait_for(
@@ -800,7 +820,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
             )
         except (CTraderProtocolError, CTraderConnectionError, CTraderTimeoutError,
                 asyncio.TimeoutError, OSError) as exc:
-            logger.warning("cTrader proactive re-authorization failed: %s", exc)
+            logger.warning(
+                "cTrader proactive re-authorization failed (%s); dropping the live "
+                "connection so the transport reconnect re-authenticates from scratch",
+                exc,
+            )
+            await self._drop_live_wire_after_failed_reauth()
 
     async def _broker_name(self, wire: WireClient, account_id: int) -> str:
         """Fetch the broker whitelabel slug for an authorized account.
