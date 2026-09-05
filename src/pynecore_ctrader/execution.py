@@ -23,7 +23,7 @@ import asyncio
 from abc import ABC
 from collections.abc import Callable
 from time import time as epoch_time
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
@@ -1029,6 +1029,32 @@ class _ExecutionMixin(_CTraderBase, ABC):
             )
         return False
 
+    @staticmethod
+    def _raise_nothing_to_close(
+            intent: CloseIntent, why: str, *, cause: BaseException | None = None,
+    ) -> NoReturn:
+        """Surface a close whose position is already gone.
+
+        :param intent: The close intent being dispatched.
+        :param why: Own-worded reason, e.g. ``"no open position"``.
+        :param cause: The venue reject to chain, when the venue answered.
+        :raises OrderSkippedByPlugin: For script and engine-trigger partial
+            closes — the book is flat on that side, nothing to close.
+        :raises ExchangeOrderRejectedError: For defensive / reversal closes.
+        """
+        if intent.synthetic_kind in (None, 'partial_trigger'):
+            raise OrderSkippedByPlugin(
+                f"cTrader execute_close: {why} for symbol {intent.symbol!r}; "
+                f"nothing to close",
+                intent_key=intent.intent_key,
+                reason='nothing_to_close',
+                context={'symbol': intent.symbol, 'side': intent.side,
+                         'synthetic_kind': intent.synthetic_kind},
+            ) from cause
+        raise ExchangeOrderRejectedError(
+            f"cTrader execute_close: {why} for symbol {intent.symbol!r}"
+        ) from cause
+
     @override
     async def execute_close(
             self, envelope: DispatchEnvelope,
@@ -1039,6 +1065,15 @@ class _ExecutionMixin(_CTraderBase, ABC):
         centi-units (the full position ``volume`` for a full close, a slice for
         a partial). The realized PnL settles on the ``watch_orders`` fill via
         ``deal.closePositionDetail``.
+
+        A close that finds the position already gone — no open position on the
+        symbol, or the venue answering the close with a not-found code — is
+        already satisfied: the book is flat there and the settling fill arrives
+        on the event stream. Script closes and engine-trigger partial closes
+        surface that as a non-halting :class:`OrderSkippedByPlugin` so the
+        engine re-evaluates against the settled book; defensive and reversal
+        closes keep the loud reject, their producers own dedicated recovery
+        contracts.
         """
         intent = envelope.intent
         assert isinstance(intent, CloseIntent)
@@ -1046,10 +1081,7 @@ class _ExecutionMixin(_CTraderBase, ABC):
         rules = await self._get_symbol_rules(intent.symbol)
         position_id = await self._find_open_position_id(intent.symbol)
         if position_id is None:
-            raise ExchangeOrderRejectedError(
-                f"cTrader execute_close: no open position for symbol "
-                f"{intent.symbol!r}"
-            )
+            self._raise_nothing_to_close(intent, "no open position")
         volume = quantize_volume(intent.qty, rules.step_volume)
         # Same fallback identity as ``close_leg``: a close fill on a
         # startup-adopted position reverse-maps through this record when no
@@ -1057,13 +1089,25 @@ class _ExecutionMixin(_CTraderBase, ABC):
         self._close_dispatch_pine_by_position[position_id] = (
                 intent.pine_id or None
         )
-        event = await self._dispatch_order(
-            OpenApiMessages.ProtoOAClosePositionReq(
-                ctidTraderAccountId=self._live_account_id,
-                positionId=position_id, volume=volume,
-            ),
-            coid=coid, context="close",
-        )
+        try:
+            event = await self._dispatch_order(
+                OpenApiMessages.ProtoOAClosePositionReq(
+                    ctidTraderAccountId=self._live_account_id,
+                    positionId=position_id, volume=volume,
+                ),
+                coid=coid, context="close",
+            )
+        except ExchangeOrderRejectedError as exc:
+            # The position closed between the lookup and the close landing
+            # (measured live: the native fail-safe SL took the whole position
+            # in the same tick the software SL-partial closes dispatched).
+            cause = exc.__cause__
+            if isinstance(cause, CTraderProtocolError) and is_not_found(cause.error_code):
+                self._raise_nothing_to_close(
+                    intent, f"the position closed before the close landed "
+                            f"({cause.error_code})", cause=exc,
+                )
+            raise
         if self.store_ctx is not None:
             self.store_ctx.log_event(
                 'close_dispatched', client_order_id=coid,

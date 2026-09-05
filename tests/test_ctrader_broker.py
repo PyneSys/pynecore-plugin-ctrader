@@ -365,6 +365,88 @@ def __test_close_request_uses_position_and_volume__():
     assert order.reduce_only is True
 
 
+def _open_eurusd_position(position_id=777, volume=1000):
+    res = _oa.ProtoOAReconcileRes()
+    res.position.append(_model.ProtoOAPosition(
+        positionId=position_id,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=volume,
+                                          tradeSide=_model.ProtoOATradeSide.BUY),
+    ))
+    return res
+
+
+def _position_not_found_reject() -> ExchangeOrderRejectedError:
+    reject = ExchangeOrderRejectedError(
+        "cTrader rejected the order (POSITION_NOT_FOUND)")
+    reject.__cause__ = CTraderProtocolError('POSITION_NOT_FOUND', '')
+    return reject
+
+
+def __test_close_racing_the_native_failsafe_is_a_non_halting_skip__():
+    # The native fail-safe SL took the whole position in the same tick the
+    # software SL-partial close dispatched: the venue answers the close with
+    # POSITION_NOT_FOUND. The book is flat there — surface "nothing to close"
+    # instead of the fatal close reject (measured live, ctrader cycle 103).
+    broker = _FakeBroker(reconcile=_open_eurusd_position())
+    broker._raise_on_dispatch = _position_not_found_reject()
+    intent = CloseIntent(
+        pine_id="__pyne_partial_trigger__L-X1\0L\0sl_partial", symbol="EURUSD",
+        side="sell", qty=5.0, synthetic_kind='partial_trigger', target_entry_id='L',
+    )
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.execute_close(_envelope(intent)))
+    assert exc.value.reason == 'nothing_to_close'
+    assert 'POSITION_NOT_FOUND' in str(exc.value)
+    assert isinstance(broker.sent[0], _oa.ProtoOAClosePositionReq)
+
+
+def __test_script_close_on_vanished_position_is_a_non_halting_skip__():
+    broker = _FakeBroker(reconcile=_open_eurusd_position())
+    broker._raise_on_dispatch = _position_not_found_reject()
+    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=10.0)
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.execute_close(_envelope(intent)))
+    assert exc.value.reason == 'nothing_to_close'
+
+
+def __test_script_close_without_open_position_is_a_non_halting_skip__():
+    # No open position on the symbol at lookup time: same "already satisfied"
+    # outcome, no request goes to the wire.
+    broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes())
+    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=10.0)
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.execute_close(_envelope(intent)))
+    assert exc.value.reason == 'nothing_to_close'
+    assert broker.sent == []
+
+
+def __test_defensive_close_on_vanished_position_keeps_the_reject__():
+    # Defensive / reversal closes have their own recovery contracts in the
+    # engine — the not-found race stays a loud reject for them.
+    broker = _FakeBroker(reconcile=_open_eurusd_position())
+    broker._raise_on_dispatch = _position_not_found_reject()
+    intent = CloseIntent(
+        pine_id="__pyne_defensive_close__L", symbol="EURUSD", side="sell",
+        qty=10.0, synthetic_kind='defensive_close', target_position_coid='coid-L',
+    )
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.execute_close(_envelope(intent)))
+    broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes())
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.execute_close(_envelope(intent)))
+
+
+def __test_close_reject_for_another_reason_propagates__():
+    broker = _FakeBroker(reconcile=_open_eurusd_position())
+    reject = ExchangeOrderRejectedError("cTrader rejected the order (SOMETHING_ELSE)")
+    reject.__cause__ = CTraderProtocolError('SOMETHING_ELSE', '')
+    broker._raise_on_dispatch = reject
+    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=10.0)
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.execute_close(_envelope(intent)))
+
+
 # === watch_orders: execution-event translation ============================
 
 def __test_translate_entry_fill__():
