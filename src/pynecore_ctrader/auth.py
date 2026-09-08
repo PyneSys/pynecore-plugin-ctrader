@@ -75,6 +75,31 @@ class CTraderAuthError(CTraderWireError):
         super().__init__(f"{error_code}: {description}" if description else error_code)
 
 
+class CTraderAccountsUnavailableError(CTraderWireError):
+    """The venue lists no account of the required kind for a token pair it still honours.
+
+    Raised when ``ProtoOAGetAccountListByAccessTokenReq`` comes back without a
+    usable account even after a successful ``ProtoOARefreshTokenReq`` on the
+    same socket. A refresh only succeeds while the application's grant on the
+    account is intact, so the empty list is a venue-side availability fault
+    (the account service not serving the grant), not a revoked or expired
+    consent — the startup connect backoff and the live reconnect should wait
+    it out rather than halt on a user-actionable auth error.
+
+    :ivar kind: ``"demo"`` or ``"live"`` — the account kind the host requires.
+    """
+
+    retryable: bool = True
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        super().__init__(
+            f"NO_TRADING_ACCOUNTS: the venue lists no {kind} accounts for the token pair "
+            "although the refresh token is still honoured; waiting for the account "
+            "service to serve the grant again"
+        )
+
+
 async def exchange_code(
         *, client_id: str, client_secret: str, code: str, redirect_uri: str
 ) -> TokenSet:

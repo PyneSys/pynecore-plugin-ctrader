@@ -870,9 +870,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         :return: The selected (and authorized) account id.
         :raises CTraderAuthError: If the choice is empty or ambiguous.
         """
-        want_live = not self._demo
-        pool = [a for a in accounts if a.isLive == want_live]
-        kind = "live" if want_live else "demo"
+        pool = self._grant_pool(accounts)
+        kind = self._account_kind()
         if not pool:
             raise auth.CTraderAuthError(
                 "NO_TRADING_ACCOUNTS", f"the access token grants no {kind} accounts"
@@ -931,10 +930,75 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         """
         await self._app_auth(wire)
         accounts = await self._get_accounts(wire)
+        if not self._grant_pool(accounts):
+            accounts = await self._relist_after_refresh(wire)
         account_id = await self._resolve_account(wire, accounts)
         env = 'demo' if self._demo else 'live'
         self._account_id = f"ctrader-{env}-{account_id}"
         return account_id
+
+    def _account_kind(self) -> str:
+        """The account kind this host serves: ``"demo"`` or ``"live"``."""
+        return "demo" if self._demo else "live"
+
+    def _grant_pool(
+            self, accounts: list[OpenApiModelMessages.ProtoOACtidTraderAccount]
+    ) -> list[OpenApiModelMessages.ProtoOACtidTraderAccount]:
+        """Filter the token's account list to the kind this host trades."""
+        want_live = not self._demo
+        return [a for a in accounts if a.isLive == want_live]
+
+    async def _relist_after_refresh(
+            self, wire: WireClient
+    ) -> list[OpenApiModelMessages.ProtoOACtidTraderAccount]:
+        """Re-enumerate accounts on a fresh access token after an empty listing.
+
+        The account-list request answers a token the venue no longer serves
+        with an EMPTY list, not an error, so the refresh-on-error path of
+        :meth:`_token_call` never triggers for it. An empty list therefore has
+        two very different causes that only a refresh can tell apart:
+
+        - the token pair is intact and the venue's account service merely did
+          not serve the grant (observed live: a 40+ minute window where a token
+          that traded fine minutes earlier — and listed the account again the
+          next day — enumerated nothing) — a transient to wait out;
+        - the consent was revoked or the account removed — permanent.
+
+        A successful ``ProtoOARefreshTokenReq`` proves the grant is intact, so
+        a still-empty listing afterwards is classified as the retryable
+        :class:`~pynecore_ctrader.auth.CTraderAccountsUnavailableError`; a
+        rejected refresh is the permanent case and surfaces as the
+        user-actionable ``NO_TRADING_ACCOUNTS`` auth error. The rotated pair is
+        persisted by :meth:`_refresh_and_persist`.
+
+        :param wire: A connected, application-authenticated client.
+        :return: The refreshed, non-empty account list.
+        :raises CTraderAuthError: If there is no refresh token, or the refresh
+            is rejected — consent must be redone.
+        :raises CTraderAccountsUnavailableError: If the venue still lists no
+            account of the host's kind on the fresh token.
+        """
+        kind = self._account_kind()
+        if not self._tokens.refresh_token:
+            raise auth.CTraderAuthError(
+                "NO_TRADING_ACCOUNTS", f"the access token grants no {kind} accounts"
+            )
+        logger.warning(
+            "cTrader lists no %s accounts for the access token; refreshing the token "
+            "to tell a venue-side outage from a revoked grant", kind,
+        )
+        try:
+            await self._refresh_and_persist(wire)
+        except CTraderProtocolError as exc:
+            raise auth.CTraderAuthError(
+                "NO_TRADING_ACCOUNTS",
+                f"the access token grants no {kind} accounts and the refresh token was "
+                f"rejected ({exc.error_code}); re-run 'pyne ctrader auth'",
+            ) from exc
+        accounts = await self._get_accounts(wire)
+        if not self._grant_pool(accounts):
+            raise auth.CTraderAccountsUnavailableError(kind)
+        return accounts
 
     # --- one-shot synchronous bridge ----------------------------------------
 

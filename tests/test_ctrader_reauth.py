@@ -11,6 +11,8 @@ from pynecore.core.broker.exceptions import (
     OrderDispositionUnknownError,
 )
 
+from pynecore.core.plugin import is_retryable_provider_error
+
 from pynecore_ctrader import CTrader, CTraderConfig
 from pynecore_ctrader import auth
 from pynecore_ctrader.exceptions import (
@@ -836,3 +838,141 @@ def __test_proactive_reauth_timeout_releases_lock__(monkeypatch):
         assert broker._reauth_generation == 1
 
     asyncio.run(scenario())
+
+
+# === Startup handshake: empty account list ================================
+
+
+def _demo_account(ctid: int = 999) -> _model.ProtoOACtidTraderAccount:
+    return _model.ProtoOACtidTraderAccount(ctidTraderAccountId=ctid, isLive=False)
+
+
+def _account_list(*accounts) -> _oa.ProtoOAGetAccountListByAccessTokenRes:
+    res = _oa.ProtoOAGetAccountListByAccessTokenRes()
+    res.ctidTraderAccount.extend(accounts)
+    return res
+
+
+def _handshake_broker(wire: _ReauthWire) -> _ReauthBroker:
+    broker = _ReauthBroker(wire)
+    broker._live_account_id = None
+    return broker
+
+
+def __test_empty_account_list_refreshes_and_relists_before_resolving__(monkeypatch):
+    # The venue answers a token it no longer serves with an EMPTY list, not an
+    # error, so the refresh-on-error path never fires for it. The handshake
+    # refreshes once, persists the rotated pair, and resolves the account from
+    # the fresh listing instead of halting on NO_TRADING_ACCOUNTS.
+    saved: list = []
+    monkeypatch.setattr(
+        'pynecore_ctrader.session.save_session',
+        lambda tokens, *, demo: saved.append(tokens),
+    )
+    live_only = _model.ProtoOACtidTraderAccount(ctidTraderAccountId=5, isLive=True)
+    wire = _ReauthWire().script(
+        _oa.ProtoOAGetAccountListByAccessTokenReq,
+        _account_list(live_only),  # nothing of the demo host's kind
+        _account_list(_demo_account()),
+    )
+    broker = _handshake_broker(wire)
+
+    account_id = asyncio.run(broker._full_handshake(wire))
+
+    assert account_id == 999
+    assert broker.account_id == "ctrader-demo-999"
+    assert wire.refresh_calls == 1
+    assert saved and saved[-1].access_token == "fresh-access"
+    assert [type(request).__name__ for request in wire.requests] == [
+        "ProtoOAApplicationAuthReq",
+        "ProtoOAGetAccountListByAccessTokenReq",
+        "ProtoOARefreshTokenReq",
+        "ProtoOAGetAccountListByAccessTokenReq",
+        "ProtoOAAccountAuthReq",
+    ]
+    # The relisting ran on the fresh token, not the stale one.
+    assert wire.requests[3].accessToken == "fresh-access"
+
+
+def __test_still_empty_after_refresh_is_a_retryable_availability_fault__(monkeypatch):
+    # A refresh only succeeds while the grant is intact, so a listing that is
+    # still empty afterwards is a venue-side outage: retryable, so the startup
+    # connect backoff waits it out instead of exiting with an auth error.
+    monkeypatch.setattr('pynecore_ctrader.session.save_session', lambda *a, **k: None)
+    wire = _ReauthWire().script(
+        _oa.ProtoOAGetAccountListByAccessTokenReq,
+        _account_list(),
+        _account_list(),
+    )
+    broker = _handshake_broker(wire)
+
+    with pytest.raises(auth.CTraderAccountsUnavailableError) as caught:
+        asyncio.run(broker._full_handshake(wire))
+
+    assert caught.value.kind == "demo"
+    assert is_retryable_provider_error(caught.value)
+    assert not isinstance(caught.value, auth.CTraderAuthError)
+    assert wire.refresh_calls == 1
+    assert wire.account_auth_calls == 0
+
+
+def __test_empty_account_list_with_rejected_refresh_is_terminal__(monkeypatch):
+    # The refresh token being rejected means the consent is gone: a permanent,
+    # user-actionable auth error that must NOT be retried.
+    monkeypatch.setattr('pynecore_ctrader.session.save_session', lambda *a, **k: None)
+    wire = _ReauthWire().script(
+        _oa.ProtoOAGetAccountListByAccessTokenReq,
+        _account_list(),
+        _account_list(_demo_account()),
+    )
+    wire.refresh_outcome = CTraderProtocolError('CH_ACCESS_TOKEN_INVALID', 'refresh rejected')
+    broker = _handshake_broker(wire)
+
+    with pytest.raises(auth.CTraderAuthError) as caught:
+        asyncio.run(broker._full_handshake(wire))
+
+    assert caught.value.error_code == "NO_TRADING_ACCOUNTS"
+    assert "CH_ACCESS_TOKEN_INVALID" in str(caught.value)
+    assert not is_retryable_provider_error(caught.value)
+    assert wire.refresh_calls == 1
+    # No second listing is attempted on a token that could not be refreshed.
+    assert sum(isinstance(r, _oa.ProtoOAGetAccountListByAccessTokenReq) for r in wire.requests) == 1
+
+
+def __test_empty_account_list_without_refresh_token_is_terminal__(monkeypatch):
+    # Without a refresh token nothing can tell an outage from a revoked grant,
+    # so the empty listing stays the classic terminal auth error.
+    monkeypatch.setattr('pynecore_ctrader.session.save_session', lambda *a, **k: None)
+    wire = _ReauthWire().script(
+        _oa.ProtoOAGetAccountListByAccessTokenReq,
+        _account_list(),
+        _account_list(_demo_account()),
+    )
+    broker = _handshake_broker(wire)
+    broker._tokens = auth.TokenSet(access_token="tok", refresh_token="", expires_in=0)
+
+    with pytest.raises(auth.CTraderAuthError) as caught:
+        asyncio.run(broker._full_handshake(wire))
+
+    assert caught.value.error_code == "NO_TRADING_ACCOUNTS"
+    assert not is_retryable_provider_error(caught.value)
+    assert wire.refresh_calls == 0
+
+
+def __test_populated_account_list_never_refreshes__(monkeypatch):
+    # The refresh is a diagnostic for the empty case only: a normal listing
+    # resolves the account on the cached token without rotating anything.
+    saved: list = []
+    monkeypatch.setattr(
+        'pynecore_ctrader.session.save_session',
+        lambda tokens, *, demo: saved.append(tokens),
+    )
+    wire = _ReauthWire().script(
+        _oa.ProtoOAGetAccountListByAccessTokenReq,
+        _account_list(_demo_account()),
+    )
+    broker = _handshake_broker(wire)
+
+    assert asyncio.run(broker._full_handshake(wire)) == 999
+    assert wire.refresh_calls == 0
+    assert saved == []
