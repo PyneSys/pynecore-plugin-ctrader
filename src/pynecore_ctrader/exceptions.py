@@ -42,6 +42,14 @@ _NOT_FOUND_CODES = frozenset({
     'ALREADY_CLOSED',
 })
 
+#: ``errorCode`` strings meaning the position exists but is busy: another
+#: venue operation (a native stop-loss fill, an amend) is executing on it, so
+#: the request cannot run right now. The book settles through the event
+#: stream; a re-evaluation against the fresh snapshot decides what is left.
+_POSITION_LOCKED_CODES = frozenset({
+    'POSITION_LOCKED',
+})
+
 #: ``errorCode`` strings meaning a margin / funds / trading-permission
 #: rejection. At entry the engine downgrades these to a skip so the bot keeps
 #: running; surfacing them as the typed margin subclass aids that routing.
@@ -151,6 +159,20 @@ def is_not_found(error_code: str) -> bool:
     :return: ``True`` if the referenced entity is known not to exist.
     """
     return error_code in _NOT_FOUND_CODES
+
+
+def is_position_locked(error_code: str) -> bool:
+    """Whether ``error_code`` means the position is busy with another operation.
+
+    The position still exists, but the venue is executing something on it
+    (measured live: the native fail-safe stop filling in the same tick the
+    engine-trigger partial close dispatched). Close paths treat it as a
+    transient decline — the fill or the next snapshot settles the book.
+
+    :param error_code: The cTrader ``errorCode`` string.
+    :return: ``True`` if the position is in a state that refuses the operation.
+    """
+    return error_code in _POSITION_LOCKED_CODES
 
 
 def is_rate_limited(error_code: str) -> bool:

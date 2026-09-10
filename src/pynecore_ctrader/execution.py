@@ -69,6 +69,7 @@ from ._base import _CTraderBase
 from .exceptions import (
     CTraderBrokerError,
     is_not_found,
+    is_position_locked,
     map_error_code,
     map_protocol_error,
 )
@@ -1073,7 +1074,11 @@ class _ExecutionMixin(_CTraderBase, ABC):
         surface that as a non-halting :class:`OrderSkippedByPlugin` so the
         engine re-evaluates against the settled book; defensive and reversal
         closes keep the loud reject, their producers own dedicated recovery
-        contracts.
+        contracts. A close the venue refuses because the position is busy
+        (``POSITION_LOCKED``: another operation is executing on it) gets the
+        same non-halting treatment with its own reason — the position may
+        still hold size, so the engine re-evaluates against the next
+        snapshot instead of retiring the close.
         """
         intent = envelope.intent
         assert isinstance(intent, CloseIntent)
@@ -1107,6 +1112,23 @@ class _ExecutionMixin(_CTraderBase, ABC):
                     intent, f"the position closed before the close landed "
                             f"({cause.error_code})", cause=exc,
                 )
+            # The same race one step earlier: the native fail-safe fill is
+            # still executing, so the venue answers POSITION_LOCKED instead
+            # of not-found (measured live: ctrader cycle 116). The fill
+            # settles the book on the event stream; the leg re-arms and
+            # re-evaluates against the fresh snapshot.
+            if (isinstance(cause, CTraderProtocolError)
+                    and is_position_locked(cause.error_code)
+                    and intent.synthetic_kind in (None, 'partial_trigger')):
+                raise OrderSkippedByPlugin(
+                    f"cTrader execute_close: the position is busy with another "
+                    f"venue operation for symbol {intent.symbol!r} "
+                    f"({cause.error_code}); re-evaluating next tick",
+                    intent_key=intent.intent_key,
+                    reason='position_locked',
+                    context={'symbol': intent.symbol, 'side': intent.side,
+                             'synthetic_kind': intent.synthetic_kind},
+                ) from exc
             raise
         if self.store_ctx is not None:
             self.store_ctx.log_event(

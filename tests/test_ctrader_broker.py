@@ -401,6 +401,48 @@ def __test_close_racing_the_native_failsafe_is_a_non_halting_skip__():
     assert isinstance(broker.sent[0], _oa.ProtoOAClosePositionReq)
 
 
+def _position_locked_reject() -> ExchangeOrderRejectedError:
+    reject = ExchangeOrderRejectedError(
+        "cTrader rejected the order (POSITION_LOCKED)")
+    reject.__cause__ = CTraderProtocolError('POSITION_LOCKED', '')
+    return reject
+
+
+def __test_close_racing_the_native_failsafe_fill_in_flight_is_a_non_halting_skip__():
+    # The same race one step earlier: the fail-safe fill is still executing,
+    # so the venue answers POSITION_LOCKED rather than not-found (measured
+    # live, ctrader cycle 116). The position may still hold size — surface a
+    # distinct non-halting skip so the leg re-arms against the next snapshot.
+    broker = _FakeBroker(reconcile=_open_eurusd_position())
+    broker._raise_on_dispatch = _position_locked_reject()
+    intent = CloseIntent(
+        pine_id="__pyne_partial_trigger__L-X1\0L\0sl_partial", symbol="EURUSD",
+        side="sell", qty=5.0, synthetic_kind='partial_trigger', target_entry_id='L',
+    )
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.execute_close(_envelope(intent)))
+    assert exc.value.reason == 'position_locked'
+    assert 'POSITION_LOCKED' in str(exc.value)
+    assert isinstance(broker.sent[0], _oa.ProtoOAClosePositionReq)
+    broker = _FakeBroker(reconcile=_open_eurusd_position())
+    broker._raise_on_dispatch = _position_locked_reject()
+    intent = CloseIntent(pine_id="Long", symbol="EURUSD", side="sell", qty=10.0)
+    with pytest.raises(OrderSkippedByPlugin) as exc:
+        asyncio.run(broker.execute_close(_envelope(intent)))
+    assert exc.value.reason == 'position_locked'
+
+
+def __test_defensive_close_on_locked_position_keeps_the_reject__():
+    broker = _FakeBroker(reconcile=_open_eurusd_position())
+    broker._raise_on_dispatch = _position_locked_reject()
+    intent = CloseIntent(
+        pine_id="__pyne_defensive_close__L", symbol="EURUSD", side="sell",
+        qty=10.0, synthetic_kind='defensive_close', target_position_coid='coid-L',
+    )
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.execute_close(_envelope(intent)))
+
+
 def __test_script_close_on_vanished_position_is_a_non_halting_skip__():
     broker = _FakeBroker(reconcile=_open_eurusd_position())
     broker._raise_on_dispatch = _position_not_found_reject()
