@@ -1270,6 +1270,39 @@ def __test_close_leg_builds_close_request__():
     assert closes[0].positionId == 7 and closes[0].volume == 2000
 
 
+def __test_close_leg_racing_the_native_failsafe_fill_is_a_plugin_skip__():
+    # The one-way fan path of the cycle-116 race (measured live, ctrader cycle
+    # 121): the fail-safe fill is still executing on the leg the engine-trigger
+    # partial close targets, so the venue answers POSITION_LOCKED. The leg
+    # must surface as a plugin skip the core emulator can route, never as a
+    # raw reject.
+    broker = _FakeBroker()
+    broker._raise_on_dispatch = _position_locked_reject()
+    with pytest.raises(OrderSkippedByPlugin) as info:
+        asyncio.run(broker.close_leg("EURUSD", "7", 2000, "coid-c"))
+    assert info.value.reason == 'position_locked'
+    assert info.value.intent_key == "coid-c"
+    assert info.value.context == {'symbol': "EURUSD", 'leg_id': "7"}
+    assert isinstance(info.value.__cause__, ExchangeOrderRejectedError)
+
+
+def __test_close_leg_on_a_vanished_position_is_a_nothing_to_close_skip__():
+    broker = _FakeBroker()
+    broker._raise_on_dispatch = _position_not_found_reject()
+    with pytest.raises(OrderSkippedByPlugin) as info:
+        asyncio.run(broker.close_leg("EURUSD", "7", 2000, "coid-c"))
+    assert info.value.reason == 'nothing_to_close'
+
+
+def __test_close_leg_other_rejects_propagate__():
+    broker = _FakeBroker()
+    reject = ExchangeOrderRejectedError("cTrader rejected the order (TRADING_DISABLED)")
+    reject.__cause__ = CTraderProtocolError('TRADING_DISABLED', '')
+    broker._raise_on_dispatch = reject
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(broker.close_leg("EURUSD", "7", 2000, "coid-c"))
+
+
 def __test_place_leg_builds_new_order_request__():
     broker = _FakeBroker()
     intent = EntryIntent(pine_id="L", symbol="EURUSD", side="buy", qty=10.0,

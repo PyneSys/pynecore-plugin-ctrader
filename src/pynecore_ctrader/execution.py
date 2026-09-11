@@ -864,18 +864,49 @@ class _ExecutionMixin(_CTraderBase, ABC):
         # emulator persists the leg row under the deterministic ``coid``
         # (``{parent}:{leg_id}``) with the close's ``pine_entry_id``.
         pine_id: str | None = None
+        intent_key = coid
         if self.store_ctx is not None:
             row = self.store_ctx.get_order(coid)
             if row is not None:
                 pine_id = row.pine_entry_id
+                intent_key = row.intent_key or coid
         self._close_dispatch_pine_by_position[int(leg_id)] = pine_id
-        await self._dispatch_order(
-            OpenApiMessages.ProtoOAClosePositionReq(
-                ctidTraderAccountId=self._live_account_id,
-                positionId=int(leg_id), volume=volume,
-            ),
-            coid=coid, context="close leg",
-        )
+        try:
+            await self._dispatch_order(
+                OpenApiMessages.ProtoOAClosePositionReq(
+                    ctidTraderAccountId=self._live_account_id,
+                    positionId=int(leg_id), volume=volume,
+                ),
+                coid=coid, context="close leg",
+            )
+        except ExchangeOrderRejectedError as exc:
+            # The same races ``execute_close`` handles, on the one-way fan
+            # path (measured live: ctrader cycle 121, the native fail-safe
+            # fill locking the leg the engine-trigger partial close targeted).
+            # The core emulator decides whether the skip is non-halting for
+            # this close kind or must stay a definitive reject.
+            cause = exc.__cause__
+            if not isinstance(cause, CTraderProtocolError):
+                raise
+            if is_not_found(cause.error_code):
+                raise OrderSkippedByPlugin(
+                    f"cTrader close leg {leg_id} for symbol {symbol!r}: the "
+                    f"position closed before the close landed "
+                    f"({cause.error_code}); nothing to close",
+                    intent_key=intent_key,
+                    reason='nothing_to_close',
+                    context={'symbol': symbol, 'leg_id': leg_id},
+                ) from exc
+            if is_position_locked(cause.error_code):
+                raise OrderSkippedByPlugin(
+                    f"cTrader close leg {leg_id} for symbol {symbol!r}: the "
+                    f"position is busy with another venue operation "
+                    f"({cause.error_code}); re-evaluating next tick",
+                    intent_key=intent_key,
+                    reason='position_locked',
+                    context={'symbol': symbol, 'leg_id': leg_id},
+                ) from exc
+            raise
 
     async def reject_out_of_range(
             self, envelope: DispatchEnvelope, qty: float,
