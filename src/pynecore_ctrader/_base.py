@@ -145,6 +145,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self.symbol = instrument
 
         self._demo = bool(getattr(config, 'demo', False))
+        self._host_override = str(getattr(config, 'host', '') or '')
+        self._port_override = int(getattr(config, 'port', 0) or 0)
         # Optional numeric ``ctidTraderAccountId`` selector from the user config
         # (tie-breaker when one broker holds several accounts). This is NOT the
         # ``BrokerPlugin.account_id`` identity — that inherited ``str | None``
@@ -311,7 +313,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
     def _make_wire(self) -> WireClient:
         """Build a wire client for the configured demo/live host."""
-        return WireClient(helpers.protobuf_host(self._demo))
+        return WireClient(*helpers.protobuf_endpoint(
+            self._demo, self._host_override, self._port_override,
+        ))
 
     @staticmethod
     async def _wait_rate_limit_retry(seconds: float) -> None:

@@ -10,6 +10,7 @@ Hosts, ports and the OAuth endpoints are taken from the official Spotware
 ``OpenApiPy`` reference (``ctrader_open_api/endpoints.py``); the wire-level
 constants mirror its ``TcpProtocol`` (``Int32StringReceiver``).
 """
+import os
 from typing import cast
 
 #: Protobuf API hosts. Demo and live are fully separate systems.
@@ -71,6 +72,24 @@ def protobuf_host(demo: bool) -> str:
     :return: The hostname to connect to.
     """
     return PROTOBUF_DEMO_HOST if demo else PROTOBUF_LIVE_HOST
+
+
+def protobuf_endpoint(demo: bool, host: str = "", port: int = 0) -> tuple[str, int]:
+    """Return the protobuf ``(host, port)`` to dial.
+
+    A per-process override (``PYNE_CTRADER_HOST`` / ``PYNE_CTRADER_PORT``)
+    wins over the config overrides, which win over the venue endpoint.
+
+    :param demo: ``True`` for the demo system, ``False`` for live.
+    :param host: The config's ``host`` field (empty keeps the venue host).
+    :param port: The config's ``port`` field (``0`` keeps the venue port).
+    :return: Host and port.
+    """
+    env_port = os.environ.get("PYNE_CTRADER_PORT", "")
+    return (
+        os.environ.get("PYNE_CTRADER_HOST") or host or protobuf_host(demo),
+        int(env_port) if env_port else (port or PROTOBUF_PORT),
+    )
 
 
 def parse_protocol_id(value: object, *, field: str) -> int:

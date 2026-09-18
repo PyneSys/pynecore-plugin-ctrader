@@ -35,3 +35,12 @@ class CTraderConfig(LiveProviderConfig):
 
     account_id: str = ""
     """The ctidTraderAccountId to trade and stream on, selected from the access token's account list."""
+
+    host: str = ""
+    """Optional protobuf API host override (a proxy in front of the venue). Leave
+    empty for the demo/live host. ``PYNE_CTRADER_HOST`` in the environment wins
+    over this field."""
+
+    port: int = 0
+    """Optional protobuf API port override; ``0`` keeps the venue port.
+    ``PYNE_CTRADER_PORT`` wins over this field."""
