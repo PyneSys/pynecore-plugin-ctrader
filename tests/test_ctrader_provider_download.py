@@ -270,3 +270,60 @@ def __test_download_outlives_a_drained_history_quota__():
         1_800_000_000_000 + 60_000 * step for step in range(3)
     ]
     assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 120.0]
+
+
+class _ContainingHistoryWire(_HistoryWire):
+    """Wire fake with the venue's real window semantics: a bar is served when
+    its span overlaps the window, so the bar CONTAINING ``fromTimestamp`` comes
+    back even when ``fromTimestamp`` is past its opening."""
+
+    def __init__(self, opens: list[datetime], *, request_cap: int) -> None:
+        super().__init__(opens)
+        self.request_cap = request_cap
+
+    async def send_request(self, request):
+        if isinstance(request, _oa.ProtoOAGetTrendbarsReq):
+            if len(self.windows) >= self.request_cap:
+                raise AssertionError(
+                    f"download did not terminate within {self.request_cap} requests"
+                )
+            self.windows.append((request.fromTimestamp, request.toTimestamp))
+            matched = [
+                _trendbar(moment) for moment in self.opens
+                if int(moment.timestamp() * 1000) + 60_000 > request.fromTimestamp
+                and int(moment.timestamp() * 1000) < request.toTimestamp
+            ]
+            return _oa.ProtoOAGetTrendbarsRes(trendbar=matched, hasMore=False)
+        return await super().send_request(request)
+
+
+def __test_download_ends_when_the_venue_only_re_serves_the_newest_bar__():
+    """A closed market must not turn the download into a request storm.
+
+    (Live incident: warmup started during a symbol holiday; the venue answered
+    every window resumed one millisecond past the last pre-holiday bar with
+    that same bar, the cursor crept one millisecond per request and the loop
+    hammered the trendbar endpoint for eight minutes until the venue's
+    throttle killed the cycle.)
+    """
+    last_open = datetime(2026, 9, 25, 21, 59, tzinfo=timezone.utc)
+    minute_opens = [
+        datetime(2026, 9, 25, 21, 57, tzinfo=timezone.utc),
+        datetime(2026, 9, 25, 21, 58, tzinfo=timezone.utc),
+        last_open,
+    ]
+    wire = _ContainingHistoryWire(minute_opens, request_cap=20)
+    provider = _provider(wire, "1")
+
+    provider.download_ohlcv(
+        datetime(2026, 9, 25, 21, 57),
+        datetime(2026, 9, 26, 3, 24),
+    )
+
+    assert [candle.timestamp for candle in provider.saved] == [  # type: ignore[attr-defined]
+        int(moment.timestamp() * 1000) for moment in minute_opens
+    ]
+    # First window: all three bars; second window (resumed one millisecond past
+    # 21:59): only the re-served 21:59 bar, which is not progress, so the window
+    # is skipped forward to its end and the download ends.
+    assert len(wire.windows) == 2

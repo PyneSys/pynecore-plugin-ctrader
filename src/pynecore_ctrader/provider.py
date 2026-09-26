@@ -7,7 +7,8 @@ Implements the :class:`~pynecore.core.plugin.ProviderPlugin` /
 - timeframe conversion between TradingView strings and ``ProtoOATrendbarPeriod``,
 - broker and symbol listing (``--list-brokers`` / ``--list-symbols``),
 - symbol metadata (:meth:`update_symbol_info`) from ``ProtoOASymbol`` plus the
-  asset list, with the weekly trading schedule mapped to PyneCore sessions,
+  asset list, with the weekly trading schedule mapped to PyneCore sessions and
+  the symbol holidays to date-specific session corrections,
 - historical OHLCV via paged ``ProtoOAGetTrendbarsReq`` (bid) with the ask side
   reconstructed from paged ``ProtoOAGetTickDataReq`` (``ASK``), and
 - live OHLCV from ``ProtoOASpotEvent`` trendbars.
@@ -58,6 +59,7 @@ from .messages.OpenApiMessages_pb2 import (
     ProtoOASymbolsListRes,
 )
 from .messages.OpenApiModelMessages_pb2 import (
+    ProtoOAHoliday,
     ProtoOAInterval,
     ProtoOALightSymbol,
     ProtoOAQuoteType,
@@ -343,6 +345,8 @@ class _ProviderMixin(_CTraderBase, ABC):
 
         opening_hours, session_starts, session_ends, session_schedules = \
             self._schedule_to_sessions(list(detail.schedule), detail.scheduleTimeZone)
+        session_corrections = self._holidays_to_corrections(
+            list(detail.holiday), detail.scheduleTimeZone, opening_hours)
 
         # ``basecurrency`` must be a genuine currency: PyneCore treats the
         # ``(basecurrency, currency)`` tuple strictly as an FX pair for
@@ -388,7 +392,93 @@ class _ProviderMixin(_CTraderBase, ABC):
             session_starts=session_starts,
             session_ends=session_ends,
             session_schedules=session_schedules,
+            session_corrections=session_corrections,
         )
+
+    def _holidays_to_corrections(
+            self,
+            holidays: list[ProtoOAHoliday],
+            schedule_tz: str,
+            opening_hours: list[SymInfoInterval],
+    ) -> dict[date, tuple[SymInfoInterval, ...]]:
+        """Map cTrader's symbol holidays to PyneCore session corrections.
+
+        A :class:`ProtoOAHoliday` closes the symbol for ``[startSecond,
+        endSecond)`` counted from midnight of ``holidayDate`` (days since the
+        epoch) in the holiday's own ``scheduleTimeZone``; a recurring holiday
+        repeats on the same month and day every year. The venue rejects orders
+        inside that window (``SYMBOL_HAS_HOLIDAY``) and sends no bars, so the
+        window must be part of the session calendar: each exchange-local date
+        the window touches gets a correction holding that date's weekly
+        intervals with the closed window cut out (an empty tuple when nothing
+        of the day remains). Recurring holidays are projected onto the
+        :data:`_SCHEDULE_HISTORY_YEARS` history plus the current and next
+        year, matching the schedule history depth.
+
+        :param holidays: The symbol's holiday list.
+        :param schedule_tz: The symbol schedule timezone, the fallback for a
+            holiday that carries no timezone of its own.
+        :param opening_hours: The current week's rendered intervals in
+            ``self.timezone`` (single-day segments, as :meth:`_schedule_to_sessions`
+            produces them).
+        :return: Corrections keyed by exchange-local date.
+        :raises ValueError: If the venue supplies an invalid nonempty timezone.
+        """
+        dst = ZoneInfo(self.timezone)
+        corrections: dict[date, tuple[SymInfoInterval, ...]] = {}
+        if not holidays:
+            return corrections
+        current_year = datetime.now(dst).year
+        years = range(current_year - _SCHEDULE_HISTORY_YEARS, current_year + 2)
+
+        def cut(day: date, closed_from: datetime, closed_to: datetime) -> None:
+            base = corrections.get(day)
+            if base is None:
+                base = tuple(iv for iv in opening_hours if iv.day == day.weekday())
+            kept: list[SymInfoInterval] = []
+            for iv in base:
+                start = datetime.combine(day, iv.start, tzinfo=dst)
+                end = datetime.combine(day, iv.end, tzinfo=dst)
+                if end <= closed_from or start >= closed_to:
+                    kept.append(iv)
+                    continue
+                if start < closed_from:
+                    kept.append(SymInfoInterval(
+                        day=iv.day, start=iv.start, end=closed_from.time()))
+                if end > closed_to:
+                    kept.append(SymInfoInterval(
+                        day=iv.day, start=closed_to.time(), end=iv.end))
+            corrections[day] = tuple(kept)
+
+        for holiday in holidays:
+            tz_name = holiday.scheduleTimeZone or schedule_tz
+            try:
+                src = ZoneInfo(tz_name) if tz_name else ZoneInfo('UTC')
+            except (ZoneInfoNotFoundError, ValueError) as error:
+                raise ValueError(
+                    f"Invalid cTrader holiday timezone: {tz_name!r}"
+                ) from error
+            first = date(1970, 1, 1) + timedelta(days=holiday.holidayDate)
+            dates = [first]
+            if holiday.isRecurring:
+                dates = []
+                for year in years:
+                    try:
+                        dates.append(first.replace(year=year))
+                    except ValueError:  # Feb 29 in a non-leap year
+                        continue
+            for holiday_date in dates:
+                midnight = datetime.combine(holiday_date, time(0, 0), tzinfo=src)
+                closed_from = (midnight + timedelta(seconds=holiday.startSecond)).astimezone(dst)
+                closed_to = (midnight + timedelta(seconds=holiday.endSecond)).astimezone(dst)
+                if closed_to <= closed_from:
+                    continue
+                day = closed_from.date()
+                last = (closed_to - timedelta(microseconds=1)).date()
+                while day <= last:
+                    cut(day, closed_from, closed_to)
+                    day += timedelta(days=1)
+        return corrections
 
     def _schedule_to_sessions(
             self, schedule: list[ProtoOAInterval], schedule_tz: str
@@ -516,6 +606,18 @@ class _ProviderMixin(_CTraderBase, ABC):
                 bars_by_open, covered = await self._fetch_trendbar_window(
                     wire, account_id, symbol_id, period, cursor, end_ms
                 )
+                # The venue serves the bar that CONTAINS ``fromTimestamp``, so a
+                # window resumed one millisecond past the newest bar read gets
+                # that same bar back. While the market is open it comes with
+                # newer bars; on a closed market (holiday, weekend) it is the
+                # only bar in the answer, and taking it as progress would resume
+                # one millisecond further and re-read it forever, one request
+                # per iteration against the venue's request pacing. A bar older
+                # than the cursor is therefore never progress.
+                bars_by_open = {
+                    opening: bar for opening, bar in bars_by_open.items()
+                    if opening >= cursor
+                }
                 if not bars_by_open:
                     cursor = end_ms
                     continue

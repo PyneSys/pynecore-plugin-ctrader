@@ -5,7 +5,7 @@ Regression coverage for cTrader live OHLCV reconnect backfill.
 """
 import asyncio
 import types
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from pynecore.core.syminfo import SymInfo, SymInfoInterval
 from pynecore.types.ohlcv import OHLCV
@@ -79,9 +79,14 @@ class _HistoryWire:
 class _SymbolInfoWire:
     """Symbol metadata wire with configurable initial rate limits."""
 
-    def __init__(self, blocked_requests: int = 1) -> None:
+    def __init__(
+            self,
+            blocked_requests: int = 1,
+            holidays: list[_model.ProtoOAHoliday] | None = None,
+    ) -> None:
         self.blocked_requests = blocked_requests
         self.symbol_list_requests = 0
+        self.holidays = holidays or []
 
     async def send_request(self, request):
         if isinstance(request, _oa.ProtoOASymbolsListReq):
@@ -120,6 +125,10 @@ class _SymbolInfoWire:
                         maxVolume=10_000_000,
                         scheduleTimeZone="UTC",
                         measurementUnits="EUR",
+                        schedule=[
+                            _model.ProtoOAInterval(startSecond=0, endSecond=604799),
+                        ],
+                        holiday=self.holidays,
                     )
                 ]
             )
@@ -1676,3 +1685,127 @@ def __test_reconnect_hole_needs_aged_evidence_before_settling__(monkeypatch):
     asyncio.run(provider.on_reconnect())
 
     assert [bar.timestamp for bar in provider._pending_bars] == [served_ts * 1000]
+
+
+def _all_week_hours() -> list[SymInfoInterval]:
+    """The 24/7 schedule rendered the way ``_schedule_to_sessions`` splits it."""
+    return [
+        SymInfoInterval(day=day, start=time(0, 0), end=time(23, 59, 59))
+        for day in range(7)
+    ]
+
+
+def __test_symbol_holiday_becomes_session_correction__():
+    """A one-off venue holiday cuts its window out of the touched local dates.
+
+    Pepperstone published ``Break 01:00 - 07:00`` (Europe/Moscow) for day
+    20722 = 2026-09-25: 22:00 UTC that Friday to 04:00 UTC Saturday. Orders
+    in that window are rejected with ``SYMBOL_HAS_HOLIDAY`` and no bars
+    arrive, so the live calendar must show both dates as partially closed.
+    """
+    provider = _provider(_HistoryWire([]))
+    holiday = _model.ProtoOAHoliday(
+        holidayId=4682,
+        name="Break 01:00 - 07:00",
+        scheduleTimeZone="Europe/Moscow",
+        holidayDate=20722,
+        isRecurring=False,
+        startSecond=3600,
+        endSecond=25200,
+    )
+
+    corrections = provider._holidays_to_corrections(
+        [holiday], "America/New_York", _all_week_hours())
+
+    assert corrections == {
+        date(2026, 9, 25): (SymInfoInterval(day=4, start=time(0, 0), end=time(22, 0)),),
+        date(2026, 9, 26): (SymInfoInterval(day=5, start=time(4, 0), end=time(23, 59, 59)),),
+    }
+
+
+def __test_full_day_holiday_closes_the_date__():
+    """A whole-day holiday leaves an empty correction: no trading at all."""
+    provider = _provider(_HistoryWire([]))
+    holiday = _model.ProtoOAHoliday(
+        holidayId=1,
+        name="Christmas",
+        scheduleTimeZone="UTC",
+        holidayDate=(date(2025, 12, 25) - date(1970, 1, 1)).days,
+        isRecurring=False,
+        startSecond=0,
+        endSecond=86400,
+    )
+
+    corrections = provider._holidays_to_corrections([holiday], "UTC", _all_week_hours())
+
+    assert corrections == {date(2025, 12, 25): ()}
+
+
+def __test_recurring_holiday_is_projected_onto_every_year__():
+    """A recurring holiday repeats on its month/day across the schedule history."""
+    provider = _provider(_HistoryWire([]))
+    holiday = _model.ProtoOAHoliday(
+        holidayId=2,
+        name="New Year",
+        scheduleTimeZone="UTC",
+        holidayDate=(date(2020, 1, 1) - date(1970, 1, 1)).days,
+        isRecurring=True,
+        startSecond=0,
+        endSecond=86400,
+    )
+
+    corrections = provider._holidays_to_corrections([holiday], "UTC", _all_week_hours())
+
+    this_year = datetime.now(timezone.utc).year
+    assert date(this_year, 1, 1) in corrections
+    assert date(this_year + 1, 1, 1) in corrections
+    assert date(this_year - _provider_module._SCHEDULE_HISTORY_YEARS, 1, 1) in corrections
+    assert all(hours == () for hours in corrections.values())
+    assert len(corrections) == _provider_module._SCHEDULE_HISTORY_YEARS + 2
+
+
+def __test_holiday_without_timezone_uses_schedule_timezone__():
+    """A holiday that names no zone is read in the symbol schedule zone."""
+    provider = _provider(_HistoryWire([]))
+    holiday = _model.ProtoOAHoliday(
+        holidayId=3,
+        name="Break",
+        scheduleTimeZone="",
+        holidayDate=(date(2026, 9, 25) - date(1970, 1, 1)).days,
+        isRecurring=False,
+        startSecond=3600,
+        endSecond=25200,
+    )
+
+    corrections = provider._holidays_to_corrections(
+        [holiday], "Europe/Moscow", _all_week_hours())
+
+    # 01:00-07:00 Moscow on 2026-09-25 is 22:00 UTC the day before to 04:00 UTC.
+    assert set(corrections) == {date(2026, 9, 24), date(2026, 9, 25)}
+
+    try:
+        provider._holidays_to_corrections([holiday], "Invalid/Timezone", _all_week_hours())
+    except ValueError as error:
+        assert "Invalid cTrader holiday timezone" in str(error)
+    else:
+        raise AssertionError("invalid holiday timezone was accepted")
+
+
+def __test_symbol_info_carries_holiday_corrections__():
+    """``update_symbol_info`` publishes the venue holidays on the SymInfo."""
+    wire = _SymbolInfoWire(holidays=[
+        _model.ProtoOAHoliday(
+            holidayId=4,
+            name="Break",
+            scheduleTimeZone="UTC",
+            holidayDate=(date(2026, 9, 25) - date(1970, 1, 1)).days,
+            isRecurring=False,
+            startSecond=0,
+            endSecond=86400,
+        )
+    ])
+    provider = _SymbolInfoProvider(wire)
+
+    syminfo = provider.update_symbol_info()
+
+    assert syminfo.session_corrections == {date(2026, 9, 25): ()}

@@ -357,8 +357,8 @@ class WireClient:
         except CTraderProtocolError as exc:
             if exc.error_code == "BLOCKED_PAYLOAD_TYPE":
                 logger.warning(
-                    "cTrader request %s was rate-limited",
-                    type(message).__name__,
+                    "cTrader request %s was rate-limited (retryAfter=%s)",
+                    type(message).__name__, exc.retry_after,
                 )
             raise
         return result
