@@ -730,6 +730,7 @@ def __test_reconnect_retries_after_a_permanently_failing_history_endpoint__(monk
     )
     provider = _provider(wire)
     provider._live_history_settle_delay_seconds = 0
+    provider._live_history_publication_lag_seconds = 0
     provider._last_live_closed_bar = OHLCV(
         timestamp=last_ts * 1000,
         open=1.14,
@@ -1147,6 +1148,7 @@ def __test_connected_gap_partial_open_session_history_is_not_committed__():
     wire = _HistoryWire([_trendbar(returned_ts, 114_020)])
     provider = _provider(wire)
     provider._live_history_settle_attempts = 1
+    provider._live_history_publication_lag_seconds = 0
     anchor = _closed(anchor_ts)
     candidate = _closed(candidate_ts)
     provider._last_live_closed_bar = anchor
@@ -1350,6 +1352,7 @@ def __test_connected_gap_empty_open_session_history_forces_fresh_connection__():
     candidate_ts = anchor_ts + 2 * 60
     wire = _HistoryWire([])
     provider = _provider(wire)
+    provider._live_history_publication_lag_seconds = 0
     provider._last_live_closed_bar = _closed(anchor_ts)
     candidate = _closed(candidate_ts)
     provider._pending_bars.append(candidate)
@@ -1399,6 +1402,7 @@ def __test_connected_gap_dst_spring_forward_requires_history__():
     candidate_moment = datetime(2027, 3, 14, 7, 30, tzinfo=timezone.utc)
     wire = _HistoryWire([])
     provider = _provider(wire, "60")
+    provider._live_history_publication_lag_seconds = 0
     provider._live_history_settle_attempts = 1
     assert provider.syminfo is not None
     provider.syminfo.timezone = "America/New_York"
@@ -1447,6 +1451,7 @@ def __test_connected_gap_dst_fallback_hour_requires_history__():
     candidate_moment = datetime(2027, 11, 7, 6, tzinfo=timezone.utc)
     wire = _HistoryWire([])
     provider = _provider(wire, "60")
+    provider._live_history_publication_lag_seconds = 0
     provider._live_history_settle_attempts = 1
     assert provider.syminfo is not None
     provider.syminfo.timezone = "America/New_York"
@@ -1519,6 +1524,7 @@ def __test_connected_weekly_gap_checks_days_after_closed_opening_day__():
     ]
     wire = _HistoryWire([])
     provider = _provider(wire, "1W")
+    provider._live_history_publication_lag_seconds = 0
     provider._live_history_settle_attempts = 1
     assert provider.syminfo is not None
     provider.syminfo.session_corrections[opens[1].date()] = ()
@@ -1658,6 +1664,7 @@ def __test_reconnect_hole_needs_aged_evidence_before_settling__(monkeypatch):
     current_ts = last_ts + 180
     wire = _HistoryWire([_trendbar(served_ts, 114_020)])
     provider = _provider(wire)
+    provider._live_history_publication_lag_seconds = 0
     provider._live_history_settle_delay_seconds = 0
     provider._last_live_closed_bar = _closed(last_ts)
     _freeze(monkeypatch, datetime.fromtimestamp(current_ts + 2, timezone.utc))
@@ -1685,6 +1692,93 @@ def __test_reconnect_hole_needs_aged_evidence_before_settling__(monkeypatch):
     asyncio.run(provider.on_reconnect())
 
     assert [bar.timestamp for bar in provider._pending_bars] == [served_ts * 1000]
+
+
+class _LaggingHistoryWire(_HistoryWire):
+    """History wire whose every read advances a test-owned monotonic clock."""
+
+    def __init__(
+        self,
+        history: list[_model.ProtoOATrendbar],
+        *,
+        clock: dict[str, int],
+        publish_after_reads: int | None,
+        read_seconds: int,
+    ) -> None:
+        super().__init__(history)
+        self.clock = clock
+        self.publish_after_reads = publish_after_reads
+        self.read_seconds = read_seconds
+        self.history_reads = 0
+
+    async def send_request(self, request):
+        if isinstance(request, _oa.ProtoOAGetTrendbarsReq):
+            self.history_reads += 1
+            self.clock["ns"] += self.read_seconds * 1_000_000_000
+            if (
+                self.publish_after_reads is None
+                or self.history_reads < self.publish_after_reads
+            ):
+                self.requests.append(request)
+                return _oa.ProtoOAGetTrendbarsRes(trendbar=[], hasMore=False)
+        return await super().send_request(request)
+
+
+def _lagging_reconnect(
+    monkeypatch, *, publish_after_reads: int | None,
+) -> tuple[CTrader, _LaggingHistoryWire]:
+    """Reconnect with one slot that closed two seconds before the wall clock."""
+    last_ts = 1_800_000_000
+    missed_ts = last_ts + 60
+    current_ts = last_ts + 120
+    clock = {"ns": 0}
+    wire = _LaggingHistoryWire(
+        [_trendbar(missed_ts, 114_010)],
+        clock=clock,
+        publish_after_reads=publish_after_reads,
+        read_seconds=10,
+    )
+    provider = _provider(wire)
+    provider._live_history_settle_delay_seconds = 0
+    provider._live_history_publication_poll_seconds = 0
+    provider._last_live_closed_bar = _closed(last_ts)
+    _freeze(monkeypatch, datetime.fromtimestamp(current_ts + 2, timezone.utc))
+    monkeypatch.setattr(
+        _provider_module,
+        "monotonic_time",
+        types.SimpleNamespace(monotonic_ns=lambda: clock["ns"]),
+    )
+    return provider, wire
+
+
+def __test_reconnect_polls_for_a_late_published_bar_past_the_settle_budget__(monkeypatch):
+    """A just-closed bar the venue publishes a minute late is awaited in place."""
+    provider, wire = _lagging_reconnect(monkeypatch, publish_after_reads=7)
+
+    asyncio.run(provider.on_reconnect())
+
+    assert wire.history_reads == 7
+    assert wire.history_reads > provider._live_history_settle_attempts
+    assert [bar.timestamp for bar in provider._pending_bars] == [
+        (1_800_000_000 + 60) * 1000
+    ]
+
+
+def __test_reconnect_publication_wait_is_bounded_by_the_lag__(monkeypatch):
+    """A slot still missing once it has aged past the lag fails the backfill."""
+    provider, wire = _lagging_reconnect(monkeypatch, publish_after_reads=None)
+
+    try:
+        asyncio.run(provider.on_reconnect())
+        raised = False
+    except CTraderConnectionError:
+        raised = True
+
+    assert raised
+    assert not provider._pending_bars
+    # Five settle reads, then one poll per ten simulated seconds until the
+    # ninety-second lag has elapsed since the collection started.
+    assert provider._live_history_settle_attempts < wire.history_reads <= 15
 
 
 def _all_week_hours() -> list[SymInfoInterval]:

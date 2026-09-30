@@ -89,6 +89,15 @@ _SCHEDULE_HISTORY_YEARS = 5
 _LIVE_HISTORY_SETTLE_ATTEMPTS = 5
 _LIVE_HISTORY_SETTLE_DELAY_SECONDS = 1.0
 
+#: How long after its close a trendbar may still be absent from the history
+#: read model before its absence counts as evidence (measured live: Pepperstone
+#: BTCUSD M1 served the just-closed bar 50-73 s after the close). A missing
+#: open slot younger than this is awaited in place, polled at the second
+#: interval, instead of failing the collection: every reconnect attempt would
+#: otherwise open a fresh, equally young slot and never converge.
+_LIVE_HISTORY_PUBLICATION_LAG_SECONDS = 90.0
+_LIVE_HISTORY_PUBLICATION_POLL_SECONDS = 5.0
+
 #: How long a session-open slot must stay missing — across fully-served
 #: collection passes — before it is accepted as venue-empty (tickless).
 #: Far beyond any observed trendbar publication lag, yet short enough that a
@@ -135,6 +144,8 @@ class _ProviderMixin(_CTraderBase, ABC):
     _live_history_settle_attempts = _LIVE_HISTORY_SETTLE_ATTEMPTS
     _live_history_settle_delay_seconds = _LIVE_HISTORY_SETTLE_DELAY_SECONDS
     _live_history_hole_evidence_seconds = _LIVE_HISTORY_HOLE_EVIDENCE_SECONDS
+    _live_history_publication_lag_seconds = _LIVE_HISTORY_PUBLICATION_LAG_SECONDS
+    _live_history_publication_poll_seconds = _LIVE_HISTORY_PUBLICATION_POLL_SECONDS
     _live_history_bar_ids: set[int]
     _history_hole_first_missing_ns: dict[int, int]
     _live_generation_wire: WireClient
@@ -1213,7 +1224,10 @@ class _ProviderMixin(_CTraderBase, ABC):
 
         This method never mutates the pending queue or the accepted closed-bar
         cursor. Inclusive venue edges are filtered locally and duplicate
-        timestamps collapse before the result is returned.
+        timestamps collapse before the result is returned. A slot the venue
+        has not had time to publish yet is polled for until it either arrives
+        or ages past the publication lag; an older missing open slot is a
+        tickless hole only once its first-seen evidence has aged.
 
         :param wire: Frozen wire used for every request in this collection.
         :param account_id: Frozen live account identity.
@@ -1263,6 +1277,11 @@ class _ProviderMixin(_CTraderBase, ABC):
             hole_first_missing_ns = {}
             self._history_hole_first_missing_ns = hole_first_missing_ns
         hole_evidence_ns = int(self._live_history_hole_evidence_seconds * 1e9)
+        # Wall-clock youth of a missing slot is aged on the monotonic clock
+        # from one wall-clock reading, so a slow venue answer cannot skew it.
+        publication_lag_ms = int(self._live_history_publication_lag_seconds * 1000)
+        wall_start_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        collection_start_ns = monotonic_time.monotonic_ns()
 
         def unrecovered_slots() -> set[int]:
             """Expected fixed-grid slots that no pass has recovered yet."""
@@ -1305,7 +1324,29 @@ class _ProviderMixin(_CTraderBase, ABC):
                     return False
             return True
 
-        for attempt in range(self._live_history_settle_attempts):
+        def awaiting_publication() -> bool:
+            """Whether an open slot is missing only because it closed too recently."""
+            if calendar_period:
+                return False
+            elapsed_ms = (monotonic_time.monotonic_ns() - collection_start_ns) // 1_000_000
+            if elapsed_ms >= publication_lag_ms:
+                # Nothing that was closed when this collection started can
+                # still be unpublished, whatever the two clocks disagree on.
+                return False
+            published_before = wall_start_ms + elapsed_ms - publication_lag_ms
+            for expected_timestamp in range(cursor, query_ceiling, period_ms):
+                if expected_timestamp in recovered_by_timestamp:
+                    continue
+                if expected_timestamp in venue_empty:
+                    continue
+                if expected_timestamp + period_ms <= published_before:
+                    continue
+                if self._history_slot_is_open(expected_timestamp, timeframe) is not False:
+                    return True
+            return False
+
+        attempt = 0
+        while True:
             query_cursor = cursor
             attempt_complete = True
             try:
@@ -1350,12 +1391,21 @@ class _ProviderMixin(_CTraderBase, ABC):
                         slot_timestamp, now_ns)
                     if now_ns - first_missing_ns >= hole_evidence_ns:
                         venue_empty.add(slot_timestamp)
-            if (
-                    coverage_complete and settled()
-            ) or attempt + 1 == self._live_history_settle_attempts:
+            attempt += 1
+            if coverage_complete and settled():
+                break
+            if attempt < self._live_history_settle_attempts:
+                await self._wait_provider_retry(
+                    self._live_history_settle_delay_seconds
+                )
+                continue
+            # Past the settle budget only a fully-served pass that still lacks a
+            # bar the venue has not had time to publish keeps polling; the youth
+            # bound makes this wait finite whatever the venue does.
+            if not (coverage_complete and awaiting_publication()):
                 break
             await self._wait_provider_retry(
-                self._live_history_settle_delay_seconds
+                self._live_history_publication_poll_seconds
             )
 
         complete = coverage_complete and settled()
