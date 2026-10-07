@@ -574,6 +574,41 @@ def __test_translate_recovers_parked_entry_fill_by_coid__(tmp_path):
     assert 'c1' not in broker.store_ctx.replay()[1]
 
 
+def __test_translate_never_resurrects_a_closed_row_by_coid__(tmp_path):
+    """A coid echo on a row the journal already CLOSED is external, not a recovery.
+
+    The reported rotation incident: a predecessor instance's resting STOP entry
+    kept working at the venue under a coid whose journal row had since been
+    reused, filled and closed by a later entry cycle. When the STOP finally
+    fired, the coid matched the closed row, the recovery re-confirmed it and the
+    engine booked the fill onto a position it no longer managed. A closed row
+    proves the cycle is over — the fill is dropped as external activity and the
+    reconcile verdict surfaces the unmanaged leg instead.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='pine1', pine_entry_id='pine1',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    broker.store_ctx.upsert_order('c1', state='confirmed', filled_qty=10.0)
+    broker.store_ctx.close_order('c1')
+
+    order = _make_order(order_id=111, executed=1000, position_id=222,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    order.clientOrderId = 'c1'
+    deal = _model.ProtoOADeal(dealId=5, filledVolume=1000, executionPrice=1.2345)
+    out = broker._translate_exec_event(
+        _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order, deal=deal))
+
+    assert out is None
+    assert len(_ignored_external(broker)) == 1
+    # The closed row stays closed: no ref backfill, no state rewrite.
+    assert broker.store_ctx.find_by_ref('order_id', '111') is None
+    assert broker.store_ctx.get_order('c1').closed_ts_ms is not None
+
+
 def __test_translate_suppresses_push_already_counted_by_reconcile__(tmp_path):
     """A PUSH entry fill whose cumulative the reconcile working-row path already
     counted (durable cursor ahead) is suppressed — not re-applied — while later

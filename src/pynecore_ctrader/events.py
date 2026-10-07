@@ -530,12 +530,16 @@ class _EventStreamMixin(_CTraderBase, ABC):
         Entry path only: a close fill carries no ``clientOrderId``
         (``ProtoOAClosePositionReq`` has no such field), so the ``closingOrder``
         guard keeps a coid match from ever reclassifying a close as an entry.
+        Live rows only: a row the journal already closed belongs to a finished
+        entry cycle, so a venue order still echoing its coid is not that
+        cycle's dispatch — resurrecting the row would book the fill onto a
+        position the engine no longer manages.
         """
         if (self.store_ctx is None or not order.clientOrderId
                 or order.closingOrder):
             return None
         row = self.store_ctx.get_order(order.clientOrderId)
-        if row is None or row.pine_entry_id is None:
+        if row is None or row.pine_entry_id is None or row.closed_ts_ms is not None:
             return None
         coid = row.client_order_id
         order_id = str(order.orderId)
