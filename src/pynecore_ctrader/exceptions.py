@@ -17,6 +17,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
     InsufficientMarginError,
+    MarketClosedError,
 )
 from pynecore.core.plugin import ProviderError
 
@@ -58,6 +59,15 @@ _MARGIN_CODES = frozenset({
     'NO_ENOUGH_MONEY_TO_OPEN_POSITION',
     'TRADING_BAD_VOLUME',
     'TRADING_DISABLED',
+})
+
+#: ``errorCode`` strings meaning the symbol is not tradable right now: a
+#: scheduled session pause (measured live: Pepperstone BTCUSD 20:59–21:01 UTC
+#: answers ``MARKET_CLOSED``) or a broker holiday. Nothing landed and the
+#: position is untouched, so the engine re-evaluates once trading resumes.
+_MARKET_CLOSED_CODES = frozenset({
+    'MARKET_CLOSED',
+    'SYMBOL_HAS_HOLIDAY',
 })
 
 #: ``errorCode`` strings meaning the client exceeded a request-rate budget.
@@ -217,6 +227,8 @@ def map_error_code(
             "permitted for this size",
         )
     reason = f"{error_code}: {description}" if description else error_code
+    if error_code in _MARKET_CLOSED_CODES:
+        return MarketClosedError(f"cTrader declined the order: market closed ({reason})")
     return ExchangeOrderRejectedError(
         f"cTrader rejected the order ({reason})" if reason else "cTrader rejected the order",
     )

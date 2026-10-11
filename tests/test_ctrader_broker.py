@@ -1455,6 +1455,15 @@ def __test_map_error_code_rate_limit__():
                       ExchangeRateLimitError)
 
 
+def __test_map_error_code_market_closed__():
+    """Session-pause and holiday codes map to the typed market-closed reject."""
+    from pynecore.core.broker.exceptions import MarketClosedError
+    err = map_error_code('MARKET_CLOSED', 'Trading is not available: Market is closed.')
+    assert isinstance(err, MarketClosedError)
+    assert 'MARKET_CLOSED' in str(err)
+    assert isinstance(map_error_code('SYMBOL_HAS_HOLIDAY'), MarketClosedError)
+
+
 def __test_map_error_code_generic_reject__():
     """A generic rejection names the venue reason code and its description."""
     from pynecore.core.broker.exceptions import ExchangeOrderRejectedError
