@@ -39,7 +39,7 @@ from pynecore.core.broker.store_helpers import (
 from pynecore.types.strategy import JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY
 
 from ._base import _CTraderBase
-from .helpers import money_value, parse_protocol_id, volume_to_units
+from .helpers import REQUEST_TIMEOUT, money_value, parse_protocol_id, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .state import _ORDER_STATUS_MAP, _ORDER_TYPE_MAP
@@ -76,6 +76,20 @@ _BACKLOG_WATERMARK = 1000
 #: disappearance grace window. Engine-ordered: the pass runs when the engine
 #: next resumes the ``watch_orders`` iterator, not on a hard wall clock.
 _RECONCILE_CADENCE_S = 5.0
+
+#: I/O budget (seconds) of one reconcile pass. ``watch_orders`` delivers no
+#: queued PUSH message while the pass runs, so the pass bounds how late a fill
+#: can reach the engine. The snapshot read, every deal-history read and every
+#: sibling cancel share this budget (each capped to what is left), so one
+#: stalled request, not one per vanished row or history page, is the longest
+#: hold. Kept within ``fill_report_grace_s`` together with the venue's own
+#: push latency.
+_RECONCILE_PASS_BUDGET_S = REQUEST_TIMEOUT
+
+#: Fraction of the reconcile pass budget the sibling cancels an earlier pass
+#: deferred may spend before the pass's reads, so reads that keep spending the
+#: whole budget cannot starve them, nor they the reads.
+_SIBLING_CANCEL_SHARE = 0.5
 
 
 class _EventStreamMixin(_CTraderBase, ABC):
@@ -151,10 +165,13 @@ class _EventStreamMixin(_CTraderBase, ABC):
     async def _run_reconcile_pass(self) -> AsyncIterator[OrderEvent]:
         """Run one reconcile-snapshot pass, isolating transient failures.
 
-        Two sub-passes in order: :meth:`_reconcile_snapshot` (gap-fill missed
-        fills, stamp / clear ``missing_pending_since``), then
-        :meth:`_emit_unexpected_cancellations` (retire rows missing past the
-        grace window). A recoverable reconcile error — a transport hiccup on
+        Steps in order: :meth:`_drain_sibling_cancels` (the
+        ``stop_and_cancel`` sweep cancels an earlier pass deferred), then
+        :meth:`_reconcile_snapshot` (gap-fill missed fills, stamp / clear
+        ``missing_pending_since``), then :meth:`_emit_unexpected_cancellations`
+        (retire rows missing past the grace window, which may queue a new
+        sweep), then :meth:`_drain_sibling_cancels` again for what is queued.
+        A recoverable reconcile error — a transport hiccup on
         the snapshot or the deal-history bridge request — is logged and
         swallowed so the PUSH stream (the primary order-event source) is never
         torn down by the gap-filler. A deliberate halt from the
@@ -172,13 +189,38 @@ class _EventStreamMixin(_CTraderBase, ABC):
         (~5 minutes); the rest log at DEBUG. The line that closes the streak
         ("recovered after N failed passes") is WARNING again so the recovery
         is visible at the same console level as the failure it answers.
+
+        The pass holds the PUSH stream for its whole run, so its reads share
+        the :data:`_RECONCILE_PASS_BUDGET_S` deadline: a snapshot read that
+        overruns it fails the pass as transient, and a deal-history walk that
+        reaches it is inconclusive for now — the next pass resumes that walk
+        where it stopped, ahead of the walks read more recently. Sibling
+        cancels the budget leaves unsent wait for the next pass, which sends
+        them first within :data:`_SIBLING_CANCEL_SHARE` of it; a halt finishes them
+        without the budget, since it ends the stream anyway.
         """
+        pass_start = asyncio.get_running_loop().time()
+        pass_deadline = pass_start + _RECONCILE_PASS_BUDGET_S
         try:
+            if self._pending_sibling_cancels:
+                self._reconcile_pass_deadline = (
+                    pass_start + _RECONCILE_PASS_BUDGET_S * _SIBLING_CANCEL_SHARE)
+                await self._drain_sibling_cancels()
+            self._reconcile_pass_deadline = pass_deadline
             async for event in self._reconcile_snapshot():
                 yield event
             async for event in self._emit_unexpected_cancellations():
                 yield event
+            await self._drain_sibling_cancels()
         except BrokerManualInterventionError:
+            # The halt ends the PUSH stream anyway: finish the sibling cancel
+            # sweep without the pass budget before the engine stops.
+            self._reconcile_pass_deadline = None
+            # noinspection PyBroadException
+            try:
+                await self._drain_sibling_cancels()
+            except Exception:  # noqa: BLE001 - the halt must still propagate
+                logger.exception("cTrader sibling cancel sweep failed before the halt")
             raise
         except Exception as exc:  # noqa: BLE001 - gap-filler must not kill the PUSH stream
             self._reconcile_fail_streak += 1
@@ -194,6 +236,8 @@ class _EventStreamMixin(_CTraderBase, ABC):
                     self._reconcile_fail_streak,
                 )
                 self._reconcile_fail_streak = 0
+        finally:
+            self._reconcile_pass_deadline = None
 
     def _translate_exec_event(self, message) -> OrderEvent | None:
         """Translate one execution / order-error message into an OrderEvent.

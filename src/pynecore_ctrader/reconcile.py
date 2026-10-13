@@ -33,9 +33,10 @@ Scope (2.1): existing ``confirmed`` local rows only. A crash between the entry
 wire-send and its post-ack persist leaves no local row at all — that zero-row
 recovery is the M3 startup-recovery's job, not this loop's.
 """
+import asyncio
 import logging
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator, cast
 
@@ -58,9 +59,10 @@ from pynecore.core.broker.models import (
 )
 
 from ._base import _CTraderBase
-from .helpers import money_value, parse_protocol_id, volume_to_units
+from .helpers import REQUEST_TIMEOUT, money_value, parse_protocol_id, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
+from .wire import CTraderTimeoutError
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -101,15 +103,14 @@ class _DealBridgeResult:
     """Aggregated FILLED-deal evidence for one vanished working order.
 
     A single working order can fill across several partial deals at different
-    prices, so the bridge sums their volume / commission and volume-weights
-    their price rather than reporting a single deal's slice.
+    prices, so the bridge sums their volume, volume-weights their price and
+    keeps every deal's own terms rather than reporting a single deal's slice.
 
     :ivar deal: The most recent matching FILLED ``ProtoOADeal`` (identity /
         timestamp), or ``None`` when nothing matched.
     :ivar filled_cents: The order's cumulative filled volume in cents.
     :ivar avg_price: The volume-weighted execution price across the deals, or
         ``None`` when nothing matched.
-    :ivar fee: The summed commission across the deals.
     :ivar conclusive: ``True`` only when the whole window was read without a
         transport error (so a no-fill result deterministically means no fill).
     :ivar closed_cents: Volume (cents) closed on this order's position over the
@@ -124,15 +125,97 @@ class _DealBridgeResult:
         they are absent from :ivar:`deal_ids` — yet a closure concluded from
         them must seed the de-dup channel too, or a late PUSH replay of the
         closing execution would re-book against the retired position.
+    :ivar fills: ``(timestamp_ms, deal_id, volume_cents, price, fee)`` of every
+        matching FILLED deal, oldest first — the per-execution terms a
+        recovered DELTA is priced and charged from when part of the order's
+        fill was already booked (:meth:`_ReconcileMixin._promote_from_deal`,
+        :meth:`_ReconcileMixin._reconcile_working_row`).
     """
     deal: 'OpenApiModelMessages.ProtoOADeal | None'
     filled_cents: int
     avg_price: float | None
-    fee: float
     conclusive: bool
     closed_cents: int = 0
     deal_ids: tuple[int, ...] = ()
     closing_deal_ids: tuple[int, ...] = ()
+    fills: tuple[tuple[int, int, int, float, float], ...] = ()
+
+
+@dataclass(slots=True)
+class _DealWalk:
+    """Deal-history evidence for one order, gathered across reconcile passes.
+
+    The window ``[from_ms, high_ms]`` is read backwards page by page; the pages
+    still owed sit in ``segments`` as ``[from_ms, to_ms]`` pairs whose ``to_ms``
+    moves down as pages arrive. Only the evidence the bridge needs is kept: the
+    order's own FILLED deals and the volume each closing deal closed.
+
+    :ivar from_ms: Lower bound of the window (the order's since-anchor).
+    :ivar high_ms: Upper bound the window has been extended to so far.
+    :ivar segments: Sub-windows not yet fully read, oldest first.
+    :ivar fills: The order's FILLED deals by ``dealId``.
+    :ivar closes: ``(positionId, closedVolume)`` by ``dealId`` of every deal
+        in the window that closed volume.
+    :ivar last_request: Event-loop time the walk last sent a page request
+        (``-inf`` before its first), so unfinished walks take turns.
+    """
+    from_ms: int
+    high_ms: int
+    segments: list[list[int]] = field(default_factory=list)
+    fills: 'dict[int, OpenApiModelMessages.ProtoOADeal]' = field(default_factory=dict)
+    closes: dict[int, tuple[int, int]] = field(default_factory=dict)
+    last_request: float = float('-inf')
+
+    def ingest(self, deal: 'OpenApiModelMessages.ProtoOADeal', order_id: int) -> None:
+        """Record one deal-history row; a re-read row replaces its earlier copy.
+
+        :param deal: A ``ProtoOADeal`` from a ``ProtoOADealListRes`` page.
+        :param order_id: The order whose FILLED deals are collected.
+        """
+        # Only a deal that actually closed volume is closure EVIDENCE — a
+        # zero-volume detail must not enter the dedup channel or the forensic
+        # audit.
+        if (deal.HasField('closePositionDetail')
+                and deal.closePositionDetail.closedVolume > 0):
+            self.closes[deal.dealId] = (
+                deal.positionId, deal.closePositionDetail.closedVolume)
+        if (deal.orderId == order_id
+                and deal.dealStatus == OpenApiModelMessages.ProtoOADealStatus.FILLED):
+            kept = OpenApiModelMessages.ProtoOADeal()
+            kept.CopyFrom(deal)
+            self.fills[deal.dealId] = kept
+
+    def result(self, close_position_id: int | None) -> _DealBridgeResult:
+        """Aggregate the gathered evidence of a fully read window.
+
+        :param close_position_id: The fallback closure target — see
+            :meth:`_ReconcileMixin._find_fill_deal`.
+        :return: The conclusive :class:`_DealBridgeResult`.
+        """
+        fills = sorted(
+            self.fills.values(),
+            key=lambda d: (d.executionTimestamp or d.createTimestamp, d.dealId),
+        )
+        filled_cents = sum(d.filledVolume for d in fills)
+        avg_price = (sum(d.executionPrice * d.filledVolume for d in fills) / filled_cents
+                     if filled_cents else None)
+        target_position_id = next(
+            (d.positionId for d in reversed(fills) if d.positionId), None)
+        closed_target = (target_position_id if target_position_id is not None
+                         else close_position_id)
+        closing_ids = tuple(
+            deal_id for deal_id, (position_id, _volume) in self.closes.items()
+            if closed_target is not None and position_id == closed_target)
+        closed_cents = sum(self.closes[deal_id][1] for deal_id in closing_ids)
+        return _DealBridgeResult(
+            fills[-1] if fills else None, filled_cents, avg_price, True,
+            closed_cents, tuple(d.dealId for d in reversed(fills)), closing_ids,
+            tuple(
+                (d.executionTimestamp or d.createTimestamp, d.dealId, d.filledVolume,
+                 d.executionPrice, money_value(d.commission, d.moneyDigits))
+                for d in fills
+            ),
+        )
 
 
 class _ReconcileMixin(_CTraderBase, ABC):
@@ -165,20 +248,43 @@ class _ReconcileMixin(_CTraderBase, ABC):
             # path — or the terminal shutdown — owns recovery; the next pass runs
             # normally once the wire is back.
             return
-        res = await self._reconcile()
+        # The snapshot read — rate-limit backoff and account re-auth included —
+        # spends the same pass budget as the deal-history reads below; an
+        # overrun fails the pass as transient and the next pass reads afresh.
+        try:
+            async with asyncio.timeout_at(self._reconcile_pass_deadline):
+                res = await self._reconcile()
+        except TimeoutError as exc:
+            raise CTraderTimeoutError(
+                "reconcile snapshot read overran the reconcile pass budget"
+            ) from exc
         orders_by_id = {o.orderId: o for o in res.order}
         open_positions = {
             p.positionId: p for p in res.position
             if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
         }
         now_ts = epoch_time()
-        for row in list(self.store_ctx.iter_live_orders()):
+        rows: list[tuple['OrderRow', int | None]] = []
+        for row in self.store_ctx.iter_live_orders():
+            order_id_raw = (row.extras or {}).get('order_id')
+            rows.append((row, parse_protocol_id(order_id_raw, field='order_id')
+                         if order_id_raw is not None else None))
+        live_order_ids = {order_id for _row, order_id in rows}
+        for stale in [oid for oid in self._deal_walks if oid not in live_order_ids]:
+            del self._deal_walks[stale]
+        # Rows whose deal-history walk an earlier pass left unfinished go first,
+        # so a lookup that keeps spending most of the budget cannot starve them;
+        # among those, the walk that waited longest for a request goes first,
+        # so one stalled lookup cannot starve the other unfinished walks.
+        def walk_turn(item: tuple['OrderRow', int | None]) -> tuple[bool, float]:
+            walk = self._deal_walks.get(item[1]) if item[1] is not None else None
+            if walk is None or not walk.segments:
+                return True, 0.0
+            return False, walk.last_request
+
+        rows.sort(key=walk_turn)
+        for row, order_id in rows:
             extras = row.extras or {}
-            order_id_raw = extras.get('order_id')
-            order_id = (
-                parse_protocol_id(order_id_raw, field='order_id')
-                if order_id_raw is not None else None
-            )
             order = orders_by_id.get(order_id) if order_id is not None else None
             if order is not None:
                 # The order is still in ``order[]`` — reconcile partial-fill
@@ -187,7 +293,8 @@ class _ReconcileMixin(_CTraderBase, ABC):
                 # cTrader keeps the original order in ``order[]`` while assigning a
                 # ``positionId`` after the first partial, so later partials must
                 # still be diffed here.
-                event = self._reconcile_working_row(row, order, open_positions, now_ts)
+                event = await self._reconcile_working_row(
+                    row, order, open_positions, now_ts)
                 if event is not None:
                     yield event
                 continue
@@ -394,16 +501,9 @@ class _ReconcileMixin(_CTraderBase, ABC):
         )
         if order_id_raw is not None:
             order_id = parse_protocol_id(order_id_raw, field='order_id')
-            anchor = extras.get('submitted_at_ms')
-            if anchor is not None:
-                from_ms = (
-                    parse_protocol_id(anchor, field='submitted_at_ms')
-                    - _SINCE_ANCHOR_SKEW_MS
-                )
-            else:
-                from_ms = int(epoch_time() * 1000) - int(_DEAL_LOOKBACK_S * 1000)
             bridge = await self._find_fill_deal(
-                order_id, from_ms, close_position_id=position_id,
+                order_id, self._deal_since_ms(extras), close_position_id=position_id,
+                deadline=self._reconcile_pass_deadline,
             )
             if not bridge.conclusive:
                 return MissingConfirmation(MissingResolution.INCONCLUSIVE)
@@ -462,7 +562,7 @@ class _ReconcileMixin(_CTraderBase, ABC):
         """
         self._seen_deal_ids.update(int(d) for d in deal_ids)
 
-    def _reconcile_working_row(
+    async def _reconcile_working_row(
             self, row, order, open_positions: dict, now_ts: float,
     ) -> OrderEvent | None:
         """Detect partial-fill progress on a still-pending working order.
@@ -472,6 +572,15 @@ class _ReconcileMixin(_CTraderBase, ABC):
         ``positionId`` (set-once) and, when the cumulative ``executedVolume`` has
         grown past the row's recorded ``filled_qty``, emit a partial-fill event.
         A working order that is back after a stale-missing stamp clears it.
+
+        The snapshot carries no per-execution terms (``executionPrice`` is the
+        order's running average) and no commission, so the event takes both
+        from the order's deal history: the price of exactly the new executions
+        and the commission of every deal not booked yet, which are then marked
+        seen. When the history cannot cover the progress (read failed, or the
+        deals are not listed yet) the fill is still booked on time from the
+        snapshot, without commission, and its deals stay unseen so a later
+        recovery of this order books their commission.
         """
         if self.store_ctx is None:
             return None
@@ -482,6 +591,22 @@ class _ReconcileMixin(_CTraderBase, ABC):
         filled = volume_to_units(order.executedVolume)
         if filled <= row.filled_qty + 1e-9 or filled >= row.qty:
             return None
+        fill_qty = filled - row.filled_qty
+        fill_price = order.executionPrice or None
+        fee = 0.0
+        # Read the history before the cursor write, so nothing is persisted for
+        # an event this pass could still fail to deliver.
+        bridge = await self._find_fill_deal(
+            order.orderId, self._deal_since_ms(extras),
+            deadline=self._reconcile_pass_deadline)
+        delta_price = (self._delta_fill_price(bridge.fills, row.filled_qty, fill_qty)
+                       if bridge.conclusive else None)
+        covered: set[int] = set()
+        if delta_price is not None:
+            fill_price = delta_price
+            covered = self._deals_covering(bridge.fills, filled)
+            fee = sum(fill[4] for fill in bridge.fills
+                      if fill[1] in covered and fill[1] not in self._seen_deal_ids)
         position_id: int | None = order.positionId or None
         patch: dict = {}
         if position_id and extras.get('position_id') is None:
@@ -501,14 +626,35 @@ class _ReconcileMixin(_CTraderBase, ABC):
         )
         if position_id is not None:
             self._link_position_ref(row.client_order_id, position_id)
+        self._seen_deal_ids.update(covered)
         avg = (open_positions[position_id].price
                if position_id in open_positions else order.executionPrice)
         return self._fill_event(
             row, event_type='partial', status=OrderStatus.PARTIALLY_FILLED,
             exchange_id=str(order.orderId), cumulative=filled,
-            fill_qty=filled - row.filled_qty, avg_price=avg or None,
-            fill_price=order.executionPrice or None, fee=0.0, timestamp=now_ts,
+            fill_qty=fill_qty, avg_price=avg or None,
+            fill_price=fill_price, fee=fee, timestamp=now_ts,
         )
+
+    @staticmethod
+    def _deals_covering(
+            fills: tuple[tuple[int, int, int, float, float], ...], filled: float,
+    ) -> set[int]:
+        """Deal ids of the oldest executions that make up ``filled`` units.
+
+        :param fills: The bridge's per-deal terms, oldest first
+            (:attr:`_DealBridgeResult.fills`).
+        :param filled: The order's cumulative filled units.
+        :return: The ids of the deals within the first ``filled`` units.
+        """
+        covered: set[int] = set()
+        total = 0.0
+        for _ts, deal_id, cents, _price, _fee in fills:
+            total += volume_to_units(cents)
+            if total > filled + 1e-9:
+                break
+            covered.add(deal_id)
+        return covered
 
     async def _recover_vanished_working_row(
             self, row, order_id: int, open_positions: dict, now_ts: float,
@@ -528,17 +674,9 @@ class _ReconcileMixin(_CTraderBase, ABC):
         if self.store_ctx is None:
             return
         extras = row.extras or {}
-        anchor = extras.get('submitted_at_ms')
-        if anchor is not None:
-            from_ms = (
-                parse_protocol_id(anchor, field='submitted_at_ms')
-                - _SINCE_ANCHOR_SKEW_MS
-            )
-        else:
-            # Zero-anchor fallback (the crash-before-persist row the M3 startup
-            # recovery owns): a wide fixed window, never the runtime path.
-            from_ms = int(epoch_time() * 1000) - int(_DEAL_LOOKBACK_S * 1000)
-        bridge = await self._find_fill_deal(order_id, from_ms)
+        bridge = await self._find_fill_deal(
+            order_id, self._deal_since_ms(extras),
+            deadline=self._reconcile_pass_deadline)
         if bridge.deal is not None:
             event = self._promote_from_deal(row, bridge, open_positions, now_ts)
             if event is not None:
@@ -658,26 +796,80 @@ class _ReconcileMixin(_CTraderBase, ABC):
             # (a prior PUSH / reconcile counted this progress). Emitting here
             # would yield a zero-qty fill that ``record_fill`` ignores while the
             # engine still runs its post-fill side effects — seed the ids and stop.
+            # Their commission is unbooked only when the snapshot partial path
+            # booked them while their history was unreadable; ``OrderEvent``
+            # carries a fee only with a fill, so surface the amount instead.
+            new_ids = set(new_deal_ids)
+            unbooked = sum(fill[4] for fill in bridge.fills if fill[1] in new_ids)
+            if unbooked:
+                logger.warning(
+                    "cTrader order %d: commission %s of deals %s was not booked "
+                    "(their fill was recovered from the snapshot without history)",
+                    deal.orderId, unbooked, sorted(new_ids),
+                )
             return None
-        # ``fill_price`` is what ``BrokerPosition.record_fill`` books the whole
-        # recovered quantity at, so it must be the volume-weighted average across
-        # the order's FILLED deals — a single deal's ``executionPrice`` would
-        # mis-state P&L when the fill spanned several deals at different prices.
+        # ``fill_price`` is what ``BrokerPosition.record_fill`` books the emitted
+        # quantity at, so it is the volume-weighted price of exactly the
+        # executions that quantity stands for — never the whole order's average,
+        # which would re-price the part the cursor already booked.
         # ``avg_price`` (the ExchangeOrder snapshot's display field) still prefers
         # the open position's broker-reported average when present.
+        fill_qty = cumulative - row.filled_qty
         bridge_price = bridge.avg_price or deal.executionPrice or None
+        fill_price = (self._delta_fill_price(bridge.fills, row.filled_qty, fill_qty)
+                      or bridge_price)
         avg = (open_positions[position_id].price
                if position_open else bridge_price)
         status = (OrderStatus.FILLED if cumulative >= row.qty - 1e-9
                   else OrderStatus.PARTIALLY_FILLED)
+        # Commission is booked once per execution: the PUSH path booked it for
+        # every deal already in ``_seen_deal_ids``, the snapshot partial-fill
+        # path books none, so the unseen deals carry every unbooked commission.
+        new_ids = set(new_deal_ids)
+        fee = sum(fill[4] for fill in bridge.fills if fill[1] in new_ids)
         return self._fill_event(
             row, event_type='filled', status=status,
             exchange_id=str(position_id or deal.orderId), cumulative=cumulative,
-            fill_qty=max(0.0, cumulative - row.filled_qty), avg_price=avg or None,
-            fill_price=bridge_price, fee=bridge.fee,
+            fill_qty=fill_qty, avg_price=avg or None,
+            fill_price=fill_price, fee=fee,
             timestamp=(deal.executionTimestamp / 1000.0
                        if deal.executionTimestamp else now_ts),
         )
+
+    @staticmethod
+    def _delta_fill_price(
+            fills: tuple[tuple[int, int, int, float, float], ...],
+            booked: float, qty: float,
+    ) -> float | None:
+        """Volume-weighted price of the ``qty`` units filled after ``booked``.
+
+        An order fills in time order, so the ``booked`` units the row's cursor
+        already counted are the OLDEST executions; the recovered delta is the
+        next ``qty`` units, splitting a deal that straddles either boundary.
+
+        :param fills: The bridge's per-deal terms, oldest first
+            (:attr:`_DealBridgeResult.fills`).
+        :param booked: Units already booked for the order (``filled_qty``).
+        :param qty: Units of the recovered delta.
+        :return: The delta's price, or ``None`` when the deals do not cover it.
+        """
+        skip = booked
+        taken = 0.0
+        notional = 0.0
+        for _ts, _deal_id, cents, price, _fee in fills:
+            units = volume_to_units(cents)
+            if skip >= units - 1e-9:
+                skip -= units
+                continue
+            part = min(units - skip, qty - taken)
+            skip = 0.0
+            notional += price * part
+            taken += part
+            if taken >= qty - 1e-9:
+                break
+        if taken < qty - 1e-9:
+            return None
+        return notional / taken
 
     def _retire_filled_then_closed(
             self, row, deal, position_id: int, closed_cents: int,
@@ -731,25 +923,50 @@ class _ReconcileMixin(_CTraderBase, ABC):
         for coid in siblings:
             self.store_ctx.close_order(coid)
 
+    @staticmethod
+    def _deal_since_ms(extras: dict) -> int:
+        """The deal-history ``fromTimestamp`` (ms) for a row's order.
+
+        The row's ``submitted_at_ms`` anchor minus :data:`_SINCE_ANCHOR_SKEW_MS`,
+        so a fill never ages out of a fixed window. Zero-anchor fallback (the
+        crash-before-persist row the M3 startup recovery owns): a wide fixed
+        window, never the runtime path.
+
+        :param extras: The row's extras.
+        :return: The lower bound of the order's deal-history window.
+        """
+        anchor = extras.get('submitted_at_ms')
+        if anchor is not None:
+            return parse_protocol_id(anchor, field='submitted_at_ms') - _SINCE_ANCHOR_SKEW_MS
+        return int(epoch_time() * 1000) - int(_DEAL_LOOKBACK_S * 1000)
+
     async def _find_fill_deal(
             self, order_id: int, from_ms: int, *, close_position_id: int | None = None,
+            deadline: float | None = None,
     ) -> '_DealBridgeResult':
         """Return the FILLED-deal evidence for ``order_id`` and read completeness.
 
-        Walks the deal history from ``from_ms`` (the order's own since-anchor)
+        Covers the deal history from ``from_ms`` (the order's own since-anchor)
         up to now, paging on ``hasMore``, and aggregates EVERY FILLED deal of
         ``order_id`` in the window — a single working order can fill across
         several partial deals, so the per-order quantity is their summed
         ``filledVolume`` (in cents), never a single deal's slice. The deals can
-        fill at DIFFERENT prices, so the booking price is their volume-weighted
-        average (``avg_price``) and the recovered commission is their sum
-        (``fee``). Alongside, it sums ``closePositionDetail.closedVolume`` per
-        position so the caller can tell a filled-then-closed order from a live
-        one (closedVolume-primary closure classification). ``conclusive`` is
+        fill at DIFFERENT prices, so the order's average is their
+        volume-weighted price (``avg_price``), and each deal's own volume, price
+        and commission is kept in ``fills`` for pricing a partial delta.
+        Alongside, it sums ``closePositionDetail.closedVolume`` per position so
+        the caller can tell a filled-then-closed order from a live one
+        (closedVolume-primary closure classification). ``conclusive`` is
         ``True`` only when the whole window was consumed without a transport
         error — a failed or truncated read returns an empty, non-conclusive
         result so the caller never concludes a cancel (or a closure) from
         missing evidence.
+
+        The evidence is kept per order in :attr:`_deal_walks` across calls, so
+        an unfinished walk resumes from its last page and a finished one reads
+        only the deals since it ended (re-reading
+        :data:`_SINCE_ANCHOR_SKEW_MS` of overlap, de-duplicated by ``dealId``).
+        A walk anchored later than ``from_ms`` starts over.
 
         :param order_id: The broker order id whose fills to recover.
         :param from_ms: The lower-bound ``fromTimestamp`` (ms) — the order's
@@ -760,73 +977,77 @@ class _ReconcileMixin(_CTraderBase, ABC):
             window to derive the target from. A fully-filled position row already
             knows its position id, so a close can be detected even when the
             original entry fill has aged out of the bridge window.
+        :param deadline: Event-loop time the read must finish by (the reconcile
+            pass budget), or ``None`` for the plain per-request timeout. Each
+            page request waits at most until the deadline; a walk that reaches
+            it unfinished is inconclusive and resumes on the next call.
         :return: a :class:`_DealBridgeResult` — see its field docs.
         """
         wire = self._wire
         if wire is None or self._live_account_id is None:
-            return _DealBridgeResult(None, 0, None, 0.0, False)
-        to_ms = int(epoch_time() * 1000)
-        latest_deal: 'OpenApiModelMessages.ProtoOADeal | None' = None
-        filled_cents = 0
-        weighted_price = 0.0
-        fee = 0.0
-        deal_ids: list[int] = []
-        target_position_id: int | None = None
-        closed_by_position: dict[int, int] = {}
-        closing_ids_by_position: dict[int, list[int]] = {}
+            return _DealBridgeResult(None, 0, None, False)
+        now_ms = int(epoch_time() * 1000)
+        walk = self._deal_walks.get(order_id)
+        if walk is None or walk.from_ms > from_ms:
+            walk = _DealWalk(from_ms=from_ms, high_ms=from_ms)
+            self._deal_walks[order_id] = walk
+        if now_ms > walk.high_ms:
+            newest = walk.segments[-1] if walk.segments else None
+            if newest is not None and newest[1] == walk.high_ms:
+                # The newest owed sub-window has returned no page yet: widen it
+                # instead of queueing another one, so a walk whose budget only
+                # fits a page or two per call still reaches the present.
+                newest[1] = now_ms
+            else:
+                walk.segments.append(
+                    [max(walk.from_ms, walk.high_ms - _SINCE_ANCHOR_SKEW_MS), now_ms])
+            walk.high_ms = now_ms
+        loop = asyncio.get_running_loop()
         try:
-            while True:
+            while walk.segments:
+                segment = walk.segments[0]
+                timeout = REQUEST_TIMEOUT
+                if deadline is not None:
+                    timeout = min(timeout, deadline - loop.time())
+                    if timeout <= 0.0:
+                        logger.debug(
+                            "cTrader deal-history bridge for order %d deferred: "
+                            "reconcile pass budget spent", order_id,
+                        )
+                        return _DealBridgeResult(None, 0, None, False)
+                walk.last_request = loop.time()
                 res = cast(OpenApiMessages.ProtoOADealListRes, await wire.send_request(
                     OpenApiMessages.ProtoOADealListReq(
                         ctidTraderAccountId=self._live_account_id,
-                        fromTimestamp=from_ms, toTimestamp=to_ms,
+                        fromTimestamp=segment[0], toTimestamp=segment[1],
                         maxRows=_DEAL_PAGE_MAX_ROWS,
-                    )
+                    ),
+                    timeout=timeout,
                 ))
                 for deal in res.deal:
-                    if deal.HasField('closePositionDetail'):
-                        closed_by_position[deal.positionId] = (
-                                closed_by_position.get(deal.positionId, 0)
-                                + deal.closePositionDetail.closedVolume)
-                        # Only a deal that actually closed volume is closure
-                        # EVIDENCE — a zero-volume detail must not enter the
-                        # dedup channel or the forensic audit.
-                        if deal.closePositionDetail.closedVolume > 0:
-                            closing_ids_by_position.setdefault(
-                                deal.positionId, []).append(deal.dealId)
-                    if (deal.orderId == order_id
-                            and deal.dealStatus == OpenApiModelMessages.ProtoOADealStatus.FILLED):
-                        filled_cents += deal.filledVolume
-                        weighted_price += deal.executionPrice * deal.filledVolume
-                        fee += money_value(deal.commission, deal.moneyDigits)
-                        deal_ids.append(deal.dealId)
-                        if target_position_id is None:
-                            target_position_id = deal.positionId or None
-                        if latest_deal is None:
-                            latest_deal = deal
+                    walk.ingest(deal, order_id)
                 if not res.hasMore or not res.deal:
-                    break
+                    walk.segments.pop(0)
+                    continue
                 oldest = min((d.executionTimestamp or d.createTimestamp)
                              for d in res.deal)
-                if oldest <= from_ms:
-                    break
-                to_ms = oldest - 1
+                if oldest <= segment[0]:
+                    walk.segments.pop(0)
+                    continue
+                segment[1] = oldest - 1
         except Exception as exc:  # noqa: BLE001 - read failure is inconclusive evidence
-            logger.warning(
-                "cTrader deal-history bridge for order %d failed: %s", order_id, exc,
-            )
-            return _DealBridgeResult(None, 0, None, 0.0, False)
-        avg_price = weighted_price / filled_cents if filled_cents else None
-        closed_target = (target_position_id if target_position_id is not None
-                         else close_position_id)
-        closed_cents = (closed_by_position.get(closed_target, 0)
-                        if closed_target is not None else 0)
-        closing_ids = (tuple(closing_ids_by_position.get(closed_target, ()))
-                       if closed_target is not None else ())
-        return _DealBridgeResult(
-            latest_deal, filled_cents, avg_price, fee, True,
-            closed_cents, tuple(deal_ids), closing_ids,
-        )
+            if deadline is not None and loop.time() >= deadline:
+                logger.debug(
+                    "cTrader deal-history bridge for order %d deferred: "
+                    "reconcile pass budget spent mid-read (%s)", order_id, exc,
+                )
+            else:
+                logger.warning(
+                    "cTrader deal-history bridge for order %d failed: %s",
+                    order_id, exc,
+                )
+            return _DealBridgeResult(None, 0, None, False)
+        return walk.result(close_position_id)
 
     def _clear_missing_pending(self, row) -> None:
         """Drop a stale ``missing_pending_since`` breadcrumb (the row came back)."""
@@ -896,49 +1117,103 @@ class _ReconcileMixin(_CTraderBase, ABC):
     async def _cancel_sibling_working_orders(self, row) -> None:
         """Best-effort cancel sweep over the other bot-owned working orders.
 
-        Sends ``ProtoOACancelOrderReq`` for every other live row in the same
-        symbol that still carries a working ``order_id``, then retires that
-        row, so the halt does not strand the bot's remaining resting protective
-        orders. Open positions (no cancellable working order) are left for the
-        operator — closing them on a halt is more aggressive than this safety
-        sweep intends. Per-order failures are swallowed: this is a best-effort
-        pass run immediately before the halt raise.
+        Queues a ``ProtoOACancelOrderReq`` for every other live row in the same
+        symbol that still carries a cancellable working order (see
+        :meth:`_sweepable_order_id`), then sends what the reconcile pass budget
+        allows (:meth:`_drain_sibling_cancels`), so the halt does not strand
+        the bot's remaining resting protective orders. Open positions (no
+        cancellable working order) are left for the operator — closing them on
+        a halt is more aggressive than this safety sweep intends.
+
+        :param row: The row whose unexpected disappearance triggered the sweep.
         """
         if self.store_ctx is None:
             return
+        for other in self.store_ctx.iter_live_orders(symbol=row.symbol):
+            if (other.client_order_id != row.client_order_id
+                    and self._sweepable_order_id(other) is not None):
+                self._pending_sibling_cancels.setdefault(
+                    other.client_order_id, row.client_order_id)
+        await self._drain_sibling_cancels()
+
+    @staticmethod
+    def _sweepable_order_id(row: 'OrderRow') -> int | None:
+        """The working ``orderId`` the sibling sweep may cancel, or ``None``.
+
+        A filled row keeps its original ``order_id`` even after the order left
+        ``order[]`` for ``position[]`` (the fill / promotion paths never strip
+        it), so ``order_id`` alone does NOT prove the row is still a cancellable
+        working order. Any row with a linked ``position_id`` AND live filled
+        exposure — a settled position (filled to its full size) OR a partial
+        fill whose residual is still working — represents real broker exposure
+        the sweep must leave for the operator: terminal-closing its tracking row
+        would strand that filled position untracked after the halt/restart.
+        Only zero-fill resting orders are swept.
+
+        :param row: A live bot-owned row.
+        :return: The parsed ``orderId`` of a zero-fill working order, else ``None``.
+        """
+        extras = row.extras or {}
+        order_id_raw = extras.get('order_id')
+        if order_id_raw is None:
+            return None
+        if extras.get('position_id') and row.filled_qty > 1e-9:
+            return None
+        return parse_protocol_id(order_id_raw, field='order_id')
+
+    async def _drain_sibling_cancels(self) -> None:
+        """Send the queued sibling cancels within the reconcile pass budget.
+
+        The sweep runs inside the reconcile pass, which holds the
+        ``watch_orders`` PUSH stream, so every cancel shares the pass deadline
+        (:attr:`_reconcile_pass_deadline`; ``None`` leaves only the per-request
+        timeout). Once the budget is spent the rest of the queue waits for the
+        next pass, which sends it before its own reads. A cancel the deadline
+        cut short may or may not have reached the venue: it moves to the back
+        of the queue and is re-sent — a repeat cancel of an order that already
+        left the book comes back as a not-found reject, which keeps the row
+        live like any other ambiguous outcome. A queued row that is no longer a
+        live zero-fill working order is dropped unsent.
+
+        Per-order failures are swallowed: the sweep is best-effort, and a row
+        whose cancel is not confirmed stays live for reconcile to resolve.
+        """
+        if self.store_ctx is None:
+            self._pending_sibling_cancels.clear()
+            return
         cascade = DispatchJournal(self.store_ctx)
-        for other in list(self.store_ctx.iter_live_orders(symbol=row.symbol)):
-            if other.client_order_id == row.client_order_id:
+        deadline = self._reconcile_pass_deadline
+        loop = asyncio.get_running_loop()
+        for coid, origin_coid in list(self._pending_sibling_cancels.items()):
+            other = self.store_ctx.get_order(coid)
+            order_id = (self._sweepable_order_id(other)
+                        if other is not None and other.closed_ts_ms is None else None)
+            if order_id is None:
+                del self._pending_sibling_cancels[coid]
                 continue
-            other_extras = other.extras or {}
-            other_order_id_raw = other_extras.get('order_id')
-            if other_order_id_raw is None:
-                continue
-            other_order_id = parse_protocol_id(
-                other_order_id_raw, field='order_id',
-            )
-            # A filled row keeps its original ``order_id`` even after the order
-            # left ``order[]`` for ``position[]`` (the fill / promotion paths
-            # never strip it), so ``order_id`` alone does NOT prove the row is
-            # still a cancellable working order. Any row with a linked
-            # ``position_id`` AND live filled exposure — a settled position
-            # (filled to its full size) OR a partial fill whose residual is still
-            # working — represents real broker exposure the sweep must leave for
-            # the operator: terminal-closing its tracking row would strand that
-            # filled position untracked after the halt/restart. Skip it rather
-            # than fire a cancel and retire the row out from under live exposure.
-            # Only zero-fill resting orders are swept.
-            if (other_extras.get('position_id')
-                    and other.filled_qty > 1e-9):
-                continue
-            try:
-                event = await self._dispatch_order(
-                    OpenApiMessages.ProtoOACancelOrderReq(
-                        ctidTraderAccountId=self._live_account_id,
-                        orderId=other_order_id,
-                    ),
-                    coid=other.client_order_id, context="cancel",
+            if deadline is not None and loop.time() >= deadline:
+                logger.debug(
+                    "cTrader sibling cancel sweep deferred (%d queued): "
+                    "reconcile pass budget spent", len(self._pending_sibling_cancels),
                 )
+                return
+            try:
+                async with asyncio.timeout_at(deadline):
+                    event = await self._dispatch_order(
+                        OpenApiMessages.ProtoOACancelOrderReq(
+                            ctidTraderAccountId=self._live_account_id,
+                            orderId=order_id,
+                        ),
+                        coid=coid, context="cancel",
+                    )
+            except TimeoutError:
+                del self._pending_sibling_cancels[coid]
+                self._pending_sibling_cancels[coid] = origin_coid
+                logger.debug(
+                    "cTrader sibling cancel for %r deferred: reconcile pass "
+                    "budget spent mid-request", coid,
+                )
+                return
             except ExchangeOrderRejectedError:
                 # NO mapped reject confirms a no-fill cancel. A ``*_NOT_FOUND``
                 # race means the working order left the book, but that is exactly
@@ -950,32 +1225,34 @@ class _ReconcileMixin(_CTraderBase, ABC):
                 # real exposure. Every other reject (cancel-reject reported as an
                 # error event, etc.) likewise fails to prove the order is gone.
                 # Keep the row live for reconcile to resolve.
+                del self._pending_sibling_cancels[coid]
                 continue
             except BrokerError:
                 # Ambiguous disposition (timeout / link drop after send) or link
                 # down: the working order may still be live or may have filled.
                 # Retiring the row here would strand that exposure untracked after
                 # the halt/restart — leave the row live for reconcile to resolve.
+                del self._pending_sibling_cancels[coid]
                 continue
-            else:
-                # ``ORDER_CANCEL_REJECTED`` (cancel/modify race) and
-                # ``ORDER_FILLED`` (the cancel lost a race to a fill) both come
-                # back as non-raising execution events. Only a confirmed
-                # ``ORDER_CANCELLED`` retires the row; everything else keeps it so
-                # a surfaced fill can still book against it.
-                if (event.executionType
-                        != OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED):
-                    continue
+            del self._pending_sibling_cancels[coid]
+            # ``ORDER_CANCEL_REJECTED`` (cancel/modify race) and ``ORDER_FILLED``
+            # (the cancel lost a race to a fill) both come back as non-raising
+            # execution events. Only a confirmed ``ORDER_CANCELLED`` retires the
+            # row; everything else keeps it so a surfaced fill can still book
+            # against it.
+            if (event.executionType
+                    != OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED):
+                continue
             cascade.apply_reconcile_outcome(
-                other.client_order_id,
+                coid,
                 ReconcileOutcome(
                     kind='terminal_close',
                     reason='unexpected_cancel_cascade',
                     new_state='rejected',
                     audit_event='unexpected_cancel_cascade',
                     close_row=True,
-                    audit_payload={'origin_coid': row.client_order_id},
-                    exchange_order_id=str(other_order_id),
+                    audit_payload={'origin_coid': origin_coid},
+                    exchange_order_id=str(order_id),
                 ),
             )
 

@@ -13,9 +13,12 @@ from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 
 from pynecore_ctrader import CTrader, CTraderConfig
+from pynecore_ctrader import events as ctrader_events
+from pynecore_ctrader import reconcile as ctrader_reconcile
 from pynecore_ctrader.helpers import volume_to_units
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
+from pynecore_ctrader.reconcile import _DealWalk
 from pynecore_ctrader.wire import CTraderProtocolError
 
 
@@ -43,10 +46,12 @@ class _FakeWire:
         self._deal_res = deal_res
         self._fail = fail
         self.requests: list = []
+        self.timeouts: list = []
         self.cancel_responses: dict = {}
 
-    async def send_request(self, req):
+    async def send_request(self, req, *, timeout=None):
         self.requests.append(req)
+        self.timeouts.append(timeout)
         if self._fail:
             raise RuntimeError("wire down")
         if isinstance(req, _oa.ProtoOACancelOrderReq):
@@ -433,6 +438,349 @@ def __test_reconcile_vanished_working_sums_multiple_fill_deals__(tmp_path):
     row = broker.store_ctx.get_order('c9')
     assert row is not None
     assert row.filled_qty == qty
+
+
+def __test_reconcile_partial_then_vanished_prices_only_the_new_fill__(tmp_path):
+    # The cursor already booked the first half through the PUSH path (deal 910
+    # at 1.0, its commission included). The recovered residual is the later
+    # deal at 2.0: it is booked at 2.0 with only its own commission — never at
+    # the order's 1.5 average with the booked commission charged again.
+    qty = volume_to_units(2000)
+    partial = volume_to_units(1000)
+    first = _deal(deal_id=910, order_id=111, position_id=222,
+                  filled_volume=1000, price=1.0)
+    first.commission = 300
+    second = _deal(deal_id=911, order_id=111, position_id=222,
+                   filled_volume=1000, price=2.0)
+    second.commission = 500
+    second.executionTimestamp = first.executionTimestamp + 60_000
+    broker = _ReconcileBroker(
+        _recon(positions=[_position(position_id=222, volume=2000)]),
+        deal_res=_deal_res(second, first),
+    )
+    _open(tmp_path, broker)
+    _seed_partial_working(broker, 'c10', order_id=111, qty=qty,
+                          filled=partial, position_id=222)
+    broker._seen_deal_ids.add(910)
+
+    events = _run(broker)
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.fill_qty == qty - partial
+    assert ev.fill_price == 2.0
+    assert ev.fee == 5.0
+
+
+def __test_reconcile_snapshot_booked_partial_commission_recovered_once__(tmp_path):
+    # The first half was booked by the snapshot partial-fill path, which knows
+    # no deal and books no commission. The recovered residual is still priced
+    # from its own (later) deal, and the commissions of BOTH unseen deals are
+    # booked now, since neither was booked before.
+    qty = volume_to_units(2000)
+    partial = volume_to_units(1000)
+    first = _deal(deal_id=920, order_id=111, position_id=222,
+                  filled_volume=1000, price=1.0)
+    first.commission = 300
+    second = _deal(deal_id=921, order_id=111, position_id=222,
+                   filled_volume=1000, price=2.0)
+    second.commission = 500
+    second.executionTimestamp = first.executionTimestamp + 60_000
+    broker = _ReconcileBroker(
+        _recon(positions=[_position(position_id=222, volume=2000)]),
+        deal_res=_deal_res(second, first),
+    )
+    _open(tmp_path, broker)
+    _seed_partial_working(broker, 'c11', order_id=111, qty=qty,
+                          filled=partial, position_id=222)
+
+    events = _run(broker)
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.fill_price == 2.0
+    assert ev.fee == 8.0
+
+
+# === Reconcile-pass I/O budget ============================================
+
+def __test_deal_bridge_defers_read_once_pass_budget_spent__(tmp_path):
+    # watch_orders delivers no PUSH message while the reconcile pass runs, so a
+    # deal-history read past the pass deadline is deferred as inconclusive
+    # without a request, and a read inside it waits at most what is left.
+    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+    _open(tmp_path, broker)
+
+    async def probe():
+        loop = asyncio.get_running_loop()
+        spent = await broker._find_fill_deal(111, 0, deadline=loop.time() - 1.0)
+        live = await broker._find_fill_deal(111, 0, deadline=loop.time() + 5.0)
+        return spent, live
+
+    spent, live = asyncio.run(probe())
+
+    assert not spent.conclusive
+    assert live.conclusive
+    assert len(broker._wire.requests) == 1
+    assert 0.0 < broker._wire.timeouts[0] <= 5.0
+
+
+def __test_reconcile_pass_bridge_reads_share_the_pass_budget__(tmp_path, monkeypatch):
+    # With the pass budget already spent the vanished row's bridge read is
+    # skipped (the next pass retries it): no deal request, no promotion, no
+    # stamp — and the deadline is cleared once the pass ends.
+    monkeypatch.setattr(ctrader_events, '_RECONCILE_PASS_BUDGET_S', 0.0)
+    qty = volume_to_units(2000)
+    broker = _ReconcileBroker(
+        _recon(positions=[_position(position_id=333, volume=2000)]),
+        deal_res=_deal_res(_deal(deal_id=930, order_id=111, position_id=333,
+                                 filled_volume=2000)),
+    )
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c12', order_id=111, qty=qty)
+
+    async def collect():
+        return [e async for e in broker._run_reconcile_pass()]
+
+    events = asyncio.run(collect())
+
+    assert events == []
+    assert broker._wire.requests == []
+    assert broker._reconcile_pass_deadline is None
+    row = broker.store_ctx.get_order('c12')
+    assert row is not None
+    assert row.filled_qty == 0.0
+    assert 'missing_pending_since' not in (row.extras or {})
+
+
+def __test_reconcile_pass_bounds_a_stalled_snapshot_read__(tmp_path, monkeypatch):
+    # A snapshot read stuck in a rate-limit backoff or an account re-auth spends
+    # the same pass budget: the pass gives up as a transient failure instead of
+    # holding the PUSH stream until the read returns.
+    monkeypatch.setattr(ctrader_events, '_RECONCILE_PASS_BUDGET_S', 0.01)
+
+    class _StalledBroker(_ReconcileBroker):
+        async def _reconcile(self, *, return_protection_orders=False):
+            await asyncio.Event().wait()
+
+    broker = _StalledBroker(_recon())
+    _open(tmp_path, broker)
+
+    async def collect():
+        return [e async for e in broker._run_reconcile_pass()]
+
+    events = asyncio.run(collect())
+
+    assert events == []
+    assert broker._reconcile_fail_streak == 1
+    assert broker._reconcile_pass_deadline is None
+
+
+class _ScriptedWire(_FakeWire):
+    """Wire answering each request with the next scripted response or error."""
+
+    def __init__(self, *responses):
+        super().__init__()
+        self._responses = list(responses)
+
+    async def send_request(self, req, *, timeout=None):
+        self.requests.append(req)
+        self.timeouts.append(timeout)
+        resp = self._responses.pop(0)
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
+
+
+def __test_deal_bridge_resumes_a_cut_walk_then_reads_only_new_deals__(tmp_path, monkeypatch):
+    # A walk cut after its first page keeps that page: the next read resumes
+    # below it (plus the deals since), and a finished walk later reads only the
+    # window since it ended — never the whole order history again.
+    clock = [1_700_000_100.0]
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: clock[0])
+    newer = _deal(deal_id=940, order_id=111, position_id=222,
+                  filled_volume=1000, price=2.0)
+    newer.executionTimestamp = 1_700_000_060_000
+    older = _deal(deal_id=941, order_id=111, position_id=222,
+                  filled_volume=1000, price=1.0)
+    broker = _ReconcileBroker(_recon())
+    wire = _ScriptedWire(_deal_res(newer, has_more=True), RuntimeError("cut"),
+                         _deal_res(older), _deal_res(), _deal_res())
+    broker._wire = wire
+    _open(tmp_path, broker)
+    from_ms = 1_699_999_000_000
+
+    async def probe():
+        first = await broker._find_fill_deal(111, from_ms)
+        clock[0] = 1_700_000_150.0
+        second = await broker._find_fill_deal(111, from_ms)
+        clock[0] = 1_700_000_200.0
+        third = await broker._find_fill_deal(111, from_ms)
+        return first, second, third
+
+    first, second, third = asyncio.run(probe())
+
+    assert not first.conclusive
+    assert second.conclusive
+    assert second.filled_cents == 2000
+    assert second.avg_price == 1.5
+    assert (wire.requests[2].fromTimestamp, wire.requests[2].toTimestamp) == (
+        from_ms, newer.executionTimestamp - 1)
+    assert (wire.requests[3].fromTimestamp, wire.requests[3].toTimestamp) == (
+        1_700_000_040_000, 1_700_000_150_000)
+    assert third.conclusive
+    assert third.filled_cents == 2000
+    assert len(wire.requests) == 5
+    assert (wire.requests[4].fromTimestamp, wire.requests[4].toTimestamp) == (
+        1_700_000_090_000, 1_700_000_200_000)
+
+
+def __test_deal_bridge_widens_an_unread_tail_instead_of_chasing_the_present__(
+        tmp_path, monkeypatch):
+    # Each call fits only one page before its budget runs out. A resumed walk
+    # first finishes its older sub-window and is cut on the tail it appended;
+    # the next call widens that never-answered tail up to now instead of
+    # queueing yet another one, so a single page completes the walk.
+    clock = [1_700_000_100.0]
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: clock[0])
+    newer = _deal(deal_id=960, order_id=111, position_id=222,
+                  filled_volume=1000, price=2.0)
+    newer.executionTimestamp = 1_700_000_060_000
+    older = _deal(deal_id=961, order_id=111, position_id=222,
+                  filled_volume=1000, price=1.0)
+    broker = _ReconcileBroker(_recon())
+    wire = _ScriptedWire(_deal_res(newer, has_more=True), RuntimeError("cut"),
+                         _deal_res(older), RuntimeError("cut"), _deal_res())
+    broker._wire = wire
+    _open(tmp_path, broker)
+    from_ms = 1_699_999_000_000
+
+    async def probe():
+        first = await broker._find_fill_deal(111, from_ms)
+        clock[0] = 1_700_000_150.0
+        second = await broker._find_fill_deal(111, from_ms)
+        clock[0] = 1_700_000_200.0
+        third = await broker._find_fill_deal(111, from_ms)
+        return first, second, third
+
+    first, second, third = asyncio.run(probe())
+
+    assert not first.conclusive
+    assert not second.conclusive
+    assert third.conclusive
+    assert third.filled_cents == 2000
+    assert len(wire.requests) == 5
+    assert (wire.requests[4].fromTimestamp, wire.requests[4].toTimestamp) == (
+        1_700_000_040_000, 1_700_000_200_000)
+
+
+def __test_reconcile_reads_an_unfinished_walk_first_and_prunes_dead_ones__(tmp_path):
+    # A row whose walk an earlier pass left unfinished is read before the rows
+    # that got their turn, so one persistently expensive lookup cannot starve
+    # it; the walk of an order with no live row is dropped.
+    qty = volume_to_units(2000)
+    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c30', order_id=111, qty=qty,
+                  extras={'submitted_at_ms': 1_700_000_000_000})
+    _seed_working(broker, 'c31', order_id=112, qty=qty,
+                  extras={'submitted_at_ms': 1_700_000_500_000})
+    broker._deal_walks[112] = _DealWalk(
+        from_ms=1_700_000_440_000, high_ms=1_700_000_600_000,
+        segments=[[1_700_000_440_000, 1_700_000_550_000]],
+    )
+    broker._deal_walks[999] = _DealWalk(from_ms=0, high_ms=0)
+
+    _run(broker)
+
+    first = broker._wire.requests[0]
+    assert (first.fromTimestamp, first.toTimestamp) == (
+        1_700_000_440_000, 1_700_000_550_000)
+    assert 999 not in broker._deal_walks
+
+
+class _StallingWire(_FakeWire):
+    """Fake wire whose deal-history reads from one window never answer.
+
+    A request whose ``fromTimestamp`` is in ``stalled_from`` waits out its
+    timeout, like a venue that stopped answering that lookup.
+    """
+
+    def __init__(self, *, stalled_from):
+        super().__init__(deal_res=_deal_res())
+        self.stalled_from = set(stalled_from)
+
+    async def send_request(self, req, *, timeout=None):
+        if (isinstance(req, _oa.ProtoOADealListReq)
+                and req.fromTimestamp in self.stalled_from):
+            self.requests.append(req)
+            self.timeouts.append(timeout)
+            await asyncio.wait_for(asyncio.Event().wait(), timeout)
+        return await super().send_request(req, timeout=timeout)
+
+
+def __test_reconcile_a_stalled_walk_cannot_starve_another_unfinished_one__(
+        tmp_path, monkeypatch):
+    # The first row's lookup stalls past the pass budget every time, so the
+    # second row's walk is created but left unread. Unfinished walks take turns
+    # by their last request: the next pass reads the second walk first, and
+    # its no-fill evidence lands even though the first lookup stalls again.
+    monkeypatch.setattr(ctrader_events, '_RECONCILE_PASS_BUDGET_S', 0.05)
+    qty = volume_to_units(2000)
+    anchor_a, anchor_b = 1_700_000_000_000, 1_700_000_500_000
+    skew = ctrader_reconcile._SINCE_ANCHOR_SKEW_MS
+    broker = _ReconcileBroker(_recon())
+    broker._wire = _StallingWire(stalled_from={anchor_a - skew})
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c32', order_id=111, qty=qty,
+                  extras={'submitted_at_ms': anchor_a})
+    _seed_working(broker, 'c33', order_id=112, qty=qty,
+                  extras={'submitted_at_ms': anchor_b})
+
+    async def one_pass():
+        return [e async for e in broker._run_reconcile_pass()]
+
+    asyncio.run(one_pass())
+    assert [r.fromTimestamp for r in broker._wire.requests] == [anchor_a - skew]
+    assert broker._deal_walks[112].segments
+    assert 'missing_pending_since' not in (broker.store_ctx.get_order('c33').extras or {})
+
+    asyncio.run(one_pass())
+    assert [r.fromTimestamp for r in broker._wire.requests][1] == anchor_b - skew
+    assert not broker._deal_walks[112].segments
+    assert 'missing_pending_since' in (broker.store_ctx.get_order('c33').extras or {})
+    assert broker._deal_walks[111].segments
+
+
+def __test_reconcile_snapshot_partial_takes_terms_and_commission_from_deals__(tmp_path):
+    # The snapshot's executionPrice is the order's running average and carries
+    # no commission: the partial is booked at its own deal's price with that
+    # deal's commission, and the deal is marked seen — so when the residual is
+    # later cancelled, the recovery neither re-books nor loses the commission.
+    qty = volume_to_units(2000)
+    partial = volume_to_units(1000)
+    deal = _deal(deal_id=950, order_id=111, position_id=222,
+                 filled_volume=1000, price=1.2)
+    deal.commission = 300
+    broker = _ReconcileBroker(
+        _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                              position_id=222, price=1.5)]),
+        deal_res=_deal_res(deal),
+    )
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c40', order_id=111, qty=qty)
+
+    events = _run(broker)
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.fill_qty == partial
+    assert ev.fill_price == 1.2
+    assert ev.fee == 3.0
+    assert 950 in broker._seen_deal_ids
+
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    assert _run(broker) == []
 
 
 # === M3 2.1.5 — cumulative-fill accounting (crash boundaries) =============
@@ -1163,6 +1511,135 @@ def __test_policy_stop_and_cancel_keeps_sibling_on_not_found__(tmp_path):
 
     assert isinstance(err, UnexpectedCancelError)
     assert 'sibling' in _live_coids(broker)
+
+
+class _StallOnceCancelWire(_FakeWire):
+    """Fake wire whose first cancel of each ``stall_once`` order never answers."""
+
+    def __init__(self, *, stall_once):
+        super().__init__(deal_res=_deal_res())
+        self.stall_once = set(stall_once)
+
+    async def send_request(self, req, *, timeout=None):
+        if (isinstance(req, _oa.ProtoOACancelOrderReq)
+                and req.orderId in self.stall_once):
+            self.stall_once.discard(req.orderId)
+            self.requests.append(req)
+            self.timeouts.append(timeout)
+            await asyncio.wait_for(asyncio.Event().wait(), timeout)
+        return await super().send_request(req, timeout=timeout)
+
+
+def _sweep_broker(tmp_path, monkeypatch, *, quarantine):
+    """A stop_and_cancel broker whose first cancel of order 600 stalls."""
+    monkeypatch.setattr(ctrader_events, '_RECONCILE_PASS_BUDGET_S', 0.05)
+    qty = volume_to_units(2000)
+    broker = _ReconcileBroker(_recon(orders=[_order(order_id=600, volume=2000),
+                                             _order(order_id=601, volume=2000)]))
+    broker._wire = _StallOnceCancelWire(stall_once={600})
+    broker.on_unexpected_cancel = 'stop_and_cancel'
+    if quarantine:
+        broker.quarantine_sink = lambda reason, context: None
+    _open(tmp_path, broker)
+    _seed_working(broker, 'gone', order_id=500, qty=qty,
+                  extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'sib_a', order_id=600, qty=qty)
+    _seed_working(broker, 'sib_b', order_id=601, qty=qty)
+    return broker
+
+
+def _cancelled_order_ids(broker) -> list[int]:
+    return [r.orderId for r in broker._wire.requests
+            if isinstance(r, _oa.ProtoOACancelOrderReq)]
+
+
+def __test_sibling_cancel_sweep_spends_the_pass_budget_then_resumes__(
+        tmp_path, monkeypatch):
+    # The stop_and_cancel sweep runs inside the reconcile pass that holds the
+    # PUSH stream: a cancel that never answers is cut at the pass deadline, and
+    # the unsent / cut cancels finish on the next pass (the cut one re-sent
+    # last), while quarantine keeps the process alive.
+    broker = _sweep_broker(tmp_path, monkeypatch, quarantine=True)
+
+    async def one_pass():
+        return [e async for e in broker._run_reconcile_pass()]
+
+    events = asyncio.run(one_pass())
+
+    assert [e.event_type for e in events] == ['cancelled']
+    assert _cancelled_order_ids(broker) == [600]
+    assert sorted(_live_coids(broker)) == ['sib_a', 'sib_b']
+    assert list(broker._pending_sibling_cancels) == ['sib_b', 'sib_a']
+    assert broker._reconcile_fail_streak == 0
+
+    asyncio.run(one_pass())
+
+    assert _cancelled_order_ids(broker) == [600, 601, 600]
+    assert _live_coids(broker) == []
+    assert broker._pending_sibling_cancels == {}
+
+
+def __test_sibling_cancel_sweep_finishes_before_a_halt__(tmp_path, monkeypatch):
+    # Without a quarantine sink the policy halts: the stream ends anyway, so the
+    # cancels the pass budget cut short are finished before the halt propagates.
+    broker = _sweep_broker(tmp_path, monkeypatch, quarantine=False)
+
+    async def one_pass():
+        try:
+            async for _e in broker._run_reconcile_pass():
+                pass
+        except UnexpectedCancelError as exc:
+            return exc
+        return None
+
+    err = asyncio.run(one_pass())
+
+    assert isinstance(err, UnexpectedCancelError)
+    assert _cancelled_order_ids(broker) == [600, 601, 600]
+    assert _live_coids(broker) == []
+    assert broker._pending_sibling_cancels == {}
+
+
+class _StallingHistoryWire(_StallOnceCancelWire):
+    """Sweep wire whose deal-history reads never answer once ``stall_history`` is set."""
+
+    stall_history = False
+
+    async def send_request(self, req, *, timeout=None):
+        if self.stall_history and isinstance(req, _oa.ProtoOADealListReq):
+            self.requests.append(req)
+            self.timeouts.append(timeout)
+            await asyncio.wait_for(asyncio.Event().wait(), timeout)
+        return await super().send_request(req, timeout=timeout)
+
+
+def __test_deferred_sibling_cancels_run_before_a_stalled_history_read__(
+        tmp_path, monkeypatch):
+    # The sweep's cut cancels wait for the next pass. A history lookup that
+    # then stalls past the whole pass budget must not starve them: the pass
+    # sends the deferred cancels first, within their share of the budget.
+    broker = _sweep_broker(tmp_path, monkeypatch, quarantine=True)
+    wire = _StallingHistoryWire(stall_once={600})
+    broker._wire = wire
+
+    async def one_pass():
+        return [e async for e in broker._run_reconcile_pass()]
+
+    asyncio.run(one_pass())
+    assert list(broker._pending_sibling_cancels) == ['sib_b', 'sib_a']
+
+    wire.stall_history = True
+    _seed_working(broker, 'c50', order_id=700, qty=volume_to_units(2000),
+                  extras={'submitted_at_ms': 1_700_000_000_000})
+
+    asyncio.run(one_pass())
+
+    assert _cancelled_order_ids(broker) == [600, 601, 600]
+    assert sorted(_live_coids(broker)) == ['c50']
+    assert broker._pending_sibling_cancels == {}
+    assert any(isinstance(r, _oa.ProtoOADealListReq) and r.fromTimestamp
+               == 1_700_000_000_000 - ctrader_reconcile._SINCE_ANCHOR_SKEW_MS
+               for r in wire.requests)
 
 
 def __test_reconcile_pass_propagates_unexpected_cancel_halt__(tmp_path):

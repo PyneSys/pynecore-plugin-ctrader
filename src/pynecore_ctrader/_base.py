@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     )
 
     from .models import _SymbolRules
+    from .reconcile import _DealWalk
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +119,10 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
     # Fills are pushed on the same socket ``get_position`` reads through
     # (measured dispatch-to-fill: p90 1.1 s, max 3.1 s, n=64), but the inline
-    # reconcile pass of ``watch_orders`` (every 5 s) can hold the stream for one
-    # request timeout (30 s) when the venue stalls.
+    # reconcile pass of ``watch_orders`` (every 5 s) holds the stream while it
+    # runs. All of its venue reads — the snapshot read with its rate-limit
+    # backoff and account re-auth, and every deal-history page — share one
+    # request-timeout budget (30 s) when the venue stalls.
     fill_report_grace_s = 45.0
     multi_broker = True
     initial_connect_timeout = 180.0
@@ -250,6 +253,22 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: how many passes the outage cost. See
         #: ``_EventStreamMixin._run_reconcile_pass``.
         self._reconcile_fail_streak: int = 0
+        #: Event-loop deadline of the reconcile pass in progress, or ``None``
+        #: between passes. The snapshot read and the deal-history reads of the
+        #: pass are bounded by it, so the pass never holds the ``watch_orders``
+        #: PUSH stream past its I/O budget. See
+        #: ``_EventStreamMixin._run_reconcile_pass``.
+        self._reconcile_pass_deadline: float | None = None
+        #: Deal-history evidence per broker ``orderId``, kept across reconcile
+        #: passes: a walk the pass budget cut short resumes where it stopped,
+        #: and a finished one later reads only the deals since. Pruned to the
+        #: live rows each snapshot pass. See ``_ReconcileMixin._find_fill_deal``.
+        self._deal_walks: 'dict[int, _DealWalk]' = {}
+        #: Sibling working orders the ``stop_and_cancel`` sweep still owes a
+        #: cancel, as ``client_order_id`` -> the ``client_order_id`` whose
+        #: disappearance triggered the sweep. Drained within each reconcile
+        #: pass budget. See ``_ReconcileMixin._drain_sibling_cancels``.
+        self._pending_sibling_cancels: dict[str, str] = {}
         #: Position ids whose pyramid-sharing was already audit-logged, so the
         #: ``ctrader_position_id_shared`` warning fires once per position per run
         #: rather than per linking entry. See :meth:`_link_position_ref`.
@@ -1485,6 +1504,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
     @abstractmethod
     def _emit_unexpected_cancellations(self) -> 'AsyncIterator[OrderEvent]': ...
+
+    @abstractmethod
+    async def _drain_sibling_cancels(self) -> None: ...
 
     @abstractmethod
     async def _dispatch_order(

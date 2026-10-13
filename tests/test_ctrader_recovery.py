@@ -32,7 +32,7 @@ class _RecoveryWire:
         self._deal_fail = deal_fail
         self.requests: list = []
 
-    async def send_request(self, req):
+    async def send_request(self, req, *, timeout=None):
         self.requests.append(req)
         if isinstance(req, _oa.ProtoOAOrderListReq):
             if self._order_fail:
