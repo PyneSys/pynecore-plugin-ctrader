@@ -9,6 +9,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
     ExchangeRateLimitError,
     OrderDispositionUnknownError,
+    VenueWritesQuarantinedError,
 )
 
 from pynecore.core.plugin import is_retryable_provider_error
@@ -93,7 +94,9 @@ class _ReauthWire:
         self._scripted[req_cls] = list(outcomes)
         return self
 
-    async def send_request(self, req):
+    async def send_request(self, req, *, write_gate=None):
+        if write_gate is not None:
+            write_gate()
         self.requests.append(req)
         if isinstance(req, _oa.ProtoOAApplicationAuthReq):
             self.app_auth_calls += 1
@@ -515,6 +518,37 @@ def __test_order_dispatch_reauths_on_returned_auth_loss_event__():
     assert wire.account_auth_calls == 1  # the session was re-won
     new_orders = sum(isinstance(r, _oa.ProtoOANewOrderReq) for r in wire.requests)
     assert new_orders == 2  # rejected original + retry, same COID (no duplicate)
+
+
+class _QuarantineDuringReauthWire(_ReauthWire):
+    """Re-auth wire whose account re-auth latches the venue-write quarantine."""
+
+    def __init__(self):
+        super().__init__()
+        self.quarantined = False
+
+    async def send_request(self, req, *, write_gate=None):
+        if isinstance(req, _oa.ProtoOAAccountAuthReq):
+            self.quarantined = True
+        return await super().send_request(req, write_gate=write_gate)
+
+
+def __test_order_dispatch_retry_refused_when_quarantine_latches_during_reauth__():
+    # The first send was a definitive auth-loss rejection, so nothing executed.
+    # An external-intervention quarantine that latches while the session is
+    # being re-won must stop the re-send too: no second order write leaves.
+    wire = _QuarantineDuringReauthWire()
+    wire.script(_oa.ProtoOACancelOrderReq, _AUTH_LOST)
+    broker = _ReauthBroker(wire)
+    broker.venue_writes_blocked = lambda: wire.quarantined
+    req = _oa.ProtoOACancelOrderReq(ctidTraderAccountId=999, orderId=111)
+
+    with pytest.raises(VenueWritesQuarantinedError):
+        asyncio.run(broker._dispatch_order(req, coid='abc', context='cancel'))
+
+    assert wire.account_auth_calls == 1  # the session was re-won
+    cancels = sum(isinstance(r, _oa.ProtoOACancelOrderReq) for r in wire.requests)
+    assert cancels == 1  # only the rejected original; the retry was refused
 
 
 # === Unrecoverable: surfaces ExchangeConnectionError ======================

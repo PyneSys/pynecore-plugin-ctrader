@@ -203,6 +203,16 @@ class _ExecutionMixin(_CTraderBase, ABC):
     ) -> OpenApiMessages.ProtoOAExecutionEvent:
         """Send an order request and return its acknowledging execution event.
 
+        Every order-mutating request (new / cancel / amend order, amend position
+        SL/TP, close position) leaves the client only through here, so this is
+        the venue-write gate: while an external-intervention quarantine is
+        latched, :meth:`ensure_venue_writes_allowed` refuses the request with
+        :class:`VenueWritesQuarantinedError` (an :class:`ExchangeConnectionError`:
+        nothing was sent, the caller keeps its state and retries after resume).
+        :meth:`_account_request_raw` runs the gate inside the wire's send lock
+        right before every physical write, so a quarantine latched while the
+        request waits for the lock or for an auth-loss recovery also stops it.
+
         Translates the wire failure modes into the broker taxonomy: a protocol
         error → mapped reject; a rate-limit rejection → a locally paced,
         pre-write-retryable connection outcome; a timeout →
@@ -223,6 +233,8 @@ class _ExecutionMixin(_CTraderBase, ABC):
             call sites pass ``()`` so the engine's parked-modify handling
             treats a CANCELLED push as a genuine external cancel.
         :return: The acknowledging ``ProtoOAExecutionEvent``.
+        :raises VenueWritesQuarantinedError: While the venue-write quarantine is
+            latched; nothing is sent.
         """
         remaining = self._order_rate_limit_until - asyncio.get_running_loop().time()
         if remaining > 0.0:
@@ -241,7 +253,8 @@ class _ExecutionMixin(_CTraderBase, ABC):
             # reaches the disposition-unknown classifiers below unconverted —
             # the converting ``_account_request`` would mask the post-write
             # ambiguity and risk the engine duplicating an accepted order.
-            message = await self._account_request_raw(req)
+            message = await self._account_request_raw(
+                req, venue_write=f"cTrader {type(req).__name__}")
         except CTraderProtocolError as exc:
             mapped = map_protocol_error(exc)
             if isinstance(mapped, ExchangeRateLimitError):

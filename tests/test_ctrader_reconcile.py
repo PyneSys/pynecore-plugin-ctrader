@@ -4,11 +4,8 @@
 import asyncio
 from time import time as epoch_time
 
-from pynecore.core.broker.exceptions import (
-    ExchangeOrderRejectedError,
-    OrderDispositionUnknownError,
-    UnexpectedCancelError,
-)
+from pynecore.core.broker.exceptions import UnexpectedCancelError
+from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 
@@ -19,48 +16,24 @@ from pynecore_ctrader.helpers import volume_to_units
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
 from pynecore_ctrader.reconcile import _DealWalk
-from pynecore_ctrader.wire import CTraderProtocolError
 
 
 # === Fakes ================================================================
 
-def _cancelled_event(order_id):
-    ev = _oa.ProtoOAExecutionEvent(
-        executionType=_model.ProtoOAExecutionType.ORDER_CANCELLED,
-    )
-    ev.order.orderId = int(order_id)
-    return ev
-
-
 class _FakeWire:
-    """Stubbed wire serving the deal-history bridge and cancel requests.
-
-    A ``ProtoOACancelOrderReq`` resolves through ``cancel_responses`` (keyed by
-    ``orderId``, value is an execution event to return or an exception to raise);
-    unmapped cancels default to a confirmed ``ORDER_CANCELLED`` so the sweep can
-    retire the row, mirroring a clean broker cancel. Every other request returns
-    the canned ``deal_res``.
-    """
+    """Stubbed wire serving the deal-history bridge: every request returns ``deal_res``."""
 
     def __init__(self, *, deal_res=None, fail=False):
         self._deal_res = deal_res
         self._fail = fail
         self.requests: list = []
         self.timeouts: list = []
-        self.cancel_responses: dict = {}
 
     async def send_request(self, req, *, timeout=None):
         self.requests.append(req)
         self.timeouts.append(timeout)
         if self._fail:
             raise RuntimeError("wire down")
-        if isinstance(req, _oa.ProtoOACancelOrderReq):
-            resp = self.cancel_responses.get(req.orderId)
-            if isinstance(resp, Exception):
-                raise resp
-            if resp is not None:
-                return resp
-            return _cancelled_event(req.orderId)
         return self._deal_res
 
 
@@ -1287,16 +1260,18 @@ def __test_partial_close_still_open_position_not_terminal_closed__(tmp_path):
 
 def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
     # With the runner-wired quarantine sink present, the default 'stop' policy
-    # latches the engine quarantine instead of raising: the event stream (and
-    # the process) stays alive while trading is stopped engine-side.
+    # latches the engine's external-intervention quarantine instead of raising:
+    # the event stream (and the process) stays alive while the bot leaves the
+    # venue untouched, so the other bot-owned working order is not cancelled.
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
-    latched: list[tuple[str, dict]] = []
-    broker.quarantine_sink = lambda reason, context: latched.append(
-        (reason, context))
+    latched: list[tuple[str, dict, QuarantineKind]] = []
+    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
+        (reason, context, kind))
     _open(tmp_path, broker)
     _seed_working(broker, 'q1', order_id=222, qty=qty,
                   extras={'missing_pending_since': 0.0})
+    _seed_working(broker, 'q2', order_id=333, qty=qty)
 
     events, err = _drive_tracker(broker)
 
@@ -1304,9 +1279,13 @@ def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
     assert err is None                      # no halt: the process stays alive
     assert 'q1' not in _live_coids(broker)  # row still retired
     assert len(latched) == 1
-    reason, context = latched[0]
+    reason, context, kind = latched[0]
     assert 'q1' in reason
     assert context['policy'] == 'stop'
+    assert kind is QuarantineKind.EXTERNAL_INTERVENTION
+    assert 'q2' in _live_coids(broker)
+    assert not any(isinstance(r, _oa.ProtoOACancelOrderReq)
+                   for r in broker._wire.requests)
 
 
 def __test_policy_ignore_retires_without_halting__(tmp_path):
@@ -1337,309 +1316,6 @@ def __test_policy_re_place_retires_without_halting__(tmp_path):
     assert len(events) == 1 and events[0].event_type == 'cancelled'
     assert err is None
     assert 'c5' not in _live_coids(broker)
-
-
-def __test_policy_stop_and_cancel_sweeps_siblings_then_halts__(tmp_path):
-    # stop_and_cancel cancels the OTHER bot-owned working orders in the symbol
-    # (ProtoOACancelOrderReq), retires their rows, then raises.
-    qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
-    broker.on_unexpected_cancel = 'stop_and_cancel'
-    _open(tmp_path, broker)
-    _seed_working(broker, 'gone', order_id=500, qty=qty,
-                  extras={'missing_pending_since': 0.0})
-    _seed_working(broker, 'sibling', order_id=600, qty=qty)
-
-    events, err = _drive_tracker(broker)
-
-    assert isinstance(err, UnexpectedCancelError)
-    cancel_reqs = [r for r in broker._wire.requests
-                   if isinstance(r, _oa.ProtoOACancelOrderReq)]
-    assert any(r.orderId == 600 for r in cancel_reqs)
-    assert _live_coids(broker) == []
-
-
-def __test_policy_stop_and_cancel_leaves_open_position_sibling__(tmp_path):
-    # stop_and_cancel must NOT cancel or retire an OPEN position sibling: a
-    # fully-filled position keeps its original extras['order_id'], but it has no
-    # working order to cancel and is the live broker exposure the operator is
-    # meant to keep. Only the working sibling is swept; the position row survives.
-    qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
-    broker.on_unexpected_cancel = 'stop_and_cancel'
-    _open(tmp_path, broker)
-    _seed_working(broker, 'gone', order_id=500, qty=qty,
-                  extras={'missing_pending_since': 0.0})
-    _seed_working(broker, 'sibling', order_id=600, qty=qty)
-    _seed_position(broker, 'open_pos', position_id=700, qty=qty)
-
-    events, err = _drive_tracker(broker)
-
-    assert isinstance(err, UnexpectedCancelError)
-    cancel_reqs = [r for r in broker._wire.requests
-                   if isinstance(r, _oa.ProtoOACancelOrderReq)]
-    # The working sibling is cancelled; the open position's order_id is NOT.
-    assert any(r.orderId == 600 for r in cancel_reqs)
-    assert all(r.orderId != 111 for r in cancel_reqs)
-    # The open position row is left intact for the operator.
-    assert 'open_pos' in _live_coids(broker)
-
-
-def __test_policy_stop_and_cancel_leaves_partially_filled_sibling__(tmp_path):
-    # stop_and_cancel must NOT cancel or retire a PARTIALLY filled sibling: its
-    # filled portion is live broker exposure linked to a position. Terminal-
-    # closing its row would strand that filled position untracked after the halt.
-    # Only the zero-fill resting sibling is swept; the partial row survives.
-    qty = volume_to_units(2000)
-    partial = volume_to_units(1000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
-    broker.on_unexpected_cancel = 'stop_and_cancel'
-    _open(tmp_path, broker)
-    _seed_working(broker, 'gone', order_id=500, qty=qty,
-                  extras={'missing_pending_since': 0.0})
-    _seed_working(broker, 'sibling', order_id=600, qty=qty)
-    _seed_partial_working(broker, 'partial', order_id=650, qty=qty,
-                          filled=partial, position_id=750)
-
-    events, err = _drive_tracker(broker)
-
-    assert isinstance(err, UnexpectedCancelError)
-    cancel_reqs = [r for r in broker._wire.requests
-                   if isinstance(r, _oa.ProtoOACancelOrderReq)]
-    # The zero-fill working sibling is cancelled; the partial-fill order is NOT.
-    assert any(r.orderId == 600 for r in cancel_reqs)
-    assert all(r.orderId != 650 for r in cancel_reqs)
-    # The partially-filled row is left intact for the operator.
-    assert 'partial' in _live_coids(broker)
-    store_row = broker.store_ctx.get_order('partial')
-    assert store_row is not None and store_row.filled_qty == partial
-
-
-def _fill_exec_event(order_id):
-    ev = _oa.ProtoOAExecutionEvent(
-        executionType=_model.ProtoOAExecutionType.ORDER_FILLED,
-    )
-    ev.order.orderId = int(order_id)
-    return ev
-
-
-def _cancel_rejected_event(order_id):
-    ev = _oa.ProtoOAExecutionEvent(
-        executionType=_model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED,
-    )
-    ev.order.orderId = int(order_id)
-    return ev
-
-
-def __test_policy_stop_and_cancel_keeps_sibling_when_cancel_races_fill__(tmp_path):
-    # The cancel loses a race to a fill: cTrader returns a non-raising
-    # ORDER_FILLED execution event. Retiring the row would drop the just-surfaced
-    # fill as external activity, stranding live exposure untracked. The row must
-    # survive so the fill can still book against it.
-    qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
-    broker.on_unexpected_cancel = 'stop_and_cancel'
-    _open(tmp_path, broker)
-    _seed_working(broker, 'gone', order_id=500, qty=qty,
-                  extras={'missing_pending_since': 0.0})
-    _seed_working(broker, 'sibling', order_id=600, qty=qty)
-    broker._wire.cancel_responses[600] = _fill_exec_event(600)
-
-    events, err = _drive_tracker(broker)
-
-    assert isinstance(err, UnexpectedCancelError)
-    assert 'sibling' in _live_coids(broker)
-
-
-def __test_policy_stop_and_cancel_keeps_sibling_on_cancel_rejected__(tmp_path):
-    # ORDER_CANCEL_REJECTED (cancel/modify race) does NOT confirm the order is
-    # gone — it may still be live or fill. The row must survive, not be retired.
-    qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
-    broker.on_unexpected_cancel = 'stop_and_cancel'
-    _open(tmp_path, broker)
-    _seed_working(broker, 'gone', order_id=500, qty=qty,
-                  extras={'missing_pending_since': 0.0})
-    _seed_working(broker, 'sibling', order_id=600, qty=qty)
-    broker._wire.cancel_responses[600] = _cancel_rejected_event(600)
-
-    events, err = _drive_tracker(broker)
-
-    assert isinstance(err, UnexpectedCancelError)
-    assert 'sibling' in _live_coids(broker)
-
-
-def __test_policy_stop_and_cancel_keeps_sibling_on_ambiguous_cancel__(tmp_path):
-    # An ambiguous cancel (timeout / link drop after send -> disposition unknown)
-    # leaves the working order possibly live or filled. The row must survive so
-    # reconcile resolves it, not be retired out from under that exposure.
-    qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
-    broker.on_unexpected_cancel = 'stop_and_cancel'
-    _open(tmp_path, broker)
-    _seed_working(broker, 'gone', order_id=500, qty=qty,
-                  extras={'missing_pending_since': 0.0})
-    _seed_working(broker, 'sibling', order_id=600, qty=qty)
-    broker._wire.cancel_responses[600] = OrderDispositionUnknownError(
-        "cancel timed out", client_order_id='sibling',
-    )
-
-    events, err = _drive_tracker(broker)
-
-    assert isinstance(err, UnexpectedCancelError)
-    assert 'sibling' in _live_coids(broker)
-
-
-def __test_policy_stop_and_cancel_keeps_sibling_on_not_found__(tmp_path):
-    # A *_NOT_FOUND cancel race means the working order left the book, but that
-    # does NOT distinguish a cancel from a fill: execute_cancel_with_outcome
-    # resolves the same race as UNKNOWN. Retiring the row here would delete its
-    # refs before a just-surfaced fill can book, stranding exposure. The row must
-    # survive, not be retired.
-    qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
-    broker.on_unexpected_cancel = 'stop_and_cancel'
-    _open(tmp_path, broker)
-    _seed_working(broker, 'gone', order_id=500, qty=qty,
-                  extras={'missing_pending_since': 0.0})
-    _seed_working(broker, 'sibling', order_id=600, qty=qty)
-    not_found = ExchangeOrderRejectedError("order gone")
-    not_found.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
-    broker._wire.cancel_responses[600] = not_found
-
-    events, err = _drive_tracker(broker)
-
-    assert isinstance(err, UnexpectedCancelError)
-    assert 'sibling' in _live_coids(broker)
-
-
-class _StallOnceCancelWire(_FakeWire):
-    """Fake wire whose first cancel of each ``stall_once`` order never answers."""
-
-    def __init__(self, *, stall_once):
-        super().__init__(deal_res=_deal_res())
-        self.stall_once = set(stall_once)
-
-    async def send_request(self, req, *, timeout=None):
-        if (isinstance(req, _oa.ProtoOACancelOrderReq)
-                and req.orderId in self.stall_once):
-            self.stall_once.discard(req.orderId)
-            self.requests.append(req)
-            self.timeouts.append(timeout)
-            await asyncio.wait_for(asyncio.Event().wait(), timeout)
-        return await super().send_request(req, timeout=timeout)
-
-
-def _sweep_broker(tmp_path, monkeypatch, *, quarantine):
-    """A stop_and_cancel broker whose first cancel of order 600 stalls."""
-    monkeypatch.setattr(ctrader_events, '_RECONCILE_PASS_BUDGET_S', 0.05)
-    qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(orders=[_order(order_id=600, volume=2000),
-                                             _order(order_id=601, volume=2000)]))
-    broker._wire = _StallOnceCancelWire(stall_once={600})
-    broker.on_unexpected_cancel = 'stop_and_cancel'
-    if quarantine:
-        broker.quarantine_sink = lambda reason, context: None
-    _open(tmp_path, broker)
-    _seed_working(broker, 'gone', order_id=500, qty=qty,
-                  extras={'missing_pending_since': 0.0})
-    _seed_working(broker, 'sib_a', order_id=600, qty=qty)
-    _seed_working(broker, 'sib_b', order_id=601, qty=qty)
-    return broker
-
-
-def _cancelled_order_ids(broker) -> list[int]:
-    return [r.orderId for r in broker._wire.requests
-            if isinstance(r, _oa.ProtoOACancelOrderReq)]
-
-
-def __test_sibling_cancel_sweep_spends_the_pass_budget_then_resumes__(
-        tmp_path, monkeypatch):
-    # The stop_and_cancel sweep runs inside the reconcile pass that holds the
-    # PUSH stream: a cancel that never answers is cut at the pass deadline, and
-    # the unsent / cut cancels finish on the next pass (the cut one re-sent
-    # last), while quarantine keeps the process alive.
-    broker = _sweep_broker(tmp_path, monkeypatch, quarantine=True)
-
-    async def one_pass():
-        return [e async for e in broker._run_reconcile_pass()]
-
-    events = asyncio.run(one_pass())
-
-    assert [e.event_type for e in events] == ['cancelled']
-    assert _cancelled_order_ids(broker) == [600]
-    assert sorted(_live_coids(broker)) == ['sib_a', 'sib_b']
-    assert list(broker._pending_sibling_cancels) == ['sib_b', 'sib_a']
-    assert broker._reconcile_fail_streak == 0
-
-    asyncio.run(one_pass())
-
-    assert _cancelled_order_ids(broker) == [600, 601, 600]
-    assert _live_coids(broker) == []
-    assert broker._pending_sibling_cancels == {}
-
-
-def __test_sibling_cancel_sweep_finishes_before_a_halt__(tmp_path, monkeypatch):
-    # Without a quarantine sink the policy halts: the stream ends anyway, so the
-    # cancels the pass budget cut short are finished before the halt propagates.
-    broker = _sweep_broker(tmp_path, monkeypatch, quarantine=False)
-
-    async def one_pass():
-        try:
-            async for _e in broker._run_reconcile_pass():
-                pass
-        except UnexpectedCancelError as exc:
-            return exc
-        return None
-
-    err = asyncio.run(one_pass())
-
-    assert isinstance(err, UnexpectedCancelError)
-    assert _cancelled_order_ids(broker) == [600, 601, 600]
-    assert _live_coids(broker) == []
-    assert broker._pending_sibling_cancels == {}
-
-
-class _StallingHistoryWire(_StallOnceCancelWire):
-    """Sweep wire whose deal-history reads never answer once ``stall_history`` is set."""
-
-    stall_history = False
-
-    async def send_request(self, req, *, timeout=None):
-        if self.stall_history and isinstance(req, _oa.ProtoOADealListReq):
-            self.requests.append(req)
-            self.timeouts.append(timeout)
-            await asyncio.wait_for(asyncio.Event().wait(), timeout)
-        return await super().send_request(req, timeout=timeout)
-
-
-def __test_deferred_sibling_cancels_run_before_a_stalled_history_read__(
-        tmp_path, monkeypatch):
-    # The sweep's cut cancels wait for the next pass. A history lookup that
-    # then stalls past the whole pass budget must not starve them: the pass
-    # sends the deferred cancels first, within their share of the budget.
-    broker = _sweep_broker(tmp_path, monkeypatch, quarantine=True)
-    wire = _StallingHistoryWire(stall_once={600})
-    broker._wire = wire
-
-    async def one_pass():
-        return [e async for e in broker._run_reconcile_pass()]
-
-    asyncio.run(one_pass())
-    assert list(broker._pending_sibling_cancels) == ['sib_b', 'sib_a']
-
-    wire.stall_history = True
-    _seed_working(broker, 'c50', order_id=700, qty=volume_to_units(2000),
-                  extras={'submitted_at_ms': 1_700_000_000_000})
-
-    asyncio.run(one_pass())
-
-    assert _cancelled_order_ids(broker) == [600, 601, 600]
-    assert sorted(_live_coids(broker)) == ['c50']
-    assert broker._pending_sibling_cancels == {}
-    assert any(isinstance(r, _oa.ProtoOADealListReq) and r.fromTimestamp
-               == 1_700_000_000_000 - ctrader_reconcile._SINCE_ANCHOR_SKEW_MS
-               for r in wire.requests)
 
 
 def __test_reconcile_pass_propagates_unexpected_cancel_halt__(tmp_path):

@@ -10,6 +10,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
+    VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.models import (
     BracketAttachRejectContext,
@@ -23,6 +24,7 @@ from pynecore.core.broker.models import (
     LegType,
     OrderType,
 )
+from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.core.broker.store_helpers import (
@@ -44,6 +46,7 @@ from pynecore_ctrader.helpers import (
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
 from pynecore_ctrader.models import _SymbolRules
+from pynecore_ctrader.wire import WireClient
 
 _RULES = _SymbolRules(
     symbol_id=1, digits=5, min_volume=1000, step_volume=1000, max_volume=10_000_000,
@@ -1868,3 +1871,202 @@ def __test_cancel_broker_order_ref_cancel_rejected_raises_unknown__():
         _model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED)
     with pytest.raises(OrderDispositionUnknownError):
         asyncio.run(broker.cancel_broker_order_ref('111'))
+
+
+# === Venue-write quarantine gate ==========================================
+
+_WRITE_REQUEST_TYPES = (
+    _oa.ProtoOANewOrderReq,
+    _oa.ProtoOACancelOrderReq,
+    _oa.ProtoOAAmendOrderReq,
+    _oa.ProtoOAAmendPositionSLTPReq,
+    _oa.ProtoOAClosePositionReq,
+)
+
+
+class _GateWire:
+    """Recording wire that answers every request with the canned reconcile snapshot."""
+
+    def __init__(self, reconcile):
+        self._reconcile = reconcile
+        self.requests: list = []
+
+    async def send_request(self, req, *, write_gate=None):
+        if write_gate is not None:
+            write_gate()
+        self.requests.append(req)
+        return self._reconcile
+
+
+class _GatedBroker(CTrader):
+    """cTrader broker with the REAL ``_dispatch_order`` over a recording wire.
+
+    The venue-write hook reports a latched external-intervention quarantine, and
+    the snapshot holds one open EURUSD position (555) without protection.
+    """
+
+    def __init__(self):
+        super().__init__(symbol=None, config=_make_config())
+        self._live_account_id = 999
+        self._symbols_by_name = {'EURUSD': 1}
+        self._symbols_by_id = {1: 'EURUSD'}
+        self._symbol_rules = {'EURUSD': _RULES}
+        res = _oa.ProtoOAReconcileRes()
+        res.position.append(_model.ProtoOAPosition(
+            positionId=555,
+            positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+            tradeData=_model.ProtoOATradeData(symbolId=1, volume=1000,
+                                              tradeSide=_model.ProtoOATradeSide.BUY),
+        ))
+        self.wire = _GateWire(res)
+        self._wire = self.wire
+        self.venue_writes_blocked = lambda: True
+
+
+def _sent_writes(broker: _GatedBroker) -> list:
+    return [r for r in broker.wire.requests if isinstance(r, _WRITE_REQUEST_TYPES)]
+
+
+@pytest.mark.parametrize('req', [
+    _oa.ProtoOANewOrderReq(ctidTraderAccountId=999, symbolId=1, volume=1000),
+    _oa.ProtoOACancelOrderReq(ctidTraderAccountId=999, orderId=111),
+    _oa.ProtoOAAmendOrderReq(ctidTraderAccountId=999, orderId=111, volume=1000),
+    _oa.ProtoOAAmendPositionSLTPReq(ctidTraderAccountId=999, positionId=555),
+    _oa.ProtoOAClosePositionReq(ctidTraderAccountId=999, positionId=555, volume=1000),
+], ids=lambda r: type(r).__name__)
+def __test_dispatch_order_refuses_every_write_while_quarantined__(req):
+    broker = _GatedBroker()
+    with pytest.raises(VenueWritesQuarantinedError) as info:
+        asyncio.run(broker._dispatch_order(req, coid='coid-q', context='gate'))
+    assert type(req).__name__ in str(info.value)
+    assert broker.wire.requests == []
+
+
+class _RecordingWriter:
+    """``StreamWriter`` stand-in that records every frame written to it."""
+
+    def __init__(self):
+        self.writes: list[bytes] = []
+
+    @staticmethod
+    def is_closing() -> bool:
+        return False
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+
+class _SignallingLock(asyncio.Lock):
+    """Send lock that signals once a second sender starts waiting for it."""
+
+    def __init__(self):
+        super().__init__()
+        self.contended = asyncio.Event()
+
+    async def acquire(self):
+        if self.locked():
+            self.contended.set()
+        return await super().acquire()
+
+
+def __test_quarantine_latched_while_waiting_for_the_send_lock_writes_nothing__():
+    # The gate runs inside the REAL wire's send lock: an order request queued
+    # behind another write (or a heartbeat drain) must not reach the socket if
+    # the quarantine latches before it gets the lock.
+    async def scenario() -> None:
+        broker = CTrader(symbol=None, config=_make_config())
+        broker._live_account_id = 999
+        quarantined = [False]
+        broker.venue_writes_blocked = lambda: quarantined[0]
+        wire = WireClient('127.0.0.1', 1)
+        writer = _RecordingWriter()
+        wire._writer = writer  # type: ignore[assignment]
+        lock = _SignallingLock()
+        wire._send_lock = lock
+        broker._wire = wire
+        req = _oa.ProtoOACancelOrderReq(ctidTraderAccountId=999, orderId=111)
+
+        async with lock:
+            task = asyncio.create_task(
+                broker._dispatch_order(req, coid='coid-q', context='cancel'))
+            await lock.contended.wait()
+            quarantined[0] = True
+        with pytest.raises(VenueWritesQuarantinedError):
+            await task
+        assert writer.writes == []
+        assert wire._pending == {}
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+
+
+def __test_dispatch_order_sends_once_the_quarantine_lifts__():
+    broker = _GatedBroker()
+    broker.venue_writes_blocked = lambda: False
+    req = _oa.ProtoOACancelOrderReq(ctidTraderAccountId=999, orderId=111)
+    with pytest.raises(ExchangeOrderRejectedError):
+        # The canned reconcile snapshot is not an execution event; what matters
+        # is that the request reached the wire.
+        asyncio.run(broker._dispatch_order(req, coid='coid-q', context='gate'))
+    assert broker.wire.requests == [req]
+
+
+def __test_quarantine_refuses_every_write_path_but_reads_still_go_out__(tmp_path):
+    broker = _GatedBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    _seed_owned_entry(broker, coid='parent', pine_id='P', position_id=555)
+    entry = EntryIntent(pine_id="Long", symbol="EURUSD", side="buy",
+                        qty=10.0, order_type=OrderType.LIMIT, limit=1.05)
+    exit_intent = ExitIntent(pine_id="Exit", from_entry="Long", symbol="EURUSD",
+                             side="sell", qty=10.0, tp_price=1.30, sl_price=1.10)
+    writes = {
+        'execute_entry': lambda: broker.execute_entry(_envelope(entry)),
+        'place_leg': lambda: broker.place_leg(_envelope(entry, run_tag="cd34"), 10.0),
+        'execute_exit': lambda: broker.execute_exit(_envelope(exit_intent)),
+        'modify_exit': lambda: broker.modify_exit(
+            _envelope(exit_intent), _envelope(exit_intent, run_tag="cd34")),
+        'modify_entry': lambda: broker.modify_entry(
+            _envelope(entry), _envelope(entry, run_tag="cd34")),
+        'execute_close': lambda: broker.execute_close(_envelope(CloseIntent(
+            pine_id="Long", symbol="EURUSD", side="sell", qty=10.0))),
+        'execute_cancel': lambda: broker.execute_cancel(_envelope(CancelIntent(
+            pine_id='Long', symbol='EURUSD'))),
+        'execute_cancel_with_outcome': lambda: broker.execute_cancel_with_outcome(
+            _envelope(CancelIntent(pine_id='Long', symbol='EURUSD'))),
+        'cancel_broker_order_ref': lambda: broker.cancel_broker_order_ref('111'),
+        'close_leg': lambda: broker.close_leg("EURUSD", "555", 1000, "coid-c"),
+        'amend_bracket': lambda: broker.amend_bracket(
+            "EURUSD", "555", side="sell", tp_price=1.30, sl_price=1.10,
+            trail_offset=None, coid="coid-b"),
+        'clear_bracket': lambda: broker.amend_bracket(
+            "EURUSD", "555", side="sell", tp_price=None, sl_price=None,
+            trail_offset=None, coid="coid-clear"),
+        'publish_native_failsafe_sl': lambda: broker.publish_native_failsafe_sl(
+            NativeBracketSnapshot(
+                parent_entry_dispatch_ref='parent', symbol='EURUSD',
+                parent_side='long', stop_level=1.10, profit_level=None,
+                trailing_stop=None, generation=1)),
+    }
+    for name, write in writes.items():
+        with pytest.raises(VenueWritesQuarantinedError):
+            asyncio.run(write())
+        assert _sent_writes(broker) == [], name
+
+    # Nothing was sent, so no journal row moved as if a write had happened: the
+    # working order and the parent stay live, the entries stay ``submitted``.
+    working = broker.store_ctx.get_order('coid-111')
+    assert working is not None and working.closed_ts_ms is None
+    assert working.state == 'confirmed'
+    parent = broker.store_ctx.get_order('parent')
+    assert parent is not None and parent.closed_ts_ms is None
+    submitted = [r for r in broker.store_ctx.iter_live_orders()
+                 if r.client_order_id not in ('coid-111', 'parent')]
+    assert submitted and all(r.state == 'submitted' for r in submitted)
+
+    # Reads are not venue writes: the snapshot read still goes out.
+    res = asyncio.run(broker._reconcile())
+    assert [p.positionId for p in res.position] == [555]
+    assert isinstance(broker.wire.requests[-1], _oa.ProtoOAReconcileReq)

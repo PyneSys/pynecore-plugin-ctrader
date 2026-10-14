@@ -45,10 +45,6 @@ from pynecore.core.broker.disappearance import (
     MissingConfirmation,
     MissingResolution,
 )
-from pynecore.core.broker.exceptions import (
-    BrokerError,
-    ExchangeOrderRejectedError,
-)
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.models import (
     ExchangeOrder,
@@ -443,7 +439,6 @@ class _ReconcileMixin(_CTraderBase, ABC):
                 policy=self.on_unexpected_cancel,
                 tracked_refs=self._tracked_position_refs,
                 confirm_missing=self._confirm_missing_via_deal_history,
-                cancel_siblings=self._cancel_sibling_working_orders,
                 request_quarantine=self.quarantine_sink,
                 sibling_coids=self._closed_position_siblings,
                 register_executions=self._register_recovered_deals,
@@ -1073,7 +1068,7 @@ class _ReconcileMixin(_CTraderBase, ABC):
         clears it from ``_order_mapping`` and re-syncs the strategy
         position, exactly as a live ``ORDER_CANCELLED`` PUSH event would —
         and the configured ``on_unexpected_cancel`` policy is applied
-        (``stop`` / ``stop_and_cancel`` latch the engine quarantine;
+        (``stop`` latches the engine's external-intervention quarantine;
         ``halt``, or an unwired quarantine sink, raises
         :class:`UnexpectedCancelError` through the reconcile pass).
 
@@ -1113,148 +1108,6 @@ class _ReconcileMixin(_CTraderBase, ABC):
             pine_id=row.pine_entry_id, from_entry=row.from_entry,
             leg_type=LegType.ENTRY, fee=0.0,
         )
-
-    async def _cancel_sibling_working_orders(self, row) -> None:
-        """Best-effort cancel sweep over the other bot-owned working orders.
-
-        Queues a ``ProtoOACancelOrderReq`` for every other live row in the same
-        symbol that still carries a cancellable working order (see
-        :meth:`_sweepable_order_id`), then sends what the reconcile pass budget
-        allows (:meth:`_drain_sibling_cancels`), so the halt does not strand
-        the bot's remaining resting protective orders. Open positions (no
-        cancellable working order) are left for the operator — closing them on
-        a halt is more aggressive than this safety sweep intends.
-
-        :param row: The row whose unexpected disappearance triggered the sweep.
-        """
-        if self.store_ctx is None:
-            return
-        for other in self.store_ctx.iter_live_orders(symbol=row.symbol):
-            if (other.client_order_id != row.client_order_id
-                    and self._sweepable_order_id(other) is not None):
-                self._pending_sibling_cancels.setdefault(
-                    other.client_order_id, row.client_order_id)
-        await self._drain_sibling_cancels()
-
-    @staticmethod
-    def _sweepable_order_id(row: 'OrderRow') -> int | None:
-        """The working ``orderId`` the sibling sweep may cancel, or ``None``.
-
-        A filled row keeps its original ``order_id`` even after the order left
-        ``order[]`` for ``position[]`` (the fill / promotion paths never strip
-        it), so ``order_id`` alone does NOT prove the row is still a cancellable
-        working order. Any row with a linked ``position_id`` AND live filled
-        exposure — a settled position (filled to its full size) OR a partial
-        fill whose residual is still working — represents real broker exposure
-        the sweep must leave for the operator: terminal-closing its tracking row
-        would strand that filled position untracked after the halt/restart.
-        Only zero-fill resting orders are swept.
-
-        :param row: A live bot-owned row.
-        :return: The parsed ``orderId`` of a zero-fill working order, else ``None``.
-        """
-        extras = row.extras or {}
-        order_id_raw = extras.get('order_id')
-        if order_id_raw is None:
-            return None
-        if extras.get('position_id') and row.filled_qty > 1e-9:
-            return None
-        return parse_protocol_id(order_id_raw, field='order_id')
-
-    async def _drain_sibling_cancels(self) -> None:
-        """Send the queued sibling cancels within the reconcile pass budget.
-
-        The sweep runs inside the reconcile pass, which holds the
-        ``watch_orders`` PUSH stream, so every cancel shares the pass deadline
-        (:attr:`_reconcile_pass_deadline`; ``None`` leaves only the per-request
-        timeout). Once the budget is spent the rest of the queue waits for the
-        next pass, which sends it before its own reads. A cancel the deadline
-        cut short may or may not have reached the venue: it moves to the back
-        of the queue and is re-sent — a repeat cancel of an order that already
-        left the book comes back as a not-found reject, which keeps the row
-        live like any other ambiguous outcome. A queued row that is no longer a
-        live zero-fill working order is dropped unsent.
-
-        Per-order failures are swallowed: the sweep is best-effort, and a row
-        whose cancel is not confirmed stays live for reconcile to resolve.
-        """
-        if self.store_ctx is None:
-            self._pending_sibling_cancels.clear()
-            return
-        cascade = DispatchJournal(self.store_ctx)
-        deadline = self._reconcile_pass_deadline
-        loop = asyncio.get_running_loop()
-        for coid, origin_coid in list(self._pending_sibling_cancels.items()):
-            other = self.store_ctx.get_order(coid)
-            order_id = (self._sweepable_order_id(other)
-                        if other is not None and other.closed_ts_ms is None else None)
-            if order_id is None:
-                del self._pending_sibling_cancels[coid]
-                continue
-            if deadline is not None and loop.time() >= deadline:
-                logger.debug(
-                    "cTrader sibling cancel sweep deferred (%d queued): "
-                    "reconcile pass budget spent", len(self._pending_sibling_cancels),
-                )
-                return
-            try:
-                async with asyncio.timeout_at(deadline):
-                    event = await self._dispatch_order(
-                        OpenApiMessages.ProtoOACancelOrderReq(
-                            ctidTraderAccountId=self._live_account_id,
-                            orderId=order_id,
-                        ),
-                        coid=coid, context="cancel",
-                    )
-            except TimeoutError:
-                del self._pending_sibling_cancels[coid]
-                self._pending_sibling_cancels[coid] = origin_coid
-                logger.debug(
-                    "cTrader sibling cancel for %r deferred: reconcile pass "
-                    "budget spent mid-request", coid,
-                )
-                return
-            except ExchangeOrderRejectedError:
-                # NO mapped reject confirms a no-fill cancel. A ``*_NOT_FOUND``
-                # race means the working order left the book, but that is exactly
-                # the ambiguity ``execute_cancel_with_outcome`` resolves as
-                # ``UNKNOWN``: the order may have left because it CANCELLED or
-                # because it just FILLED, and the fill PUSH / deal-history event
-                # may not have booked yet. Retiring the row on not-found would
-                # delete its refs before that fill can be attributed, stranding
-                # real exposure. Every other reject (cancel-reject reported as an
-                # error event, etc.) likewise fails to prove the order is gone.
-                # Keep the row live for reconcile to resolve.
-                del self._pending_sibling_cancels[coid]
-                continue
-            except BrokerError:
-                # Ambiguous disposition (timeout / link drop after send) or link
-                # down: the working order may still be live or may have filled.
-                # Retiring the row here would strand that exposure untracked after
-                # the halt/restart — leave the row live for reconcile to resolve.
-                del self._pending_sibling_cancels[coid]
-                continue
-            del self._pending_sibling_cancels[coid]
-            # ``ORDER_CANCEL_REJECTED`` (cancel/modify race) and ``ORDER_FILLED``
-            # (the cancel lost a race to a fill) both come back as non-raising
-            # execution events. Only a confirmed ``ORDER_CANCELLED`` retires the
-            # row; everything else keeps it so a surfaced fill can still book
-            # against it.
-            if (event.executionType
-                    != OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED):
-                continue
-            cascade.apply_reconcile_outcome(
-                coid,
-                ReconcileOutcome(
-                    kind='terminal_close',
-                    reason='unexpected_cancel_cascade',
-                    new_state='rejected',
-                    audit_event='unexpected_cancel_cascade',
-                    close_row=True,
-                    audit_payload={'origin_coid': origin_coid},
-                    exchange_order_id=str(order_id),
-                ),
-            )
 
     @staticmethod
     def _fill_event(

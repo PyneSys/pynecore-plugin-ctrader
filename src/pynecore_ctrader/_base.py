@@ -23,6 +23,7 @@ data-provider surface and the high-level order-execution layer, and acts as
 the shared base every cTrader mix-in derives from.
 """
 import asyncio
+import functools
 import logging
 from abc import ABC, abstractmethod
 from collections import deque
@@ -264,11 +265,6 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: and a finished one later reads only the deals since. Pruned to the
         #: live rows each snapshot pass. See ``_ReconcileMixin._find_fill_deal``.
         self._deal_walks: 'dict[int, _DealWalk]' = {}
-        #: Sibling working orders the ``stop_and_cancel`` sweep still owes a
-        #: cancel, as ``client_order_id`` -> the ``client_order_id`` whose
-        #: disappearance triggered the sweep. Drained within each reconcile
-        #: pass budget. See ``_ReconcileMixin._drain_sibling_cancels``.
-        self._pending_sibling_cancels: dict[str, str] = {}
         #: Position ids whose pyramid-sharing was already audit-logged, so the
         #: ``ctrader_position_id_shared`` warning fires once per position per run
         #: rather than per linking entry. See :meth:`_link_position_ref`.
@@ -737,7 +733,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         except (CTraderConnectionError, CTraderTimeoutError) as exc:
             raise ExchangeConnectionError(str(exc) or "connection lost") from exc
 
-    async def _account_request_raw(self, req: Message) -> Message:
+    async def _account_request_raw(
+            self, req: Message, *, venue_write: str | None = None,
+    ) -> Message:
         """Send an account-scoped request, recovering from a mid-session de-auth.
 
         On an "account not authorized" error the socket is still up (only this
@@ -760,13 +758,25 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         definitive server *rejection* (an error response proves nothing
         executed, so re-sending the same ``client_order_id`` cannot duplicate).
 
+        An order write passes ``venue_write``: the venue-write gate
+        (:meth:`ensure_venue_writes_allowed`) runs inside the wire's send lock,
+        right before EVERY physical write, the re-send included, because an
+        external-intervention quarantine can latch while the request waits for
+        the send lock or for the session recovery.
+
         :param req: The request message; re-sent unchanged on retry.
+        :param venue_write: Description of an order-mutating request for the
+            venue-write gate, or ``None`` for a read.
         :return: The successful response.
         :raises ExchangeConnectionError: If the session could not be re-won.
+        :raises VenueWritesQuarantinedError: When ``venue_write`` is set and the
+            venue-write quarantine is latched before a send; that send is not made.
         """
         wire = self._wire
         if wire is None:
             raise CTraderConnectionError("live connection not established")
+        write_gate = (None if venue_write is None
+                      else functools.partial(self.ensure_venue_writes_allowed, venue_write))
         # Capture the re-auth generation BEFORE issuing the request: if this send
         # loses the session and its rejection arrives late — after a concurrent
         # caller already re-won the session and bumped the generation — recovery
@@ -775,7 +785,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         # client-channel loss, would re-app-auth an already-authenticated channel).
         seen_generation = self._reauth_generation
         try:
-            response = await wire.send_request(req)
+            response = await wire.send_request(req, write_gate=write_gate)
             loss = self._account_auth_loss(response)
             if loss is None:
                 return response
@@ -790,7 +800,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
             raise ExchangeConnectionError(
                 "cTrader live connection not established") from exc
         try:
-            response = await wire.send_request(req)
+            response = await wire.send_request(req, write_gate=write_gate)
         except CTraderProtocolError as retry_exc:
             # The session was re-won, but the re-sent request hit a fresh
             # auth-loss — the very condition being handled (another
@@ -1504,9 +1514,6 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
     @abstractmethod
     def _emit_unexpected_cancellations(self) -> 'AsyncIterator[OrderEvent]': ...
-
-    @abstractmethod
-    async def _drain_sibling_cancels(self) -> None: ...
 
     @abstractmethod
     async def _dispatch_order(

@@ -27,6 +27,7 @@ import asyncio
 import logging
 import ssl
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from google.protobuf.message import DecodeError, Message
@@ -313,12 +314,16 @@ class WireClient:
         await self._send_message(message)
 
     async def send_request(
-            self, message: Message, *, timeout: float = helpers.REQUEST_TIMEOUT
+            self, message: Message, *, timeout: float = helpers.REQUEST_TIMEOUT,
+            write_gate: Callable[[], None] | None = None,
     ) -> Message:
         """Send a request and await its correlated response.
 
         :param message: A concrete request message to wrap and send.
         :param timeout: Seconds to wait for the response.
+        :param write_gate: Called under the send lock immediately before the
+            bytes are written; an exception it raises aborts the send with
+            nothing written and propagates unchanged.
         :return: The decoded response message.
         :raises CTraderTimeoutError: If no response arrives within ``timeout``.
         :raises CTraderProtocolError: If the server answers with an error response.
@@ -334,7 +339,7 @@ class WireClient:
         future: asyncio.Future[Message] = loop.create_future()
         self._pending[client_msg_id] = future
         try:
-            await self._send_message(message, client_msg_id)
+            await self._send_message(message, client_msg_id, write_gate)
             # The request bytes are now on the wire: a connection loss while we
             # await the correlated response leaves the disposition unknown (the
             # server may have accepted the order), so re-raise the pending
@@ -380,11 +385,17 @@ class WireClient:
         body = envelope.SerializeToString()
         return struct.pack("!I", len(body)) + body
 
-    async def _send_message(self, message: Message, client_msg_id: str = "") -> None:
+    async def _send_message(
+            self, message: Message, client_msg_id: str = "",
+            write_gate: Callable[[], None] | None = None,
+    ) -> None:
         """Frame and write a message under the send lock.
 
         :param message: The concrete message to send.
         :param client_msg_id: The correlation id, or ``""`` for none.
+        :param write_gate: Called once the send lock is held, right before the
+            write, so no await separates its verdict from the bytes leaving; an
+            exception it raises aborts the send with nothing written.
         :raises CTraderConnectionError: If the socket is not writable (nothing was
             sent).
         :raises CTraderRequestSentConnectionError: If the write was queued but the
@@ -395,6 +406,8 @@ class WireClient:
             raise CTraderConnectionError("not connected")
         data = self._frame(message, client_msg_id)
         async with self._send_lock:
+            if write_gate is not None:
+                write_gate()
             try:
                 writer.write(data)
                 await writer.drain()
