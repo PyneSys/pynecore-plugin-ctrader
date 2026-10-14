@@ -38,10 +38,10 @@ from pynecore.core.broker.store_helpers import (
 )
 from pynecore.types.strategy import JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY
 
-from ._base import _CTraderBase
 from .helpers import REQUEST_TIMEOUT, money_value, parse_protocol_id, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
+from .protection import CloseOrigin, _ProtectionMixin
 from .state import _ORDER_STATUS_MAP, _ORDER_TYPE_MAP
 from .wire import CTraderConnectionError
 
@@ -56,6 +56,12 @@ _EXEC_TYPE_TO_EVENT = {
     OpenApiModelMessages.ProtoOAExecutionType.ORDER_REJECTED: 'rejected',
     OpenApiModelMessages.ProtoOAExecutionType.ORDER_EXPIRED: 'cancelled',
 }
+
+#: Execution types that carry a fill.
+_FILL_EXEC_TYPES = frozenset({
+    OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED,
+    OpenApiModelMessages.ProtoOAExecutionType.ORDER_PARTIAL_FILL,
+})
 
 #: ``orders.state`` values of a real ENTRY dispatch row (as opposed to the
 #: book-keeping markers — bracket ownership, close legs, entry-stop watches —
@@ -86,7 +92,7 @@ _RECONCILE_CADENCE_S = 5.0
 _RECONCILE_PASS_BUDGET_S = REQUEST_TIMEOUT
 
 
-class _EventStreamMixin(_CTraderBase, ABC):
+class _EventStreamMixin(_ProtectionMixin, ABC):
     """Order-event PUSH stream: ``ProtoOAExecutionEvent`` -> ``OrderEvent``."""
 
     async def watch_orders(self) -> AsyncIterator[OrderEvent]:
@@ -104,10 +110,19 @@ class _EventStreamMixin(_CTraderBase, ABC):
         deadline is checked at the TOP of the loop before blocking, so a busy
         PUSH stream cannot starve the reconcile; and the next deadline is set
         AFTER the pass completes (no catch-up burst when one pass runs long).
+
+        A manual close found while translating a fill is reported only after
+        that fill was yielded, and one recovered by a reconcile pass after the
+        pass's events were yielded, so the events are queued in the engine
+        before the external-intervention policy acts; a halt raises from here
+        and the engine books the queued events before the run stops. Reports
+        an earlier process queued but never handled are handled first, before
+        the stream waits for anything; venue writes wait for them.
         """
         execq = self._exec_events
         if execq is None:
             raise CTraderConnectionError("live event router not started")
+        self._flush_external_interventions()
         warned = False
         loop = asyncio.get_running_loop()
         next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
@@ -117,6 +132,7 @@ class _EventStreamMixin(_CTraderBase, ABC):
                 async for event in self._run_reconcile_pass():
                     yield event
                 next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
+                self._flush_external_interventions()
                 continue
             try:
                 message = await asyncio.wait_for(
@@ -155,6 +171,7 @@ class _EventStreamMixin(_CTraderBase, ABC):
                 continue
             if event is not None:
                 yield event
+            self._flush_external_interventions()
 
     async def _run_reconcile_pass(self) -> AsyncIterator[OrderEvent]:
         """Run one reconcile-snapshot pass, isolating transient failures.
@@ -225,6 +242,12 @@ class _EventStreamMixin(_CTraderBase, ABC):
             return self._order_error_to_event(message)
         if not isinstance(message, OpenApiMessages.ProtoOAExecutionEvent):
             return None
+        if (message.HasField('position')
+                and message.executionType not in _FILL_EXEC_TYPES):
+            # A replaced / accepted / cancelled protection order carries the
+            # position's levels after the change (ORDER_REPLACED reaches no
+            # engine event at all).
+            self._observe_pushed_protection(message.position)
         event_type = _EXEC_TYPE_TO_EVENT.get(message.executionType)
         if event_type is None:
             return None
@@ -307,6 +330,21 @@ class _EventStreamMixin(_CTraderBase, ABC):
                     },
                 )
                 return None
+        if (event_type in ('filled', 'partial') and leg_type is LegType.CLOSE
+                and (fill_qty or 0.0) > 0.0
+                and self._close_fill_origin(message, order) is CloseOrigin.EXTERNAL):
+            # Booked like any other close of the run's position, so the engine
+            # sees the true size; reported once the stream yielded the event.
+            # Queued (and journalled) before the deal is marked judged.
+            self._defer_external_close(
+                message, order, from_entry=from_entry, fill_qty=fill_qty or 0.0)
+        if (deal is not None and leg_type is not None and (fill_qty or 0.0) > 0.0
+                and (leg_type is LegType.CLOSE
+                     or (deal.HasField('closePositionDetail')
+                         and deal.closePositionDetail.closedVolume > 0))):
+            # A closing fill attributed to the run: classified right above (a
+            # CLOSE leg) or the run's own order (an entry that closed volume).
+            self._mark_close_judged([deal.dealId])
         if (event_type in ('filled', 'partial') and leg_type is LegType.ENTRY
                 and (fill_qty or 0.0) > 0.0 and (fill_price or 0.0) > 0.0):
             # Only a fill record_fill will actually apply touches the cursor:
@@ -326,6 +364,8 @@ class _EventStreamMixin(_CTraderBase, ABC):
                 # same deal is caught by that guard too.
                 return None
             self._advance_fill_cursor(order)
+            if message.HasField('position'):
+                self._absorb_fill_protection(message.position)
         if (event_type == 'filled' and order.closingOrder
                 and self._position_is_flat(message)):
             self._mark_position_closed(order.positionId)
@@ -409,10 +449,11 @@ class _EventStreamMixin(_CTraderBase, ABC):
         slice) or book another run's close as its own exit. The only run-unique
         venue handle is the entry ``orderId`` this run placed (recorded as an
         ``order_id`` ref); a close carries only the venue's own close
-        ``orderId`` (never in the ref index), so a close is ours only when THIS
-        run dispatched it (``_close_dispatch_pine_by_position``, keyed by the
-        shared ``positionId`` but only ever populated by our own
-        ``execute_close`` / ``close_leg``).
+        ``orderId`` (never in the ref index), so a close maps to this run only
+        when THIS run dispatched a close against the position
+        (``_close_dispatch_pine_by_position``, keyed by the shared
+        ``positionId`` but only ever populated by our own ``execute_close`` /
+        ``close_leg``) or holds exposure in it.
 
         A close the venue itself fired from the protective bracket armed on the
         position (server-side SL / TP / trailing) is dispatched by neither side,
@@ -424,6 +465,10 @@ class _EventStreamMixin(_CTraderBase, ABC):
         fill as the entry itself. A fill that maps to neither run-owned handle
         is another run's / external activity and returns ``(None, None, None)``
         so the caller drops it.
+
+        Attribution only: who caused a closing fill attributed here — this
+        run, the venue or someone else — is decided by
+        :meth:`_close_fill_origin`.
         """
         if self.store_ctx is None:
             return None, None, None
@@ -697,6 +742,7 @@ class _EventStreamMixin(_CTraderBase, ABC):
         """
         if self.store_ctx is None or not position_id:
             return
+        self._release_protection(position_id)
         pid_str = str(position_id)
         targets: list[str] = []
         for row in self.store_ctx.iter_live_orders():

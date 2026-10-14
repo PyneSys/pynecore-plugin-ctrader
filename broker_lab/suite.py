@@ -1,10 +1,14 @@
 """Opt-in offline conformance scenarios for the cTrader broker plugin."""
 
 import asyncio
+import inspect
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, patch
+
+from google.protobuf.message import Message
 
 from pynecore.core.broker.exceptions import ExchangeConnectionError
 from pynecore.core.broker.models import LegType, OrderStatus
@@ -15,7 +19,7 @@ from pynecore.testing.broker_lab.reference import (
     VenueOrder,
 )
 from pynecore.types.ohlcv import OHLCV
-from pynecore_ctrader import CTrader, CTraderConfig, auth
+from pynecore_ctrader import CTrader, CTraderConfig, auth, helpers
 from pynecore_ctrader.exceptions import map_protocol_error
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as model
@@ -58,16 +62,22 @@ def _accepted_event(request, order_id: int) -> oa.ProtoOAExecutionEvent:
     return event
 
 
-class OfflineWire:
-    """Account-scoped fake below cTrader's correlation-aware dispatch layer."""
+class OfflineWire(WireClient):
+    """Account-scoped fake below cTrader's correlation-aware dispatch layer.
+
+    A :class:`WireClient` subclass, so it can stand in as the plugin's wire.
+    :func:`_assert_wire_signatures` pins every override to the real method's
+    parameters, so a parameter the plugin starts passing fails the suite at
+    import instead of as a ``TypeError`` deep inside one scenario.
+    """
 
     def __init__(self, profile: "CTraderProfile") -> None:
+        super().__init__("offline.invalid")
         self.profile = profile
         self.requests: list[Any] = []
         self.orders: dict[int, model.ProtoOAOrder] = {}
         self.positions: dict[int, model.ProtoOAPosition] = {}
         self.deals: list[model.ProtoOADeal] = []
-        self.events: asyncio.Queue[Any] = asyncio.Queue()
         self.fail_next_new: str | None = None
         self.connected = True
         self.connect_calls = 0
@@ -95,13 +105,18 @@ class OfflineWire:
     async def disconnect(self) -> None:
         self.connected = False
 
-    async def send_request(self, request):
-        self.requests.append(request)
-        if isinstance(request, oa.ProtoOAApplicationAuthReq):
+    async def send_request(
+            self, message: Message, *, timeout: float = helpers.REQUEST_TIMEOUT,
+            write_gate: Callable[[], None] | None = None,
+    ) -> Message:
+        if write_gate is not None:
+            write_gate()
+        self.requests.append(message)
+        if isinstance(message, oa.ProtoOAApplicationAuthReq):
             return oa.ProtoOAApplicationAuthRes()
-        if isinstance(request, oa.ProtoOAGetAccountListByAccessTokenReq):
+        if isinstance(message, oa.ProtoOAGetAccountListByAccessTokenReq):
             return oa.ProtoOAGetAccountListByAccessTokenRes(
-                accessToken=request.accessToken,
+                accessToken=message.accessToken,
                 ctidTraderAccount=[
                     model.ProtoOACtidTraderAccount(
                         ctidTraderAccountId=999,
@@ -109,10 +124,10 @@ class OfflineWire:
                     )
                 ],
             )
-        if isinstance(request, oa.ProtoOAAccountAuthReq):
+        if isinstance(message, oa.ProtoOAAccountAuthReq):
             self.account_auth_calls += 1
             return oa.ProtoOAAccountAuthRes(ctidTraderAccountId=999)
-        if isinstance(request, oa.ProtoOARefreshTokenReq):
+        if isinstance(message, oa.ProtoOARefreshTokenReq):
             self.refresh_calls += 1
             return oa.ProtoOARefreshTokenRes(
                 accessToken="rotated-access",
@@ -120,23 +135,23 @@ class OfflineWire:
                 tokenType="bearer",
                 expiresIn=2_628_000,
             )
-        if isinstance(request, oa.ProtoOASubscribeSpotsReq):
+        if isinstance(message, oa.ProtoOASubscribeSpotsReq):
             return oa.ProtoOASubscribeSpotsRes(
-                ctidTraderAccountId=request.ctidTraderAccountId
+                ctidTraderAccountId=message.ctidTraderAccountId
             )
-        if isinstance(request, oa.ProtoOASubscribeLiveTrendbarReq):
+        if isinstance(message, oa.ProtoOASubscribeLiveTrendbarReq):
             return oa.ProtoOASubscribeLiveTrendbarRes(
-                ctidTraderAccountId=request.ctidTraderAccountId
+                ctidTraderAccountId=message.ctidTraderAccountId
             )
-        if isinstance(request, oa.ProtoOAGetTrendbarsReq):
+        if isinstance(message, oa.ProtoOAGetTrendbarsReq):
             history = self.history_responses.pop(0) if self.history_responses else []
             return oa.ProtoOAGetTrendbarsRes(
-                ctidTraderAccountId=request.ctidTraderAccountId,
-                period=request.period,
-                symbolId=request.symbolId,
+                ctidTraderAccountId=message.ctidTraderAccountId,
+                period=message.period,
+                symbolId=message.symbolId,
                 trendbar=history,
             )
-        if isinstance(request, oa.ProtoOATraderReq):
+        if isinstance(message, oa.ProtoOATraderReq):
             return oa.ProtoOATraderRes(
                 ctidTraderAccountId=999,
                 trader=model.ProtoOATrader(
@@ -146,7 +161,7 @@ class OfflineWire:
                     depositAssetId=1,
                 ),
             )
-        if isinstance(request, oa.ProtoOANewOrderReq):
+        if isinstance(message, oa.ProtoOANewOrderReq):
             if self.rate_limit_next_new:
                 self.rate_limit_next_new = False
                 raise CTraderProtocolError(
@@ -158,48 +173,48 @@ class OfflineWire:
                 raise CTraderConnectionError("injected pre-write disconnect")
             order_id = self.profile.state.next_id
             self.profile.state.next_id += 1
-            event = _accepted_event(request, order_id)
+            event = _accepted_event(message, order_id)
             self.orders[order_id] = event.order
             if fault == "post_write":
                 raise CTraderRequestSentConnectionError(
                     "injected post-write disconnect"
                 )
             return event
-        if isinstance(request, oa.ProtoOACancelOrderReq):
-            order = self.orders.pop(request.orderId)
+        if isinstance(message, oa.ProtoOACancelOrderReq):
+            order = self.orders.pop(message.orderId)
             order.orderStatus = model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED
             event = oa.ProtoOAExecutionEvent(
                 executionType=model.ProtoOAExecutionType.ORDER_CANCELLED
             )
             event.order.CopyFrom(order)
             return event
-        if isinstance(request, oa.ProtoOAAmendPositionSLTPReq):
-            position = self.positions[request.positionId]
+        if isinstance(message, oa.ProtoOAAmendPositionSLTPReq):
+            position = self.positions[message.positionId]
             if (
-                request.HasField("trailingStopLoss")
-                and not request.trailingStopLoss
-                and not request.HasField("stopLoss")
+                message.HasField("trailingStopLoss")
+                and not message.trailingStopLoss
+                and not message.HasField("stopLoss")
             ):
                 raise CTraderProtocolError(
                     "INVALID_REQUEST",
                     "Can't set Trailing Stop Loss parameter without specified Stop Loss",
                 )
             for field in ("stopLoss", "takeProfit"):
-                if request.HasField(field):
-                    setattr(position, field, getattr(request, field))
+                if message.HasField(field):
+                    setattr(position, field, getattr(message, field))
                 else:
                     position.ClearField(field)
             # Live Pepperstone DEMO proved that an omitted trailing flag is
             # retained even though omitted SL/TP fields are cleared. Disabling
             # trailing therefore requires an explicit ``False`` field.
-            if request.HasField("trailingStopLoss"):
-                position.trailingStopLoss = request.trailingStopLoss
+            if message.HasField("trailingStopLoss"):
+                position.trailingStopLoss = message.trailingStopLoss
             event = oa.ProtoOAExecutionEvent(
                 executionType=model.ProtoOAExecutionType.ORDER_REPLACED
             )
             event.position.CopyFrom(position)
             return event
-        if isinstance(request, oa.ProtoOAReconcileReq):
+        if isinstance(message, oa.ProtoOAReconcileReq):
             if self.rate_limit_next_reconcile:
                 self.rate_limit_next_reconcile = False
                 raise CTraderProtocolError(
@@ -212,11 +227,11 @@ class OfflineWire:
                 order=list(self.orders.values()),
                 position=list(self.positions.values()),
             )
-        if isinstance(request, oa.ProtoOADealListReq):
+        if isinstance(message, oa.ProtoOADealListReq):
             return oa.ProtoOADealListRes(deal=self.deals, hasMore=False)
-        if isinstance(request, oa.ProtoOAClosePositionReq):
-            position = self.positions[request.positionId]
-            closed_volume = min(request.volume, position.tradeData.volume)
+        if isinstance(message, oa.ProtoOAClosePositionReq):
+            position = self.positions[message.positionId]
+            closed_volume = min(message.volume, position.tradeData.volume)
             residual = position.tradeData.volume - closed_volume
             order_id = self.profile.state.next_id
             self.profile.state.next_id += 1
@@ -226,7 +241,7 @@ class OfflineWire:
                 orderStatus=model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
                 executedVolume=closed_volume,
                 executionPrice=position.price,
-                positionId=request.positionId,
+                positionId=message.positionId,
                 closingOrder=True,
                 tradeData=model.ProtoOATradeData(
                     symbolId=1,
@@ -246,7 +261,7 @@ class OfflineWire:
                 model.ProtoOADeal(
                     dealId=order_id + 10_000,
                     orderId=order_id,
-                    positionId=request.positionId,
+                    positionId=message.positionId,
                     filledVolume=closed_volume,
                     executionPrice=position.price,
                     closePositionDetail=model.ProtoOAClosePositionDetail(
@@ -258,12 +273,12 @@ class OfflineWire:
                 position.tradeData.volume = residual
                 event.position.CopyFrom(position)
             else:
-                del self.positions[request.positionId]
+                del self.positions[message.positionId]
             owner_run = self.profile.dispatch_run
             if owner_run is None:
-                raise AssertionError("cTrader close request has no dispatch owner")
+                raise AssertionError("cTrader close message has no dispatch owner")
             self.profile.broadcast_execution_event(event)
-            leg_key = self.profile.position_keys[request.positionId]
+            leg_key = self.profile.position_keys[message.positionId]
             signed = closed_volume / 100.0
             current = self.profile.state.position_legs.get(leg_key, 0.0)
             residual_units = max(0.0, abs(current) - signed)
@@ -278,8 +293,25 @@ class OfflineWire:
             )
             return event
         raise AssertionError(
-            f"unexpected offline cTrader wire request: {type(request).__name__}"
+            f"unexpected offline cTrader wire request: {type(message).__name__}"
         )
+
+
+def _assert_wire_signatures() -> None:
+    """Fail fast when an :class:`OfflineWire` override drifts from the real wire."""
+    for name in ("connect", "disconnect", "send_request"):
+        real = inspect.signature(getattr(WireClient, name)).parameters.values()
+        fake = inspect.signature(getattr(OfflineWire, name)).parameters.values()
+        real_shape = [(p.name, p.kind, p.default) for p in real]
+        fake_shape = [(p.name, p.kind, p.default) for p in fake]
+        if real_shape != fake_shape:
+            raise TypeError(
+                f"OfflineWire.{name} drifted from WireClient.{name}: "
+                f"expected {real_shape}, got {fake_shape}"
+            )
+
+
+_assert_wire_signatures()
 
 
 class OfflineCTrader(CTrader):
@@ -387,9 +419,14 @@ class OwnershipLeakingOfflineCTrader(OfflineCTrader):
 
 
 class OneShotHistoryOfflineCTrader(OfflineCTrader):
-    """Broken control that trusts the first empty reconnect-history response."""
+    """Broken control that trusts the first empty reconnect-history response.
+
+    Both retry paths are disabled: the settle budget and the in-place await of
+    a slot younger than the trendbar publication lag.
+    """
 
     _live_history_settle_attempts = 1
+    _live_history_publication_lag_seconds = 0.0
 
 
 class AnchorDroppingOfflineCTrader(OfflineCTrader):
@@ -466,7 +503,8 @@ class OrderRateLimitCrashingOfflineCTrader(MultiSymbolOfflineCTrader):
         self, req, *, coid, context, predecessor_cancel_ids=None,
     ):
         try:
-            return await self._account_request_raw(req)
+            return await self._account_request_raw(
+                req, venue_write=f"cTrader {type(req).__name__}")
         except CTraderProtocolError as exc:
             raise map_protocol_error(exc) from exc
 
@@ -1064,22 +1102,26 @@ class MultiSymbolRateStormCTraderProfile(CTraderProfile):
         gbp = runner.runs["gbpusd"]
         eur_wire = self.rate_wires["eurusd"]
         gbp_wire = self.rate_wires["gbpusd"]
+        # A definitive read throttle is sat out on the same authenticated
+        # session (``_account_request`` -> ``_retry_rate_limited``): the
+        # reconcile completes, the throttled read is re-sent on this wire and
+        # nothing reconnects.
         eur_wire.rate_limit_next_reconcile = True
-        try:
-            eur.engine.reconcile()
-        except ExchangeConnectionError:
-            pass
-        else:
-            raise AssertionError("cTrader read throttle did not park the EURUSD run")
-        eur_requests = len(eur_wire.requests)
-        try:
-            eur.engine.reconcile()
-        except ExchangeConnectionError:
-            pass
-        else:
-            raise AssertionError("cTrader read backoff was not enforced")
-        if len(eur_wire.requests) != eur_requests:
-            raise AssertionError("cTrader read backoff sent another venue request")
+        eur_connects = eur_wire.connect_calls
+        throttled_at = len(eur_wire.requests)
+        eur.engine.reconcile()
+        if eur_wire.rate_limit_next_reconcile:
+            raise AssertionError("cTrader read throttle was never exercised")
+        reads_after_throttle = [
+            req for req in eur_wire.requests[throttled_at:]
+            if isinstance(req, oa.ProtoOAReconcileReq)
+        ]
+        if len(reads_after_throttle) < 2:
+            raise AssertionError(
+                "cTrader read throttle was not retried on the same session"
+            )
+        if eur_wire.connect_calls != eur_connects:
+            raise AssertionError("cTrader read throttle reconnected the wire")
         gbp.engine.reconcile()
         if not any(isinstance(req, oa.ProtoOAReconcileReq) for req in gbp_wire.requests):
             raise AssertionError("rate-limited EURUSD starved the GBPUSD run")
@@ -1175,7 +1217,10 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             name="ctrader-control-one-shot-empty-history-is-detected",
             profile_factory=OneShotHistoryCTraderProfile,
             seed=seed,
-            expected_violation="unrepaired reconnect bar gap",
+            # The plugin fails an incomplete reconnect backfill closed (anchor
+            # kept, retry through a fresh connection) instead of resuming
+            # over the hole, so the missing retry surfaces as that refusal.
+            expected_violation="reconnect history coverage remained incomplete",
             steps=(Step("ctrader_delayed_reconnect_history"),),
         ),
         Scenario(
@@ -1583,9 +1628,14 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
                 Step("restart", check_invariants=False),
                 Step("entry", values={"id": "Short", "side": "sell", "qty": 20.0}),
                 Step("sync", values={"last_price": 1.10}, check_invariants=False),
-                Step("ctrader_fill_entry", check_invariants=False),
+                Step(
+                    "expect_ctrader_wire_dispatch",
+                    values={"requests": 1, "orders": 0},
+                    check_invariants=False,
+                ),
                 Step("ctrader_queue_pending_push", check_invariants=False),
                 Step("pump_watch", check_invariants=False),
+                Step("ctrader_fill_entry", check_invariants=False),
                 Step("ctrader_queue_pending_push", check_invariants=False),
                 Step("pump_watch"),
                 Step(

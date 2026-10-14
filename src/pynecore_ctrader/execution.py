@@ -65,7 +65,6 @@ from pynecore.core.broker.store_helpers import (
 )
 from pynecore.core.plugin import override
 
-from ._base import _CTraderBase
 from .exceptions import (
     CTraderBrokerError,
     is_not_found,
@@ -83,6 +82,7 @@ from .helpers import (
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .models import _SymbolRules
+from .protection import _ProtectionMixin, protection_key
 from .wire import (
     CTraderConnectionError,
     CTraderProtocolError,
@@ -99,7 +99,7 @@ _SIDE_TO_TRADE_SIDE = {
 }
 
 
-class _ExecutionMixin(_CTraderBase, ABC):
+class _ExecutionMixin(_ProtectionMixin, ABC):
     """Order execution mix-in: every ``execute_*`` and ``modify_*`` path."""
 
     # --- order-sizing rules + position discovery --------------------------
@@ -627,8 +627,11 @@ class _ExecutionMixin(_CTraderBase, ABC):
         )
 
         try:
-            await self._dispatch_order(req, coid=envelope.client_order_id(KIND_EXIT_SL),
-                                       context="bracket attach")
+            await self._write_protection(
+                req, position_id=position_id,
+                row_coid=self._protection_row(position_id),
+                coid=envelope.client_order_id(KIND_EXIT_SL), context="bracket attach",
+            )
         except ExchangeOrderRejectedError as exc:
             # The parent entry already filled (the position is OPEN — this amend
             # only attaches its protective levels), so a reject here leaves the
@@ -885,7 +888,7 @@ class _ExecutionMixin(_CTraderBase, ABC):
                 intent_key = row.intent_key or coid
         self._close_dispatch_pine_by_position[int(leg_id)] = pine_id
         try:
-            await self._dispatch_order(
+            await self._send_own_close(
                 OpenApiMessages.ProtoOAClosePositionReq(
                     ctidTraderAccountId=self._live_account_id,
                     positionId=int(leg_id), volume=volume,
@@ -991,12 +994,40 @@ class _ExecutionMixin(_CTraderBase, ABC):
             trail_offset=trail_offset, rules=rules,
         )
         try:
-            await self._dispatch_order(req, coid=coid, context="amend bracket")
+            await self._write_protection(
+                req, position_id=position_id,
+                row_coid=self._protection_row(position_id),
+                coid=coid, context="amend bracket",
+            )
         except ExchangeOrderRejectedError as exc:
             cause = exc.__cause__
             if isinstance(cause, CTraderProtocolError) and is_not_found(cause.error_code):
                 return
             raise
+
+    async def _send_own_close(
+            self, req: OpenApiMessages.ProtoOAClosePositionReq, *,
+            coid: str, context: str,
+    ) -> OpenApiMessages.ProtoOAExecutionEvent:
+        """Send one position close, recording it as this run's own close.
+
+        The record lets :meth:`_close_fill_origin` tell this close's fills from
+        a manual close: it claims fills of the close ``orderId`` the response
+        names, and any closing fill on the position while the response is
+        outstanding or its outcome unknown. A definitive reject or a pre-write
+        failure drops it; nothing was executed.
+        """
+        record = self._open_own_close(req.positionId)
+        try:
+            event = await self._dispatch_order(req, coid=coid, context=context)
+        except (ExchangeOrderRejectedError, ExchangeConnectionError):
+            self._drop_own_close(record)
+            raise
+        except BaseException:
+            self._settle_own_close(record, None)
+            raise
+        self._settle_own_close(record, event.order.orderId)
+        return event
 
     async def _clear_position_bracket(
             self, position_id: int, *, coid: str, context: str,
@@ -1008,13 +1039,21 @@ class _ExecutionMixin(_CTraderBase, ABC):
         current Stop Loss is repeated. Clear therefore disables trailing with
         the authenticated current anchor first, then clears SL/TP in a second
         amend that omits the trailing field.
+
+        A guarded position stays guarded while the clear runs: each amend is
+        recorded as the bot's own write, so neither the intermediate state nor
+        a clear that fails half-way is mistaken for an external edit. The
+        position leaves the guard once the clear is done — a bare position
+        carries no levels of the bot.
         """
+        guarded = self._protection_guard().known(protection_key(position_id))
         snapshot = await self._reconcile()
         position = next(
             (item for item in snapshot.position if item.positionId == position_id),
             None,
         )
         if position is None:
+            self._release_protection(position_id)
             return
         trailing = (
                 position.HasField("trailingStopLoss") and position.trailingStopLoss
@@ -1037,15 +1076,20 @@ class _ExecutionMixin(_CTraderBase, ABC):
             positionId=position_id,
         ))
         for index, request in enumerate(requests, start=1):
+            step_context = f"{context} ({index}/{len(requests)})"
             try:
-                await self._dispatch_order(
-                    request, coid=coid,
-                    context=f"{context} ({index}/{len(requests)})",
-                )
+                if guarded:
+                    await self._write_protection(
+                        request, position_id=position_id, row_coid=None,
+                        coid=coid, context=step_context,
+                    )
+                else:
+                    await self._dispatch_order(request, coid=coid, context=step_context)
             except ExchangeOrderRejectedError as exc:
                 cause = exc.__cause__
                 if isinstance(cause, CTraderProtocolError) and is_not_found(
                         cause.error_code):
+                    self._release_protection(position_id)
                     return
                 # An amend on a position that already carries no protection
                 # rejects with ``INVALID_REQUEST: Nothing to amend.`` (live
@@ -1057,8 +1101,10 @@ class _ExecutionMixin(_CTraderBase, ABC):
                 if (isinstance(cause, CTraderProtocolError)
                         and cause.error_code == 'INVALID_REQUEST'
                         and 'nothing to amend' in str(cause).lower()):
+                    self._release_protection(position_id)
                     return
                 raise
+        self._release_protection(position_id)
 
     async def _trail_only_position_already_armed(self, position_id: int) -> bool:
         """Return whether one live position already carries trail-only protection."""
@@ -1139,7 +1185,7 @@ class _ExecutionMixin(_CTraderBase, ABC):
                 intent.pine_id or None
         )
         try:
-            event = await self._dispatch_order(
+            event = await self._send_own_close(
                 OpenApiMessages.ProtoOAClosePositionReq(
                     ctidTraderAccountId=self._live_account_id,
                     positionId=position_id, volume=volume,
@@ -1396,9 +1442,12 @@ class _ExecutionMixin(_CTraderBase, ABC):
             tp_price=intent.tp_price, trail_offset=intent.trail_offset,
             rules=rules,
         )
-        await self._dispatch_order(req, coid=new.client_order_id(KIND_MODIFY_EXIT),
-                                   context="amend bracket",
-                                   predecessor_cancel_ids=())
+        await self._write_protection(
+            req, position_id=position_id,
+            row_coid=self._protection_row(position_id),
+            coid=new.client_order_id(KIND_MODIFY_EXIT), context="amend bracket",
+            predecessor_cancel_ids=(),
+        )
         return self._build_bracket_legs(intent, new, position_id, rules)
 
     # --- native fail-safe actuator + observed feed (§2.6.7) ----------------
@@ -1463,10 +1512,18 @@ class _ExecutionMixin(_CTraderBase, ABC):
                 req.takeProfit = round_price(snapshot.profit_level, rules.digits)
             if snapshot.trailing_stop is not None:
                 req.trailingStopLoss = True
-            await self._dispatch_order(
-                req, coid=snapshot.parent_entry_dispatch_ref,
-                context="native fail-safe SL",
-            )
+            # The core fail-safe manager judges this position's levels and
+            # quarantines on an external edit itself; the plugin guard stays
+            # off it, before and after the write, so a concurrent exit amend
+            # cannot leave it judging the fail-safe's levels.
+            self._release_protection(position_id)
+            try:
+                await self._dispatch_order(
+                    req, coid=snapshot.parent_entry_dispatch_ref,
+                    context="native fail-safe SL",
+                )
+            finally:
+                self._release_protection(position_id)
         self.store_ctx.log_event(
             'native_failsafe_sl_put',
             client_order_id=snapshot.parent_entry_dispatch_ref,

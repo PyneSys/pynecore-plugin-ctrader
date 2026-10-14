@@ -4,7 +4,9 @@
 import asyncio
 from time import time as epoch_time
 
-from pynecore.core.broker.exceptions import UnexpectedCancelError
+import pytest
+
+from pynecore.core.broker.exceptions import BrokerManualInterventionError, UnexpectedCancelError
 from pynecore.core.broker.models import QuarantineKind
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
@@ -16,12 +18,17 @@ from pynecore_ctrader.helpers import volume_to_units
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
 from pynecore_ctrader.reconcile import _DealWalk
+from pynecore_ctrader.wire import CTraderProtocolError, CTraderTimeoutError
 
 
 # === Fakes ================================================================
 
 class _FakeWire:
-    """Stubbed wire serving the deal-history bridge: every request returns ``deal_res``."""
+    """Stubbed wire serving the deal-history bridge: every request returns ``deal_res``.
+
+    A closing order looked up by ``ProtoOAOrderDetailsReq`` is the position's
+    own SL/TP order: the venue closed it.
+    """
 
     def __init__(self, *, deal_res=None, fail=False):
         self._deal_res = deal_res
@@ -29,11 +36,19 @@ class _FakeWire:
         self.requests: list = []
         self.timeouts: list = []
 
-    async def send_request(self, req, *, timeout=None):
+    async def send_request(self, req, *, timeout=None, **_kwargs):
         self.requests.append(req)
         self.timeouts.append(timeout)
         if self._fail:
             raise RuntimeError("wire down")
+        if isinstance(req, _oa.ProtoOAOrderDetailsReq):
+            return _oa.ProtoOAOrderDetailsRes(order=_model.ProtoOAOrder(
+                orderId=req.orderId,
+                orderType=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+                orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+                closingOrder=True,
+                tradeData=_model.ProtoOATradeData(symbolId=1, volume=0,
+                                                  tradeSide=_model.ProtoOATradeSide.SELL)))
         return self._deal_res
 
 
@@ -1451,3 +1466,438 @@ def __test_reconcile_no_failsafe_observation_when_position_absent__(tmp_path):
     _run(broker)
 
     assert captured == []
+
+
+# === Closes the PUSH stream missed: intervention policy ===================
+
+class _VenueWire(_FakeWire):
+    """Serves the deal history and ``ProtoOAOrderDetailsReq`` for closing orders."""
+
+    def __init__(self, *, deal_res, orders=(), details_error=None):
+        super().__init__(deal_res=deal_res)
+        self.orders = {order.orderId: order for order in orders}
+        self.details_error = details_error
+        self.details_errors_once: list[Exception] = []
+
+    async def send_request(self, req, *, timeout=None, **_kwargs):
+        if isinstance(req, _oa.ProtoOAOrderDetailsReq):
+            self.requests.append(req)
+            if self.details_errors_once:
+                raise self.details_errors_once.pop(0)
+            if self.details_error is not None:
+                raise self.details_error
+            return _oa.ProtoOAOrderDetailsRes(order=self.orders[req.orderId])
+        return await super().send_request(req, timeout=timeout)
+
+
+def _closing_order(order_id, *, order_type=_model.ProtoOAOrderType.MARKET,
+                   stop_out=False, coid=''):
+    """The closing order ``ProtoOAOrderDetailsRes`` describes."""
+    return _model.ProtoOAOrder(
+        orderId=order_id, orderType=order_type,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        closingOrder=True, positionId=222, isStopOut=stop_out, clientOrderId=coid,
+        executedVolume=2000,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=2000,
+                                          tradeSide=_model.ProtoOATradeSide.SELL),
+    )
+
+
+def _recovered_close_broker(tmp_path, *orders, details_error=None, executed_ms=None,
+                            seed=True):
+    """A streaming broker whose position 222 was closed by order 999 while the
+    stream was down; the row is stamped missing past the grace window."""
+    deal = _close_deal(deal_id=900, order_id=999, position_id=222, closed_volume=2000)
+    if executed_ms is not None:
+        deal.executionTimestamp = executed_ms
+    broker = _ReconcileBroker(_recon())
+    broker._wire = _VenueWire(deal_res=_deal_res(deal), orders=orders,
+                              details_error=details_error)
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    if seed:
+        _seed_position(broker, 'c3', position_id=222, qty=volume_to_units(2000),
+                       extras={'missing_pending_since': 0.0})
+    return broker, reports
+
+
+def _details_requests(broker) -> list:
+    return [r for r in broker._wire.requests if isinstance(r, _oa.ProtoOAOrderDetailsReq)]
+
+
+def _recover(broker) -> None:
+    """One grace-expiry pass, then the report flush ``watch_orders`` runs after it."""
+    events, err = _drive_tracker(broker)
+    assert events == [] and err is None
+    broker._flush_external_interventions()
+
+
+def __test_recovered_manual_close_is_reported__(tmp_path):
+    """A MARKET close of the bot's position the PUSH stream missed is a manual close."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999))
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert 900 in broker._seen_deal_ids
+    assert len(reports) == 1
+    _reason, context, kind = reports[0]
+    assert kind is QuarantineKind.EXTERNAL_INTERVENTION
+    assert context['position_id'] == 222 and context['order_id'] == 999
+    assert context['deal_ids'] == [900] and context['recovered'] is True
+    assert context['closed_qty'] == volume_to_units(2000)
+    assert context['from_entry'] == 'long'
+
+    # The pass after the retire never judges the same close again.
+    _seed_position(broker, 'c4', position_id=222, qty=volume_to_units(2000),
+                   extras={'missing_pending_since': 0.0})
+    _recover(broker)
+    assert len(reports) == 1
+
+
+def __test_recovered_venue_bracket_close_is_not_reported__(tmp_path):
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(
+        999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT))
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+
+
+def __test_recovered_stop_out_is_not_reported__(tmp_path):
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999, stop_out=True))
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+
+
+def __test_recovered_own_close_by_order_id_is_not_reported__(tmp_path):
+    """The close this run sent, answered with order 999, needs no lookup."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999))
+    broker._settle_own_close(broker._open_own_close(222), 999)
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+    assert _details_requests(broker) == []
+
+
+def __test_recovered_close_after_an_own_close_of_unknown_outcome_is_not_reported__(tmp_path):
+    """The run's close whose answer was lost may be the one that executed."""
+    broker, reports = _recovered_close_broker(
+        tmp_path, _closing_order(999), executed_ms=int(epoch_time() * 1000))
+    broker._settle_own_close(broker._open_own_close(222), None)
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+
+
+def __test_recovered_close_by_an_own_order_is_not_reported__(tmp_path):
+    """An order carrying one of this run's client-order-ids closed the volume."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999, coid='rev1'))
+    broker.store_ctx.upsert_order(
+        'rev1', symbol='EURUSD', side='sell', qty=20.0, filled_qty=20.0,
+        state='closed', pine_entry_id='short', exchange_order_id='999')
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+
+
+def __test_recovered_close_lookup_failure_defers_the_retire__(tmp_path):
+    """Who closed the position is not known yet: neither retired nor reported."""
+    broker, reports = _recovered_close_broker(
+        tmp_path, _closing_order(999),
+        details_error=CTraderTimeoutError("no response"))
+
+    _recover(broker)
+    assert 'c3' in _live_coids(broker)
+    assert reports == []
+    assert 900 not in broker._seen_deal_ids
+
+    broker._wire.details_error = None
+    _recover(broker)
+    assert 'c3' not in _live_coids(broker)
+    assert len(reports) == 1
+
+
+def __test_recovered_close_rate_limited_lookup_is_retried__(tmp_path, monkeypatch):
+    """A throttled lookup waits only within the pass budget, then defers."""
+    monkeypatch.setattr(ctrader_events, '_RECONCILE_PASS_BUDGET_S', 0.05)
+    broker, reports = _recovered_close_broker(
+        tmp_path, _closing_order(999),
+        details_error=CTraderProtocolError('BLOCKED_PAYLOAD_TYPE', 'slow down'))
+
+    async def one_pass():
+        return [event async for event in broker._run_reconcile_pass()]
+
+    assert asyncio.run(one_pass()) == []
+    broker._flush_external_interventions()
+
+    assert _details_requests(broker)
+    assert 'c3' in _live_coids(broker)
+    assert reports == []
+
+
+@pytest.mark.parametrize('error_code', ['CANT_ROUTE_REQUEST', 'TIMEOUT_ERROR', 'INVALID_REQUEST'])
+def __test_recovered_close_lookup_protocol_error_defers_the_retire__(tmp_path, error_code):
+    """Only a not-found answer is final: any other venue error is asked again."""
+    broker, reports = _recovered_close_broker(
+        tmp_path, _closing_order(999),
+        details_error=CTraderProtocolError(error_code, 'try later'))
+
+    _recover(broker)
+    assert 'c3' in _live_coids(broker)
+    assert reports == []
+    assert 900 not in broker._judged_close_deals
+
+    broker._wire.details_error = None
+    _recover(broker)
+    assert 'c3' not in _live_coids(broker)
+    assert len(reports) == 1
+
+
+def __test_recovered_close_lookup_rewins_a_lost_account_session__(tmp_path):
+    """A mid-session de-auth is re-won and the lookup retried in the same pass."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999))
+    broker._wire.details_errors_once.append(
+        CTraderProtocolError('ACCOUNT_NOT_AUTHORIZED', 'Trading account is not authorized'))
+    reauths: list = []
+
+    async def reauth(**kwargs):
+        reauths.append(kwargs)
+
+    broker._reauth_account = reauth
+
+    _recover(broker)
+
+    assert len(reauths) == 1
+    assert 'c3' not in _live_coids(broker)
+    assert len(reports) == 1
+
+
+def __test_recovered_close_lookup_unrecovered_session_defers_the_retire__(tmp_path):
+    broker, reports = _recovered_close_broker(
+        tmp_path, _closing_order(999),
+        details_error=CTraderProtocolError('ACCOUNT_NOT_AUTHORIZED', 'not authorized'))
+
+    async def reauth(**_kwargs):
+        raise CTraderProtocolError('CH_ACCESS_TOKEN_INVALID', 'token revoked')
+
+    async def drop_wire():
+        pass
+
+    broker._reauth_account = reauth
+    broker._drop_live_wire_after_failed_reauth = drop_wire
+
+    _recover(broker)
+
+    assert 'c3' in _live_coids(broker)
+    assert reports == []
+
+
+def __test_recovered_close_the_venue_cannot_describe_is_not_reported__(tmp_path):
+    """No origin can be established for it: retired, never reported."""
+    broker, reports = _recovered_close_broker(
+        tmp_path, _closing_order(999),
+        details_error=CTraderProtocolError('ORDER_NOT_FOUND', 'unknown order'))
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+
+
+def __test_recovered_manual_close_right_after_the_start_is_reported__(tmp_path):
+    """No start-up window is skipped: the close executed a moment ago counts."""
+    broker, reports = _recovered_close_broker(
+        tmp_path, _closing_order(999), executed_ms=int(epoch_time() * 1000))
+
+    _recover(broker)
+
+    assert len(reports) == 1
+
+
+def _restarted(tmp_path, broker, *orders):
+    """A new process of the same run, adopting ``broker``'s journal after it stopped."""
+    broker.store_ctx.close()
+    restarted, reports = _recovered_close_broker(tmp_path, *orders, seed=False)
+    restarted._wire._deal_res = broker._wire._deal_res
+    assert 'c3' in _live_coids(restarted)
+    return restarted, reports
+
+
+def __test_recovered_close_an_earlier_process_sent_is_not_reported__(tmp_path):
+    first, _ = _recovered_close_broker(tmp_path, _closing_order(999))
+    first._settle_own_close(first._open_own_close(222), 999)
+
+    restarted, reports = _restarted(tmp_path, first, _closing_order(999))
+    _recover(restarted)
+
+    assert 'c3' not in _live_coids(restarted)
+    assert reports == []
+    assert _details_requests(restarted) == []
+
+
+def __test_recovered_close_after_an_earlier_process_died_mid_close_is_not_reported__(tmp_path):
+    """The earlier process's close never got its answer: it may be the one that executed."""
+    first, _ = _recovered_close_broker(
+        tmp_path, _closing_order(999), executed_ms=int(epoch_time() * 1000))
+    first._open_own_close(222)
+
+    restarted, reports = _restarted(tmp_path, first, _closing_order(999))
+    _recover(restarted)
+
+    assert 'c3' not in _live_coids(restarted)
+    assert reports == []
+
+
+def __test_recovered_close_after_a_stale_unanswered_close_is_reported__(tmp_path):
+    """An earlier process's close that never got its answer claims only its grace."""
+    first, _ = _recovered_close_broker(
+        tmp_path, _closing_order(999), executed_ms=int(epoch_time() * 1000))
+    record = first._open_own_close(222)
+    record.sent_ms -= 10 * 86_400_000
+    first._journal_own_close(record)
+
+    restarted, reports = _restarted(tmp_path, first, _closing_order(999))
+    _recover(restarted)
+
+    assert 'c3' not in _live_coids(restarted)
+    assert len(reports) == 1
+    assert _details_requests(restarted)
+
+
+def __test_recovered_report_a_dead_process_never_delivered_is_replayed__(tmp_path):
+    """The close was judged and journalled, but the process died before the report."""
+    first, first_reports = _recovered_close_broker(tmp_path, _closing_order(999))
+    events, err = _drive_tracker(first)
+    assert events == [] and err is None
+    assert 900 in first._judged_close_deals and first_reports == []
+    first.store_ctx.close()
+
+    restarted, reports = _recovered_close_broker(tmp_path, _closing_order(999), seed=False)
+    restarted._flush_external_interventions()
+    assert len(reports) == 1
+    assert reports[0][1]['position_id'] == 222 and reports[0][1]['deal_ids'] == [900]
+    restarted._flush_external_interventions()
+    assert len(reports) == 1
+
+    restarted.store_ctx.close()
+    third, third_reports = _recovered_close_broker(tmp_path, _closing_order(999), seed=False)
+    third._flush_external_interventions()
+    assert third_reports == []
+
+
+def __test_recovered_report_that_halted_is_not_replayed__(tmp_path):
+    first, _ = _recovered_close_broker(tmp_path, _closing_order(999))
+    first.on_unexpected_cancel = 'halt'
+    _drive_tracker(first)
+    with pytest.raises(UnexpectedCancelError):
+        first._flush_external_interventions()
+    first.store_ctx.close()
+
+    restarted, reports = _recovered_close_broker(tmp_path, _closing_order(999), seed=False)
+    restarted._flush_external_interventions()
+    assert reports == []
+
+
+def __test_recovered_close_after_an_earlier_refused_close_is_reported__(tmp_path):
+    first, _ = _recovered_close_broker(
+        tmp_path, _closing_order(999), executed_ms=int(epoch_time() * 1000))
+    first._drop_own_close(first._open_own_close(222))
+
+    restarted, reports = _restarted(tmp_path, first, _closing_order(999))
+    _recover(restarted)
+
+    assert len(reports) == 1
+
+
+def __test_recovered_close_an_earlier_process_attributed_is_not_judged_again__(tmp_path):
+    first, _ = _recovered_close_broker(tmp_path, _closing_order(999))
+    first._mark_close_judged([900])
+
+    restarted, reports = _restarted(tmp_path, first, _closing_order(999))
+    _recover(restarted)
+
+    assert 'c3' not in _live_coids(restarted)
+    assert reports == []
+    assert _details_requests(restarted) == []
+
+
+def __test_recovered_close_the_push_path_attributed_is_not_judged_again__(tmp_path):
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999))
+    broker._mark_close_judged([900])
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+    assert _details_requests(broker) == []
+
+
+def __test_recovered_manual_close_of_a_working_order_position_is_reported__(tmp_path):
+    """A working order filled and its position was closed by hand, both unseen."""
+    broker = _ReconcileBroker(_recon(positions=[]))
+    broker._wire = _VenueWire(
+        deal_res=_deal_res(
+            _deal(deal_id=905, order_id=111, position_id=222, filled_volume=2000),
+            _close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=2000)),
+        orders=[_closing_order(999)])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c14', order_id=111, qty=volume_to_units(2000))
+
+    assert _run(broker) == []
+    broker._flush_external_interventions()
+
+    assert broker.store_ctx.get_order('c14').state == 'closed'
+    assert {905, 906} <= broker._seen_deal_ids
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [906]
+
+
+def __test_recovered_working_close_lookup_failure_defers_the_retire__(tmp_path):
+    broker = _ReconcileBroker(_recon(positions=[]))
+    broker._wire = _VenueWire(
+        deal_res=_deal_res(
+            _deal(deal_id=905, order_id=111, position_id=222, filled_volume=2000),
+            _close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=2000)),
+        orders=[_closing_order(999)],
+        details_error=CTraderTimeoutError("no response"))
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c14', order_id=111, qty=volume_to_units(2000))
+
+    assert _run(broker) == []
+
+    assert 'c14' in _live_coids(broker)
+    assert 906 not in broker._seen_deal_ids
+
+
+def __test_watch_orders_reports_a_recovered_manual_close_after_the_pass__(
+        tmp_path, monkeypatch):
+    """Without a quarantine sink the policy halts: the halt leaves the stream
+    after the pass that retired the position."""
+    monkeypatch.setattr(ctrader_events, '_RECONCILE_CADENCE_S', 0.0)
+    broker, _reports = _recovered_close_broker(tmp_path, _closing_order(999))
+    broker.quarantine_sink = None
+
+    async def drive():
+        broker._exec_events = asyncio.Queue()
+        async for _event in broker.watch_orders():
+            pass
+
+    with pytest.raises(BrokerManualInterventionError):
+        asyncio.run(drive())
+    assert 'c3' not in _live_coids(broker)

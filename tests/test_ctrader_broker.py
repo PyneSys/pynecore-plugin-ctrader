@@ -2,6 +2,7 @@
 @pyne
 """
 import asyncio
+import time
 
 import pytest
 
@@ -10,6 +11,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeOrderRejectedError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
+    UnexpectedCancelError,
     VenueWritesQuarantinedError,
 )
 from pynecore.core.broker.models import (
@@ -23,6 +25,7 @@ from pynecore.core.broker.models import (
     ExitIntent,
     LegType,
     OrderType,
+    QuarantineKind,
 )
 from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
 from pynecore.core.broker.run_identity import RunIdentity
@@ -747,8 +750,10 @@ def __test_translate_partial_close_fill_foreign_coid_persists_no_row__(tmp_path)
     # close_leg). This is the run-owned handle that attributes the close fill;
     # the shared ``position_id`` ref alone is deliberately NOT enough (it is
     # present in every run that entered the netted position — see
-    # ``_resolve_identity`` run-ownership isolation).
+    # ``_resolve_identity`` run-ownership isolation). The own-close record
+    # marks the fill as this run's, not a manual close.
     broker._close_dispatch_pine_by_position[52695200] = 'pineL'
+    broker._open_own_close(52695200)
 
     order = _make_order(order_id=777, executed=1000, position_id=52695200,
                         closing=True,
@@ -776,6 +781,7 @@ def __test_translate_partial_close_fill_foreign_coid_persists_no_row__(tmp_path)
     # The foreign coid never became a store row, and the entry row survived.
     assert broker.store_ctx.get_order('27') is None
     assert broker.store_ctx.get_order('c1') is not None
+    assert broker._deferred_interventions == []
 
 
 def __test_translate_close_fill_on_adopted_position_maps_via_dispatch_record__(tmp_path):
@@ -2070,3 +2076,883 @@ def __test_quarantine_refuses_every_write_path_but_reads_still_go_out__(tmp_path
     res = asyncio.run(broker._reconcile())
     assert [p.positionId for p in res.position] == [555]
     assert isinstance(broker.wire.requests[-1], _oa.ProtoOAReconcileReq)
+
+
+# === External intervention: moved SL/TP, manual close =====================
+
+_PID = 54302872
+
+
+def _spy_quarantine(broker) -> list:
+    """Capture every external-intervention quarantine request of ``broker``."""
+    calls: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: calls.append(
+        (reason, context, kind))
+    return calls
+
+
+def _protected_position(*, sl=None, tp=None, trailing=None, volume=1000,
+                        position_id=_PID):
+    position = _model.ProtoOAPosition(
+        positionId=position_id,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=volume,
+                                          tradeSide=_model.ProtoOATradeSide.BUY),
+    )
+    if sl is not None:
+        position.stopLoss = sl
+    if tp is not None:
+        position.takeProfit = tp
+    if trailing is not None:
+        position.trailingStopLoss = trailing
+    return position
+
+
+def _set_venue(broker, **levels) -> None:
+    """Make the canned reconcile snapshot carry one position with ``levels``."""
+    res = _oa.ProtoOAReconcileRes()
+    res.position.append(_protected_position(**levels))
+    broker._reconcile_res = res
+
+
+def _guarded_broker(tmp_path, *, sl=1.1, tp=1.3, trail_offset=None):
+    """A broker owning position ``_PID`` whose bracket it attached itself."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker)
+    intent = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                        side="sell", qty=10.0, tp_price=tp, sl_price=sl,
+                        trail_offset=trail_offset)
+    asyncio.run(broker.execute_exit(_envelope(intent)))
+    return broker
+
+
+def _snapshot_pass(broker) -> list:
+    async def collect():
+        return [event async for event in broker._reconcile_snapshot()]
+    return asyncio.run(collect())
+
+
+def _replaced_push(**levels):
+    sltp = _make_order(order_id=70300000, position_id=_PID, volume=0,
+                       order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)
+    event = _exec_event(_model.ProtoOAExecutionType.ORDER_REPLACED, order=sltp)
+    event.position.CopyFrom(_protected_position(**levels))
+    return event
+
+
+def __test_moved_stop_via_replaced_push_reports_once__(tmp_path):
+    """Someone else moving the SL is quarantined once two pushes agree.
+
+    ORDER_REPLACED reaches no engine event; its position snapshot feeds the
+    guard. One push alone is never judged: the bot's own amend responses
+    arrive the same way, and a push may describe an earlier state.
+    """
+    broker = _guarded_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+
+    assert broker._translate_exec_event(_replaced_push(sl=1.05, tp=1.3)) is None
+    assert calls == []
+    assert broker._translate_exec_event(_replaced_push(sl=1.05, tp=1.3)) is None
+    assert len(calls) == 1
+    _reason, context, kind = calls[0]
+    assert kind is QuarantineKind.EXTERNAL_INTERVENTION
+    assert context['protection_key'] == f"position:{_PID}"
+    assert context['client_order_id'] == 'c1'
+    assert context['observed'][0] == pytest.approx(1.05)
+
+    broker._translate_exec_event(_replaced_push(sl=1.05, tp=1.3))
+    assert len(calls) == 1
+
+
+def __test_moved_take_profit_via_snapshot_reports_once__(tmp_path):
+    broker = _guarded_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+
+    _snapshot_pass(broker)
+    assert calls == [], "the venue carries the bot's own levels"
+    _set_venue(broker, sl=1.1, tp=1.35)
+    _snapshot_pass(broker)
+    assert calls == []
+    _snapshot_pass(broker)
+    assert len(calls) == 1
+    _snapshot_pass(broker)
+    assert len(calls) == 1
+
+
+def __test_removed_stop_via_snapshot_reports__(tmp_path):
+    broker = _guarded_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    _set_venue(broker, sl=1.1, tp=1.3)
+    _snapshot_pass(broker)
+
+    _set_venue(broker, tp=1.3)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+
+    assert len(calls) == 1
+
+
+class _HookedBroker(_FakeBroker):
+    """Runs ``on_dispatch`` while a request is in flight."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.on_dispatch = None
+
+    async def _dispatch_order(self, req, *, coid, context, predecessor_cancel_ids=None):
+        if self.on_dispatch is not None:
+            await self.on_dispatch(req)
+        return await super()._dispatch_order(
+            req, coid=coid, context=context,
+            predecessor_cancel_ids=predecessor_cancel_ids)
+
+
+def __test_own_modify_exit_never_reports__(tmp_path):
+    """The bot's own amend is never an intervention, before, during or after it.
+
+    Snapshot passes while the amend is in flight (old or new levels) are not
+    judged; a snapshot read that started before the write is skipped; once
+    settled, the venue carrying the new levels matches.
+    """
+    broker = _HookedBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker, sl=1.1, tp=1.3)
+    old = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                     side="sell", qty=10.0, tp_price=1.3, sl_price=1.1)
+    new = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                     side="sell", qty=10.0, tp_price=1.4, sl_price=1.15)
+    asyncio.run(broker.execute_exit(_envelope(old)))
+    calls = _spy_quarantine(broker)
+    stale_read_started_at = time.time() - 1.0
+
+    async def reconcile_in_flight(_req):
+        _set_venue(broker, sl=1.1, tp=1.3)
+        _ = [e async for e in broker._reconcile_snapshot()]
+        _ = [e async for e in broker._reconcile_snapshot()]
+        _set_venue(broker, sl=1.15, tp=1.4)
+        _ = [e async for e in broker._reconcile_snapshot()]
+
+    broker.on_dispatch = reconcile_in_flight
+    asyncio.run(broker.modify_exit(_envelope(old), _envelope(new, run_tag="cd34")))
+    broker.on_dispatch = None
+    assert calls == []
+
+    # A snapshot whose read started before the amend shows the old levels.
+    stale = {_PID: _protected_position(sl=1.1, tp=1.3)}
+    for _ in range(2):
+        asyncio.run(broker._observe_protection_snapshot(
+            stale, read_started_at=stale_read_started_at, filled_positions=set()))
+    assert calls == []
+
+    for _ in range(3):
+        _snapshot_pass(broker)
+    assert calls == []
+
+    # A late push of the replaced own levels next to fresh snapshots.
+    broker._translate_exec_event(_replaced_push(sl=1.1, tp=1.3))
+    _snapshot_pass(broker)
+    assert calls == []
+
+
+def __test_sub_tick_noise_never_reports__(tmp_path):
+    broker = _guarded_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    _set_venue(broker, sl=1.100004, tp=1.299996)
+
+    for _ in range(3):
+        _snapshot_pass(broker)
+        broker._translate_exec_event(_replaced_push(sl=1.100004, tp=1.299996))
+
+    assert calls == []
+
+
+def __test_trailing_stop_moving_never_reports__(tmp_path):
+    """The venue ratchets a trailing stop by itself: never an intervention."""
+    broker = _FakeBroker()
+    broker._last_bid = 1.2
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker)
+    intent = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                        side="sell", qty=10.0, trail_offset=0.01)
+    asyncio.run(broker.execute_exit(_envelope(intent)))
+    assert broker.sent[-1].trailingStopLoss is True
+    calls = _spy_quarantine(broker)
+
+    for stop in (1.19, 1.193, 1.196, 1.199):
+        _set_venue(broker, sl=stop, trailing=True)
+        _snapshot_pass(broker)
+        broker._translate_exec_event(_replaced_push(sl=stop, trailing=True))
+
+    assert calls == []
+
+
+def __test_trailing_switched_off_externally_reports__(tmp_path):
+    broker = _FakeBroker()
+    broker._last_bid = 1.2
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker)
+    intent = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                        side="sell", qty=10.0, trail_offset=0.01)
+    asyncio.run(broker.execute_exit(_envelope(intent)))
+    calls = _spy_quarantine(broker)
+
+    _set_venue(broker, sl=1.195, trailing=False)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+
+    assert len(calls) == 1
+
+
+def __test_restart_restores_levels_without_a_false_report__(tmp_path):
+    """The accepted levels persist on the entry row and survive a restart."""
+    first = _guarded_broker(tmp_path)
+    _set_venue(first, sl=1.1, tp=1.3)
+    _snapshot_pass(first)
+
+    restarted = _FakeBroker()
+    restarted.store_ctx = first.store_ctx
+    restarted._wire = object()
+    calls = _spy_quarantine(restarted)
+    _set_venue(restarted, sl=1.1, tp=1.3)
+    for _ in range(3):
+        _snapshot_pass(restarted)
+    assert calls == []
+
+    _set_venue(restarted, sl=1.0, tp=1.3)
+    _snapshot_pass(restarted)
+    _snapshot_pass(restarted)
+    assert len(calls) == 1
+
+
+def __test_failsafe_owned_position_is_left_to_the_core_manager__(tmp_path):
+    """A position whose SL the native fail-safe wrote is not guarded here.
+
+    The core fail-safe manager compares its own levels and quarantines on an
+    external edit; a second report from the plugin guard would be a duplicate.
+    """
+    broker = _guarded_broker(tmp_path)
+    broker.store_ctx.upsert_order('c1', exchange_order_id=str(_PID))
+    calls = _spy_quarantine(broker)
+    asyncio.run(broker.publish_native_failsafe_sl(NativeBracketSnapshot(
+        parent_entry_dispatch_ref='c1', symbol='EURUSD', parent_side='long',
+        stop_level=1.08, profit_level=None, trailing_stop=None, generation=1)))
+
+    _set_venue(broker, sl=1.02)
+    for _ in range(3):
+        _snapshot_pass(broker)
+
+    assert calls == []
+    row = broker.store_ctx.get_order('c1')
+    assert 'protection_levels' not in (row.extras or {})
+
+
+def __test_cleared_bracket_is_not_guarded__(tmp_path):
+    """An operator adding protection to a position the bot left bare is no edit."""
+    broker = _guarded_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    _set_venue(broker, sl=1.1, tp=1.3)
+    asyncio.run(broker.execute_cancel(_envelope(CancelIntent(
+        pine_id='Exit', symbol='EURUSD', from_entry='L'))))
+
+    _set_venue(broker, sl=1.0)
+    for _ in range(3):
+        _snapshot_pass(broker)
+
+    assert calls == []
+
+
+def __test_failed_first_protection_write_never_reports__(tmp_path):
+    """A first amend that never reached the venue leaves nothing to judge.
+
+    The position still carries the protection it had before the write, which
+    the guard never knew; judging it against the unsent levels would
+    quarantine the bot for its own failed request.
+    """
+    broker = _HookedBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker)
+    calls = _spy_quarantine(broker)
+
+    async def drop(_req):
+        raise ExchangeConnectionError("connection lost")
+
+    broker.on_dispatch = drop
+    intent = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                        side="sell", qty=10.0, tp_price=1.3, sl_price=1.1)
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker.execute_exit(_envelope(intent)))
+    broker.on_dispatch = None
+
+    for _ in range(3):
+        _snapshot_pass(broker)
+    assert calls == []
+    assert not broker._protection_guard().known(f"position:{_PID}")
+
+
+def __test_unknown_first_protection_write_never_reports__(tmp_path):
+    """A first amend whose outcome is unknown leaves nothing to judge either.
+
+    The venue may never have received it; the protection it would then still
+    carry was never known to the guard.
+    """
+    broker = _HookedBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker)
+    calls = _spy_quarantine(broker)
+
+    async def timeout(_req):
+        raise OrderDispositionUnknownError(
+            "cTrader bracket attach timed out; disposition unknown",
+            client_order_id='c1')
+
+    broker.on_dispatch = timeout
+    intent = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                        side="sell", qty=10.0, tp_price=1.3, sl_price=1.1)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.execute_exit(_envelope(intent)))
+    broker.on_dispatch = None
+
+    for _ in range(3):
+        _snapshot_pass(broker)
+    assert calls == []
+    assert not broker._protection_guard().known(f"position:{_PID}")
+
+
+def _modify_with_failure(tmp_path, failure: BaseException):
+    """A guarded broker whose amend from 1.1 / 1.3 to 1.15 / 1.4 failed with ``failure``."""
+    broker = _HookedBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker, sl=1.1, tp=1.3)
+    old = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                     side="sell", qty=10.0, tp_price=1.3, sl_price=1.1)
+    new = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                     side="sell", qty=10.0, tp_price=1.4, sl_price=1.15)
+    asyncio.run(broker.execute_exit(_envelope(old)))
+    _snapshot_pass(broker)
+
+    async def fail(_req):
+        raise failure
+
+    broker.on_dispatch = fail
+    with pytest.raises(type(failure)):
+        asyncio.run(broker.modify_exit(_envelope(old), _envelope(new, run_tag="cd34")))
+    broker.on_dispatch = None
+    return broker
+
+
+def __test_refused_protection_amend_stops_being_acceptable__(tmp_path):
+    """The venue refused the amend: its levels showing up later are someone else's."""
+    reject = ExchangeOrderRejectedError("cTrader rejected the order (TRADING_BAD_STOPS)")
+    reject.__cause__ = CTraderProtocolError('TRADING_BAD_STOPS', '')
+    broker = _modify_with_failure(tmp_path, reject)
+    calls = _spy_quarantine(broker)
+
+    _snapshot_pass(broker)
+    assert calls == [], "the venue still carries the bot's previous levels"
+    _set_venue(broker, sl=1.15, tp=1.4)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+    assert len(calls) == 1
+
+
+def __test_unknown_protection_amend_stays_acceptable__(tmp_path):
+    """An amend whose outcome is unknown may have landed: its levels are the bot's."""
+    broker = _modify_with_failure(tmp_path, OrderDispositionUnknownError(
+        "cTrader amend bracket timed out; disposition unknown", client_order_id='c1'))
+    calls = _spy_quarantine(broker)
+
+    _set_venue(broker, sl=1.15, tp=1.4)
+    for _ in range(3):
+        _snapshot_pass(broker)
+    assert calls == []
+
+
+def _overlapping_protection_writes(tmp_path, levels, answers, *, baseline=True):
+    """Send one amend per ``levels`` at once; answer them in ``answers`` order.
+
+    :param levels: ``(stop, take_profit)`` of each write, in write order.
+    :param answers: ``(write index, failure or None)`` in answer order.
+    :param baseline: Guard ``_PID`` from 1.1 / 1.3 before the writes;
+        otherwise they are the position's first protection writes.
+    :return: The broker.
+    """
+    broker = _HookedBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker, sl=1.1, tp=1.3)
+    if baseline:
+        asyncio.run(broker.execute_exit(_envelope(ExitIntent(
+            pine_id="Exit", from_entry="L", symbol="EURUSD", side="sell", qty=10.0,
+            tp_price=1.3, sl_price=1.1))))
+        _snapshot_pass(broker)
+
+    async def scenario():
+        gates = [asyncio.Event() for _ in levels]
+        failures: dict[int, BaseException | None] = {}
+        arrived: list[int] = []
+        all_arrived = asyncio.Event()
+
+        async def hold(_req):
+            index = len(arrived)
+            arrived.append(index)
+            if len(arrived) == len(levels):
+                all_arrived.set()
+            await gates[index].wait()
+            failure = failures[index]
+            if failure is not None:
+                raise failure
+
+        broker.on_dispatch = hold
+        tasks = [
+            asyncio.create_task(broker._write_protection(
+                _oa.ProtoOAAmendPositionSLTPReq(
+                    ctidTraderAccountId=999, positionId=_PID, stopLoss=stop,
+                    takeProfit=take_profit),
+                position_id=_PID, row_coid='c1', coid=f'w{index}', context='amend'))
+            for index, (stop, take_profit) in enumerate(levels)
+        ]
+        await all_arrived.wait()
+        for index, failure in answers:
+            failures[index] = failure
+            gates[index].set()
+            await asyncio.gather(tasks[index], return_exceptions=True)
+        broker.on_dispatch = None
+
+    asyncio.run(scenario())
+    return broker
+
+
+def _refused_amend() -> ExchangeOrderRejectedError:
+    reject = ExchangeOrderRejectedError("cTrader rejected the order (TRADING_BAD_STOPS)")
+    reject.__cause__ = CTraderProtocolError('TRADING_BAD_STOPS', '')
+    return reject
+
+
+def __test_overlapping_same_level_refusals_settle_their_own_write__(tmp_path):
+    """Two writes of the same levels, both refused, answered out of order.
+
+    Each answer closes its own write, so the refused levels stop being the
+    bot's at once; someone setting them later is an edit.
+    """
+    broker = _overlapping_protection_writes(
+        tmp_path, [(1.04, 1.2), (1.04, 1.2)],
+        [(1, _refused_amend()), (0, _refused_amend())])
+    calls = _spy_quarantine(broker)
+
+    _snapshot_pass(broker)
+    assert calls == [], "the venue still carries the bot's previous levels"
+    _set_venue(broker, sl=1.04, tp=1.2)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+    assert len(calls) == 1
+
+
+def _unknown_amend() -> OrderDispositionUnknownError:
+    return OrderDispositionUnknownError(
+        "cTrader amend bracket timed out; disposition unknown", client_order_id='c1')
+
+
+@pytest.mark.parametrize('answers', [
+    [(1, None), (0, 'unknown')],
+    [(0, 'unknown'), (1, None)],
+], ids=['second-confirmed-first', 'first-failed-first'])
+def __test_unknown_first_write_keeps_an_overlapping_confirmed_write__(tmp_path, answers):
+    """The position's first write fails with an unknown outcome while a second
+    write of it is confirmed: the confirmed write stays guarded."""
+    broker = _overlapping_protection_writes(
+        tmp_path, [(1.04, 1.2), (1.03, 1.2)],
+        [(index, _unknown_amend() if failure else None) for index, failure in answers],
+        baseline=False)
+    calls = _spy_quarantine(broker)
+    assert broker._protection_guard().known(f"position:{_PID}")
+
+    _set_venue(broker, sl=1.04, tp=1.2)
+    _snapshot_pass(broker)
+    _set_venue(broker, sl=1.03, tp=1.2)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+    assert calls == [], "both writes are the bot's"
+    _set_venue(broker, sl=1.0, tp=1.2)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+    assert len(calls) == 1
+
+
+def __test_overlapping_first_writes_all_unknown_leave_nothing_to_judge__(tmp_path):
+    broker = _overlapping_protection_writes(
+        tmp_path, [(1.04, 1.2), (1.03, 1.2)],
+        [(1, _unknown_amend()), (0, _unknown_amend())], baseline=False)
+    calls = _spy_quarantine(broker)
+
+    assert not broker._protection_guard().known(f"position:{_PID}")
+    for _ in range(3):
+        _snapshot_pass(broker)
+    assert calls == []
+
+
+def __test_overlapping_writes_answered_out_of_order_never_report__(tmp_path):
+    """Writes A, B, A again; the first A refused, the last A and then B accepted.
+
+    The late answer to B, written before the last A, never outranks it: the
+    venue showing B before it settles on A is the bot's own history.
+    """
+    broker = _overlapping_protection_writes(
+        tmp_path, [(1.04, 1.2), (1.03, 1.2), (1.04, 1.2)],
+        [(0, _refused_amend()), (2, None), (1, None)])
+    calls = _spy_quarantine(broker)
+
+    _set_venue(broker, sl=1.03, tp=1.2)
+    _snapshot_pass(broker)
+    _set_venue(broker, sl=1.04, tp=1.2)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+    assert calls == []
+
+
+def __test_failed_bracket_clear_keeps_the_guard__(tmp_path):
+    """A clear that fails before it changed anything leaves the levels guarded."""
+    broker = _guarded_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    _set_venue(broker, sl=1.1, tp=1.3)
+    canned = broker._reconcile_res
+
+    async def failed_read():
+        raise ExchangeConnectionError("snapshot read failed")
+
+    broker._reconcile = failed_read
+    with pytest.raises(ExchangeConnectionError):
+        asyncio.run(broker._clear_position_bracket(_PID, coid='clear', context='clear'))
+    del broker._reconcile
+    broker._reconcile_res = canned
+    assert broker._protection_guard().known(f"position:{_PID}")
+
+    _snapshot_pass(broker)
+    assert calls == []
+    _set_venue(broker, sl=1.0, tp=1.3)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+    assert len(calls) == 1
+
+
+def _closing_fill(*, order_id, closed_cents=1000, remaining_cents=0,
+                  order_type=_model.ProtoOAOrderType.MARKET, deal_id=None,
+                  stop_out=False, server_event=False, partial=False):
+    order = _make_order(order_id=order_id, executed=closed_cents,
+                        volume=closed_cents, position_id=_PID, closing=True,
+                        order_type=order_type,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    if stop_out:
+        order.isStopOut = True
+    deal = _model.ProtoOADeal(dealId=deal_id or order_id + 1,
+                              filledVolume=closed_cents, executionPrice=1.1)
+    exec_type = (_model.ProtoOAExecutionType.ORDER_PARTIAL_FILL if partial
+                 else _model.ProtoOAExecutionType.ORDER_FILLED)
+    event = _exec_event(exec_type, order=order, deal=deal)
+    if server_event:
+        event.isServerEvent = True
+    status = (_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN if remaining_cents
+              else _model.ProtoOAPositionStatus.POSITION_STATUS_CLOSED)
+    event.position.CopyFrom(_model.ProtoOAPosition(
+        positionId=_PID, positionStatus=status,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=remaining_cents,
+                                          tradeSide=_model.ProtoOATradeSide.BUY),
+    ))
+    return event
+
+
+def _owned_broker(tmp_path):
+    broker = _FakeBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    return broker
+
+
+@pytest.mark.parametrize('remaining_cents', [0, 600])
+def __test_manual_close_is_booked_and_reported__(tmp_path, remaining_cents):
+    """A MARKET close of the bot's position nobody of the bot sent.
+
+    The fill is booked exactly like a close of the run's position, so the
+    engine sees the true size; the report follows the delivered event.
+    """
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+
+    out = broker._translate_exec_event(_closing_fill(
+        order_id=70400000, closed_cents=1000 - remaining_cents,
+        remaining_cents=remaining_cents))
+
+    assert out is not None
+    assert out.leg_type is LegType.CLOSE and out.from_entry == 'L'
+    assert out.fill_qty == pytest.approx((1000 - remaining_cents) / 100)
+    assert calls == [], "reported only after the stream yielded the fill"
+    broker._flush_external_interventions()
+    assert len(calls) == 1
+    _reason, context, kind = calls[0]
+    assert kind is QuarantineKind.EXTERNAL_INTERVENTION
+    assert context['position_id'] == _PID and context['order_id'] == 70400000
+
+
+def __test_manual_close_report_lost_with_its_process_is_replayed__(tmp_path):
+    """The fill was judged external, but the process died before the report."""
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    assert broker._translate_exec_event(_closing_fill(order_id=70400000)) is not None
+    assert calls == []
+    broker.store_ctx.close()
+
+    restarted = _FakeBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, restarted)
+    restarted_calls = _spy_quarantine(restarted)
+    restarted._flush_external_interventions()
+    assert len(restarted_calls) == 1
+    assert restarted_calls[0][1]['order_id'] == 70400000
+    restarted._flush_external_interventions()
+    assert len(restarted_calls) == 1
+
+
+def __test_no_venue_write_leaves_before_a_replayed_report_is_handled__(tmp_path):
+    """A restarted process must not trade before the lost report is handled."""
+    broker = _owned_broker(tmp_path)
+    _spy_quarantine(broker)
+    assert broker._translate_exec_event(_closing_fill(order_id=70400000)) is not None
+    broker.store_ctx.close()
+
+    restarted = _GatedBroker()
+    restarted.venue_writes_blocked = lambda: False
+    _open_store(tmp_path, restarted)
+    calls = _spy_quarantine(restarted)
+    req = _oa.ProtoOANewOrderReq(ctidTraderAccountId=999, symbolId=1, volume=1000)
+    with pytest.raises(VenueWritesQuarantinedError):
+        asyncio.run(restarted._dispatch_order(req, coid='coid-r', context='entry'))
+    assert _sent_writes(restarted) == [] and calls == []
+
+    async def start_stream():
+        restarted._exec_events = asyncio.Queue()
+        agen = restarted.watch_orders()
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(agen.__anext__(), timeout=0.05)
+        finally:
+            await agen.aclose()
+
+    asyncio.run(start_stream())
+    assert len(calls) == 1 and calls[0][1]['order_id'] == 70400000
+    with pytest.raises(ExchangeOrderRejectedError):
+        asyncio.run(restarted._dispatch_order(req, coid='coid-r', context='entry'))
+    assert _sent_writes(restarted) == [req]
+
+
+def __test_manual_close_report_follows_the_fill_through_watch_orders__(tmp_path):
+    broker = _owned_broker(tmp_path)
+    broker.on_unexpected_cancel = 'halt'
+
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        broker._exec_events.put_nowait(_closing_fill(order_id=70400000))
+        agen = broker.watch_orders()
+        try:
+            first = await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+            with pytest.raises(UnexpectedCancelError):
+                await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+            return first
+        finally:
+            await agen.aclose()
+
+    event = asyncio.run(run())
+    assert event.leg_type is LegType.CLOSE and event.fill_qty == 10.0
+
+
+@pytest.mark.parametrize('kind', ['sltp', 'stop_out', 'server_event'])
+def __test_venue_closes_are_never_reported__(tmp_path, kind):
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+
+    out = broker._translate_exec_event(_closing_fill(
+        order_id=70400000,
+        order_type=(_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT if kind == 'sltp'
+                    else _model.ProtoOAOrderType.MARKET),
+        stop_out=kind == 'stop_out', server_event=kind == 'server_event'))
+    broker._flush_external_interventions()
+
+    assert out is not None and out.leg_type is LegType.CLOSE
+    assert calls == []
+
+
+def _close(broker, qty=10.0):
+    intent = CloseIntent(pine_id="L", symbol="EURUSD", side="sell", qty=qty)
+    return asyncio.run(broker.execute_close(_envelope(intent)))
+
+
+def __test_own_close_correlated_by_order_id_is_not_reported__(tmp_path):
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=888, position_id=_PID, closing=True))
+    _close(broker)
+
+    out = broker._translate_exec_event(_closing_fill(order_id=888))
+    broker._flush_external_interventions()
+
+    assert out is not None and out.leg_type is LegType.CLOSE
+    assert calls == []
+    assert broker._own_closes == []
+
+
+def __test_own_close_fill_before_the_response_is_not_reported__(tmp_path):
+    """The fill push can overtake the close response that names its order."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    calls = _spy_quarantine(broker)
+    seen: list = []
+
+    async def fill_overtakes_response(_req):
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=889, closed_cents=400, remaining_cents=600, partial=True)))
+
+    broker.on_dispatch = fill_overtakes_response
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    _close(broker)
+    broker.on_dispatch = None
+    seen.append(broker._translate_exec_event(_closing_fill(
+        order_id=889, closed_cents=1000, deal_id=9001)))
+    broker._flush_external_interventions()
+
+    assert all(out is not None and out.leg_type is LegType.CLOSE for out in seen)
+    assert calls == []
+    assert broker._own_closes == []
+
+
+def __test_own_close_with_unknown_outcome_claims_its_fill__(tmp_path):
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    broker._raise_on_dispatch = OrderDispositionUnknownError(
+        "timed out", client_order_id="x")
+    with pytest.raises(OrderDispositionUnknownError):
+        _close(broker)
+    broker._raise_on_dispatch = None
+
+    broker._translate_exec_event(_closing_fill(order_id=890))
+    broker._flush_external_interventions()
+
+    assert calls == []
+
+
+def __test_rejected_own_close_does_not_mask_a_manual_close__(tmp_path):
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    broker._raise_on_dispatch = _position_locked_reject()
+    with pytest.raises(OrderSkippedByPlugin):
+        _close(broker)
+    broker._raise_on_dispatch = None
+
+    broker._translate_exec_event(_closing_fill(order_id=891))
+    broker._flush_external_interventions()
+
+    assert len(calls) == 1
+
+
+def __test_manual_close_after_an_own_partial_close_is_reported__(tmp_path):
+    """Regression: one own close must not make every later close look own."""
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=888, position_id=_PID, closing=True))
+    _close(broker, qty=4.0)
+    broker._translate_exec_event(_closing_fill(
+        order_id=888, closed_cents=400, remaining_cents=600))
+    broker._flush_external_interventions()
+    assert calls == []
+
+    out = broker._translate_exec_event(_closing_fill(
+        order_id=70400000, closed_cents=600))
+    broker._flush_external_interventions()
+
+    assert out is not None and out.leg_type is LegType.CLOSE
+    assert len(calls) == 1
+
+
+def __test_close_by_an_own_entry_order_is_not_reported__(tmp_path):
+    """A netting reversal entry closing the position echoes our coid."""
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='rev', symbol='EURUSD', side='sell', qty=20.0,
+        intent_key='S', pine_entry_id='S',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    fill = _closing_fill(order_id=70500000)
+    fill.order.clientOrderId = 'rev'
+
+    broker._translate_exec_event(fill)
+    broker._flush_external_interventions()
+
+    assert calls == []
+
+
+def __test_pyramid_exits_persist_on_one_row_across_a_restart__(tmp_path):
+    """Exits of two pyramid entries write one netted position's protection.
+
+    The levels must live on one row: a stale copy on the first entry's row
+    would be restored after a restart and flag the current levels as edited.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    _set_venue(broker)
+    for from_entry, sl in (('L1', 1.1), ('L2', 1.12)):
+        intent = ExitIntent(pine_id="Exit", from_entry=from_entry, symbol="EURUSD",
+                            side="sell", qty=10.0, tp_price=1.3, sl_price=sl)
+        asyncio.run(broker.execute_exit(_envelope(intent)))
+
+    restarted = _FakeBroker()
+    restarted.store_ctx = broker.store_ctx
+    restarted._wire = object()
+    calls = _spy_quarantine(restarted)
+    _set_venue(restarted, sl=1.12, tp=1.3)
+    for _ in range(3):
+        _snapshot_pass(restarted)
+
+    assert calls == []
+
+
+def __test_own_entry_fill_accepts_the_protection_it_leaves__(tmp_path):
+    """Whatever an own fill does to the position's protection is not an edit."""
+    broker = _guarded_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    order = _make_order(order_id=70211174, executed=1000, position_id=_PID,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    fill = _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+                       deal=_model.ProtoOADeal(dealId=5150, filledVolume=1000,
+                                               executionPrice=1.2))
+    fill.position.CopyFrom(_protected_position(volume=2000))
+    broker.store_ctx.upsert_order('c1', filled_qty=0.0)
+
+    out = broker._translate_exec_event(fill)
+    _set_venue(broker, volume=2000)
+    for _ in range(3):
+        _snapshot_pass(broker)
+
+    assert out is not None and out.leg_type is LegType.ENTRY
+    assert calls == []

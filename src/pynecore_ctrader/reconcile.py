@@ -54,10 +54,10 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 
-from ._base import _CTraderBase
 from .helpers import REQUEST_TIMEOUT, money_value, parse_protocol_id, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
+from .protection import _ProtectionMixin
 from .wire import CTraderTimeoutError
 
 if TYPE_CHECKING:
@@ -121,6 +121,9 @@ class _DealBridgeResult:
         they are absent from :ivar:`deal_ids` — yet a closure concluded from
         them must seed the de-dup channel too, or a late PUSH replay of the
         closing execution would re-book against the retired position.
+    :ivar closing_deals: ``(deal_id, order_id, executed_ms, closed_cents)`` of
+        the same deals, for judging who closed the position
+        (:meth:`_ProtectionMixin._judge_recovered_closes`).
     :ivar fills: ``(timestamp_ms, deal_id, volume_cents, price, fee)`` of every
         matching FILLED deal, oldest first — the per-execution terms a
         recovered DELTA is priced and charged from when part of the order's
@@ -135,6 +138,7 @@ class _DealBridgeResult:
     deal_ids: tuple[int, ...] = ()
     closing_deal_ids: tuple[int, ...] = ()
     fills: tuple[tuple[int, int, int, float, float], ...] = ()
+    closing_deals: tuple[tuple[int, int, int, int], ...] = ()
 
 
 @dataclass(slots=True)
@@ -150,8 +154,8 @@ class _DealWalk:
     :ivar high_ms: Upper bound the window has been extended to so far.
     :ivar segments: Sub-windows not yet fully read, oldest first.
     :ivar fills: The order's FILLED deals by ``dealId``.
-    :ivar closes: ``(positionId, closedVolume)`` by ``dealId`` of every deal
-        in the window that closed volume.
+    :ivar closes: ``(positionId, closedVolume, orderId, executed_ms)`` by
+        ``dealId`` of every deal in the window that closed volume.
     :ivar last_request: Event-loop time the walk last sent a page request
         (``-inf`` before its first), so unfinished walks take turns.
     """
@@ -159,7 +163,7 @@ class _DealWalk:
     high_ms: int
     segments: list[list[int]] = field(default_factory=list)
     fills: 'dict[int, OpenApiModelMessages.ProtoOADeal]' = field(default_factory=dict)
-    closes: dict[int, tuple[int, int]] = field(default_factory=dict)
+    closes: dict[int, tuple[int, int, int, int]] = field(default_factory=dict)
     last_request: float = float('-inf')
 
     def ingest(self, deal: 'OpenApiModelMessages.ProtoOADeal', order_id: int) -> None:
@@ -174,7 +178,8 @@ class _DealWalk:
         if (deal.HasField('closePositionDetail')
                 and deal.closePositionDetail.closedVolume > 0):
             self.closes[deal.dealId] = (
-                deal.positionId, deal.closePositionDetail.closedVolume)
+                deal.positionId, deal.closePositionDetail.closedVolume, deal.orderId,
+                deal.executionTimestamp or deal.createTimestamp)
         if (deal.orderId == order_id
                 and deal.dealStatus == OpenApiModelMessages.ProtoOADealStatus.FILLED):
             kept = OpenApiModelMessages.ProtoOADeal()
@@ -200,7 +205,7 @@ class _DealWalk:
         closed_target = (target_position_id if target_position_id is not None
                          else close_position_id)
         closing_ids = tuple(
-            deal_id for deal_id, (position_id, _volume) in self.closes.items()
+            deal_id for deal_id, (position_id, *_rest) in self.closes.items()
             if closed_target is not None and position_id == closed_target)
         closed_cents = sum(self.closes[deal_id][1] for deal_id in closing_ids)
         return _DealBridgeResult(
@@ -211,10 +216,15 @@ class _DealWalk:
                  d.executionPrice, money_value(d.commission, d.moneyDigits))
                 for d in fills
             ),
+            tuple(
+                (deal_id, self.closes[deal_id][2], self.closes[deal_id][3],
+                 self.closes[deal_id][1])
+                for deal_id in closing_ids
+            ),
         )
 
 
-class _ReconcileMixin(_CTraderBase, ABC):
+class _ReconcileMixin(_ProtectionMixin, ABC):
     """Periodic reconcile-snapshot diff: gap-fills events the PUSH path missed."""
 
     async def _reconcile_snapshot(self) -> AsyncIterator[OrderEvent]:
@@ -226,6 +236,8 @@ class _ReconcileMixin(_CTraderBase, ABC):
         ``missing_pending_since`` on rows whose broker counterpart has
         deterministically vanished. Emits nothing — and stamps nothing — for an
         ambiguous observation; the next pass or the live PUSH event resolves it.
+        Finally judges the guarded positions' protection levels against the
+        levels this run set (:meth:`_observe_protection_snapshot`).
 
         A no-op when persistence is off (the test paths) or the live connection
         is not established.
@@ -247,6 +259,7 @@ class _ReconcileMixin(_CTraderBase, ABC):
         # The snapshot read — rate-limit backoff and account re-auth included —
         # spends the same pass budget as the deal-history reads below; an
         # overrun fails the pass as transient and the next pass reads afresh.
+        read_started_at = epoch_time()
         try:
             async with asyncio.timeout_at(self._reconcile_pass_deadline):
                 res = await self._reconcile()
@@ -279,6 +292,7 @@ class _ReconcileMixin(_CTraderBase, ABC):
             return False, walk.last_request
 
         rows.sort(key=walk_turn)
+        filled_coids: list[str] = []
         for row, order_id in rows:
             extras = row.extras or {}
             order = orders_by_id.get(order_id) if order_id is not None else None
@@ -292,6 +306,7 @@ class _ReconcileMixin(_CTraderBase, ABC):
                 event = await self._reconcile_working_row(
                     row, order, open_positions, now_ts)
                 if event is not None:
+                    filled_coids.append(row.client_order_id)
                     yield event
                 continue
             position_id = extras.get('position_id')
@@ -312,6 +327,7 @@ class _ReconcileMixin(_CTraderBase, ABC):
             # must be recovered through the same bridge — never treated as settled.
             async for event in self._recover_vanished_working_row(
                     row, order_id, open_positions, now_ts):
+                filled_coids.append(row.client_order_id)
                 yield event
         # Presence diff for the settled-position rows: stamp when the position
         # vanished from ``position[]``, clear the moment it is back. Runs AFTER
@@ -324,6 +340,22 @@ class _ReconcileMixin(_CTraderBase, ABC):
             {'positions': {str(pid) for pid in open_positions}}, now_ts,
         )
         self._feed_native_failsafe_observations(open_positions)
+        await self._observe_protection_snapshot(
+            open_positions, read_started_at=read_started_at,
+            filled_positions=self._row_position_ids(filled_coids),
+        )
+
+    def _row_position_ids(self, coids: list[str]) -> set[int]:
+        """Positions the given journal rows are linked to now."""
+        if self.store_ctx is None:
+            return set()
+        position_ids: set[int] = set()
+        for coid in coids:
+            row = self.store_ctx.get_order(coid)
+            raw = (row.extras or {}).get('position_id') if row is not None else None
+            if raw is not None:
+                position_ids.add(parse_protocol_id(raw, field='position_id'))
+        return position_ids
 
     def _feed_native_failsafe_observations(
             self, open_positions: 'dict[int, OpenApiModelMessages.ProtoOAPosition]',
@@ -475,7 +507,10 @@ class _ReconcileMixin(_CTraderBase, ABC):
           (``filled_cents``); a fully-filled position row already
           establishes its fill, so a close on its KNOWN position id is
           enough even when the entry fill aged out of the bridge window
-          (the ``close_position_id`` fallback).
+          (the ``close_position_id`` fallback). The closing deals are first
+          judged for an external close the PUSH stream missed
+          (:meth:`_judge_recovered_closes`); while a closing order cannot be
+          looked up the verdict stays INCONCLUSIVE.
         * A zero-fill working order that FILLED during the gap: it
           demonstrably opened a position, so it is NOT a cancel — the
           tracker clears the now-false premise and the next
@@ -508,6 +543,9 @@ class _ReconcileMixin(_CTraderBase, ABC):
                     bridge.deal.positionId if bridge.deal is not None else position_id
                 )
                 assert close_pid is not None
+                if not await self._judge_recovered_closes(
+                        close_pid, bridge.closing_deals, from_entry=row.pine_entry_id):
+                    return MissingConfirmation(MissingResolution.INCONCLUSIVE)
                 # Register the entry fills AND the closing deals: the
                 # closure is concluded from the closing evidence, whose
                 # deals usually belong to a DIFFERENT order (native TP/SL,
@@ -673,6 +711,14 @@ class _ReconcileMixin(_CTraderBase, ABC):
             order_id, self._deal_since_ms(extras),
             deadline=self._reconcile_pass_deadline)
         if bridge.deal is not None:
+            closed_pid = bridge.deal.positionId
+            if (closed_pid and closed_pid not in open_positions
+                    and bridge.closed_cents > 0 and bridge.filled_cents > 0
+                    and not await self._judge_recovered_closes(
+                        closed_pid, bridge.closing_deals, from_entry=row.pine_entry_id)):
+                # Who closed the position is not known yet: retire it on a
+                # later pass, once the closing orders could be looked up.
+                return
             event = self._promote_from_deal(row, bridge, open_positions, now_ts)
             if event is not None:
                 yield event

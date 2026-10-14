@@ -66,8 +66,11 @@ if TYPE_CHECKING:
         OrderEvent,
         PositionLeg,
     )
+    from pynecore.core.broker.protection_guard import ProtectionLevelGuard
+    from pynecore.core.broker.storage import RunContext
 
     from .models import _SymbolRules
+    from .protection import _OwnClose
     from .reconcile import _DealWalk
 
 logger = logging.getLogger(__name__)
@@ -275,9 +278,50 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: only the venue's own close ``orderId`` (never in the ref index) plus
         #: the ``positionId``; when no entry row links that position (a
         #: startup-adopted position closed by this run), ``_resolve_identity``
-        #: falls back to this map so our OWN close fill is emitted as a CLOSE
-        #: leg instead of being dropped as external activity.
+        #: falls back to this map to attribute closing fills on it as CLOSE
+        #: legs instead of dropping them as external activity. Attribution
+        #: only: whether a closing fill is this run's own close is decided by
+        #: :attr:`_own_closes`.
         self._close_dispatch_pine_by_position: dict[int, str | None] = {}
+        #: Closes this run sent whose final fill has not been seen yet. See
+        #: ``_ProtectionMixin._close_fill_origin``.
+        self._own_closes: list['_OwnClose'] = []
+        #: Every close the run sent that the venue did not refuse (this
+        #: process's and, once loaded, the journalled ones of earlier
+        #: processes), for judging closes recovered from the deal history. See
+        #: ``_ProtectionMixin._judge_recovered_closes``.
+        self._own_close_history: list['_OwnClose'] = []
+        #: ``dealId`` of every closing fill the PUSH path attributed to the
+        #: run or a recovery judged; never classified again. Independent of the
+        #: fill de-dup set, which recovery seeds before booking.
+        self._judged_close_deals: set[int] = set()
+        #: The journal the earlier processes' close evidence was loaded from.
+        self._close_evidence_store: 'RunContext | None' = None
+        #: Closing orders whose failed lookup was already warned about.
+        self._close_lookup_warned: set[int] = set()
+        #: Manual-close reports waiting for the stream to yield their fill
+        #: event (or the reconcile pass that recovered them to end), as
+        #: ``(reason, context, client_order_id, exchange_order_id)``.
+        #: See ``_ProtectionMixin._flush_external_interventions``.
+        self._deferred_interventions: list[
+            tuple[str, dict, str | None, str | None]] = []
+        #: Positions a manual close was already reported for (once each).
+        self._external_close_reported: set[int] = set()
+        #: Positions whose manual-close report an earlier process queued but
+        #: never handled, replayed and not handled yet; venue writes wait for
+        #: them. See ``_ProtectionMixin.ensure_venue_writes_allowed``.
+        self._unhandled_close_replays: set[int] = set()
+        #: Protection level guard and the journal it was built on. Built
+        #: lazily by ``_ProtectionMixin._protection_guard`` — ``store_ctx`` is
+        #: injected after ``__init__``.
+        self._level_guard: 'ProtectionLevelGuard | None' = None
+        self._level_guard_store: 'RunContext | None' = None
+        #: Guard keys holding a baseline the venue confirmed or the bot
+        #: adopted, as opposed to only unanswered writes. See
+        #: ``_ProtectionMixin._write_protection``.
+        self._protection_baselined: set[str] = set()
+        #: Protection writes awaiting their answer, per guard key.
+        self._protection_in_flight: dict[str, int] = {}
         #: One-shot guard for the startup adoption baseline. The engine's startup
         #: ``reconcile`` adopts the broker net position deal-independently; the
         #: FIRST ``get_position`` / ``fetch_raw_positions`` call (which IS that
