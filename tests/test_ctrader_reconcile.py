@@ -1749,6 +1749,31 @@ def __test_recovered_manual_close_is_reported__(tmp_path):
     assert len(reports) == 1
 
 
+@pytest.mark.parametrize('policy', ['ignore', 're_place'])
+def __test_recovered_manual_close_after_a_handled_report_is_reported_again__(tmp_path, policy):
+    """The run trades on after a report the policy let pass: a later manual
+    close of the same position is judged and reported on its own."""
+    broker, _reports = _recovered_close_broker(
+        tmp_path, _closing_order(999), _closing_order(998))
+    broker.on_unexpected_cancel = policy
+    handled: list = []
+    report = broker.report_external_intervention
+    broker.report_external_intervention = lambda reason, context, **kw: (
+        handled.append(context['order_id']), report(reason, context, **kw))
+    _recover(broker)
+    assert handled == [999]
+
+    _seed_position(broker, 'c4', position_id=222, qty=volume_to_units(2000),
+                   extras={'missing_pending_since': 0.0})
+    broker._wire._deal_res = _deal_res(
+        _close_deal(deal_id=900, order_id=999, position_id=222, closed_volume=2000),
+        _close_deal(deal_id=901, order_id=998, position_id=222, closed_volume=2000))
+    _recover(broker)
+
+    assert 'c4' not in _live_coids(broker)
+    assert handled == [999, 998]
+
+
 def __test_recovered_venue_bracket_close_is_not_reported__(tmp_path):
     broker, reports = _recovered_close_broker(tmp_path, _closing_order(
         999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT))
@@ -1802,6 +1827,34 @@ def __test_recovered_close_by_an_own_order_is_not_reported__(tmp_path):
     _recover(broker)
 
     assert 'c3' not in _live_coids(broker)
+    assert reports == []
+
+
+def __test_recovered_close_by_an_order_of_the_run_without_a_row_is_not_reported__(tmp_path):
+    """An order carrying the run's tag closed the volume, but its journal row
+    belongs to an earlier process's run instance, which lookups do not see."""
+    broker, reports = _recovered_close_broker(tmp_path)
+    broker._wire.orders[999] = _closing_order(999, coid=f"{broker.store_ctx.run_tag}-rev1")
+    assert broker.store_ctx.get_order(f"{broker.store_ctx.run_tag}-rev1") is None
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+
+
+def __test_recovered_close_by_an_entry_order_of_a_closed_row_needs_no_lookup__(tmp_path):
+    """A closing deal of an entry order whose row is closed is the bot's own."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999))
+    deals = [_PositionDeal(deal_id=900, order_id=999, executed_ms=1_700_000_100_000,
+                           filled=2000, closed=2000)]
+
+    taken = asyncio.run(broker._judge_recovered_closes(
+        222, deals, from_entry='long', own_orders=(999,)))
+
+    assert taken is not None
+    assert _details_requests(broker) == []
+    broker._flush_external_interventions()
     assert reports == []
 
 
@@ -1897,8 +1950,9 @@ def __test_recovered_close_lookup_unrecovered_session_defers_the_retire__(tmp_pa
     assert reports == []
 
 
-def __test_recovered_close_the_venue_cannot_describe_is_not_reported__(tmp_path):
-    """No origin can be established for it: retired, never reported."""
+def __test_recovered_close_the_venue_cannot_describe_is_audited_not_reported__(tmp_path):
+    """No origin can be established for it: retired, never reported, but the
+    bot's share it took is an ERROR and an audit event, not a silent pass."""
     broker, reports = _recovered_close_broker(
         tmp_path, _closing_order(999),
         details_error=CTraderProtocolError('ORDER_NOT_FOUND', 'unknown order'))
@@ -1907,6 +1961,8 @@ def __test_recovered_close_the_venue_cannot_describe_is_not_reported__(tmp_path)
 
     assert 'c3' not in _live_coids(broker)
     assert reports == []
+    audits = _store_events(broker, 'ctrader_close_unattributed')
+    assert len(audits) == 1 and audits[0]['deal_ids'] == [900]
 
 
 def __test_recovered_manual_close_right_after_the_start_is_reported__(tmp_path):
@@ -2221,6 +2277,35 @@ def __test_missed_venue_partial_close_retires_without_a_report__(tmp_path):
 
     assert reports == []
     assert _retired(broker) == pytest.approx(10.0)
+
+
+def __test_late_push_of_a_close_a_shrink_pass_retired_is_not_booked_again__(tmp_path):
+    """The bot's own close (order 600) executed while the stream was down; the
+    shrink pass judged its deal 903 from the deal history and retired it. Its
+    push arriving afterwards is a late copy, never booked twice."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker._settle_own_close(broker._open_own_close(222, 10.0), 600)
+    _run(broker)
+    _run(broker)
+    assert _retired(broker) == pytest.approx(10.0)
+
+    order = _model.ProtoOAOrder(
+        orderId=600, orderType=_model.ProtoOAOrderType.MARKET, closingOrder=True,
+        positionId=222, executedVolume=1000,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=1000,
+                                          tradeSide=_model.ProtoOATradeSide.SELL))
+    push = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    push.order.CopyFrom(order)
+    push.deal.CopyFrom(_model.ProtoOADeal(
+        dealId=903, orderId=600, positionId=222, filledVolume=1000, executionPrice=1.1,
+        executionTimestamp=1_700_000_003_000,
+        closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=1000)))
+    push.position.CopyFrom(_position(position_id=222, volume=1000))
+
+    assert broker._translate_exec_event(push) is None
+    assert _retired(broker) == pytest.approx(10.0)
+    assert reports == []
 
 
 def __test_shrink_is_not_judged_while_an_event_waits_in_the_queue__(tmp_path):

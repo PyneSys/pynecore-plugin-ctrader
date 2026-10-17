@@ -29,7 +29,9 @@ Resolution rules:
 
 * **Live-position rule.** ``ProtoOAPosition`` carries no ``clientOrderId``, so a
   live position alone NEVER confirms a row — only an ``order[]`` coid-match or
-  the order-history bridge does. No net-position inference by label / symbol.
+  the order-history bridge does. No net-position inference by symbol; an
+  untracked position carrying the run's own label is adopted as a new row of
+  its own (``_recover_untracked_venue_state``), never matched to a pending one.
 * **Never re-issue.** A row whose outcome cannot be read from either source
   stays pending (``still_unknown``); the recoverer never dispatches a new order.
 * **Evidence-gated TTL.** A ``still_unknown`` row is retired
@@ -54,14 +56,17 @@ from dataclasses import dataclass
 from time import time as epoch_time
 from typing import cast
 
+from pynecore.core.broker.exceptions import BrokerError
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
-from pynecore.core.broker.store_helpers import find_pending_dispatch
+from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, find_pending_dispatch
+from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
 
 from .helpers import REQUEST_TIMEOUT, parse_protocol_id, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .protection import _accepted_by_resume
 from .reconcile import _SINCE_ANCHOR_SKEW_MS, _ReconcileMixin
+from .wire import CTraderWireError
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,22 @@ logger = logging.getLogger(__name__)
 #: depth. Minutes, NOT the 25s ``pending_missing_grace`` (that is the everyday
 #: reconcile-noise window — a different policy).
 _ABANDON_TTL_S = 600.0
+
+#: Audit event: an open position carrying the run's label that no journal row
+#: of the run tracked was adopted as the bot's own.
+_OWN_LEG_RECOVERED_EVENT = 'ctrader_own_leg_recovered'
+#: Audit event: a working order carrying the run's label or client-order-id
+#: prefix that no journal row of the run tracked was cancelled (or could not be).
+_OWN_ORDER_DEBRIS_EVENT = 'ctrader_own_order_debris'
+#: Audit event: an open position on the run's symbol that carries no label at
+#: all and no journal row tracks; written once per position.
+_UNLABELLED_LEG_EVENT = 'ctrader_untracked_leg_unattributed'
+#: Order types of the bot's own entry orders.
+_ENTRY_ORDER_TYPES = frozenset({
+    OpenApiModelMessages.ProtoOAOrderType.MARKET,
+    OpenApiModelMessages.ProtoOAOrderType.LIMIT,
+    OpenApiModelMessages.ProtoOAOrderType.STOP,
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,9 +131,6 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         if self.store_ctx is None:
             return
         pending = list(find_pending_dispatch(self.store_ctx))
-        has_live = next(iter(self.store_ctx.iter_live_orders()), None) is not None
-        if not pending and not has_live:
-            return
         res = await self._reconcile(return_protection_orders=True)
         orders_by_coid = {o.clientOrderId: o for o in res.order if o.clientOrderId}
         open_positions = {
@@ -124,6 +142,139 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             if await self._recover_one_pending_row(row, orders_by_coid, open_positions):
                 promoted_coids.add(row.client_order_id)
         await self._retire_startup_orphans(res, promoted_coids)
+        await self._recover_untracked_venue_state(res)
+
+    async def _recover_untracked_venue_state(
+            self, res: 'OpenApiMessages.ProtoOAReconcileRes',
+    ) -> None:
+        """Recognise the bot's own venue state its journal lost.
+
+        Every order the run sends carries its run tag as ``label`` (and its
+        client-order-ids start with it), and an open position keeps the label
+        of the order that opened it. A journal write lost to a crash (or a row
+        an earlier process closed while its order still lived) leaves the
+        run's exposure on the venue with nothing of the run tracking it:
+
+        * An untracked open position carrying the run's label is the bot's
+          own. It is adopted (:meth:`_adopt_own_leg`): the engine's startup
+          adoption, which follows, takes it up like any position the run
+          holds, and its protection is guarded from the venue's view. ERROR +
+          audit: the bot's journal lost a fill.
+        * An untracked working entry order carrying the run's label or
+          client-order-id prefix is cancelled (:meth:`_cancel_own_debris`).
+          No intent of the engine stands behind it, so nothing would manage
+          it: left working, it could fill into exposure the strategy never
+          asked for. The strategy places the order again if it still wants it.
+        * An untracked open position on the run's symbol without any label
+          was opened by none of the runs (each stamps its label): another
+          party's, but nothing tells whose (ERROR + audit, once per
+          position). One carrying another label is another run's.
+
+        Never raises for a venue failure: what it cannot do stays as it was,
+        logged and audited.
+        """
+        if self.store_ctx is None:
+            return
+        run_tag = self.store_ctx.run_tag
+        owned = self._owned_position_ids() or set()
+        symbol_id = self._symbols_by_name.get(self.symbol) if self.symbol else None
+        for position in res.position:
+            if (position.positionStatus
+                    != OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+                    or position.positionId in owned):
+                continue
+            label = position.tradeData.label
+            if label == run_tag:
+                self._adopt_own_leg(position)
+            elif not label and position.tradeData.symbolId == symbol_id:
+                self._note_unlabelled_leg(position)
+        for order in res.order:
+            if (order.closingOrder or order.orderType not in _ENTRY_ORDER_TYPES
+                    or order.orderStatus != OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+                    or not (order.tradeData.label == run_tag
+                            or order.clientOrderId.startswith(f"{run_tag}-"))
+                    or self.store_ctx.find_by_ref('order_id', str(order.orderId)) is not None
+                    or (order.clientOrderId
+                        and self.store_ctx.get_order(order.clientOrderId) is not None)):
+                continue
+            await self._cancel_own_debris(order)
+
+    def _adopt_own_leg(self, position: 'OpenApiModelMessages.ProtoOAPosition') -> None:
+        """Journal an open position of the bot's that no row of the run tracks.
+
+        The row counts as the run's own exposure (not ``adopted_startup``):
+        filled, linked to the position, under the synthetic entry id the
+        engine's adoption uses for exposure no entry names. Its protection is
+        taken from the venue's view (:meth:`_take_own_fill_protection`).
+        """
+        assert self.store_ctx is not None
+        position_id = position.positionId
+        coid = f"{self.store_ctx.run_tag}-recovered-{position_id}"
+        qty = volume_to_units(position.tradeData.volume)
+        side = ('buy' if position.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
+                else 'sell')
+        symbol = self._symbol_name_for(position.tradeData.symbolId)
+        self.store_ctx.upsert_order(
+            coid, symbol=symbol, side=side, qty=qty, filled_qty=qty, state='confirmed',
+            pine_entry_id=ADOPTED_STARTUP_ENTRY_ID, exchange_order_id=str(position_id),
+            extras={'kind': ENTRY_KIND_POSITION, 'entry_filled_at': epoch_time(),
+                    'position_id': str(position_id), 'recovered_own_leg': True},
+        )
+        self._link_position_ref(coid, position_id)
+        logger.error(
+            "cTrader startup: open position %d (%s %s units of %s) carries this run's "
+            "label %r but no journal row of the run tracked it; adopted as the bot's own",
+            position_id, side, qty, symbol, self.store_ctx.run_tag)
+        self.store_ctx.log_event(
+            _OWN_LEG_RECOVERED_EVENT, client_order_id=coid,
+            exchange_order_id=str(position_id),
+            payload={'position_id': position_id, 'symbol': symbol, 'side': side,
+                     'qty': qty, 'label': position.tradeData.label})
+        self._take_own_fill_protection(position)
+
+    async def _cancel_own_debris(self, order: 'OpenApiModelMessages.ProtoOAOrder') -> None:
+        """Cancel a working order of the bot's that no row of the run tracks."""
+        assert self.store_ctx is not None
+        payload = {'order_id': order.orderId, 'client_order_id': order.clientOrderId,
+                   'label': order.tradeData.label, 'volume': order.tradeData.volume,
+                   'executed_volume': order.executedVolume}
+        try:
+            await self._dispatch_order(
+                OpenApiMessages.ProtoOACancelOrderReq(
+                    ctidTraderAccountId=self._live_account_id, orderId=order.orderId),
+                coid=order.clientOrderId or str(order.orderId), context="own debris cancel")
+        except (BrokerError, CTraderWireError, TimeoutError) as exc:
+            logger.error(
+                "cTrader startup: working order %d (%s) carries this run's tag but no journal "
+                "row of the run tracks it; its cancel failed, it stays working: %s",
+                order.orderId, order.clientOrderId, exc)
+            self.store_ctx.log_event(
+                _OWN_ORDER_DEBRIS_EVENT, exchange_order_id=str(order.orderId),
+                payload={**payload, 'cancelled': False, 'error': str(exc)})
+            return
+        logger.error(
+            "cTrader startup: working order %d (%s) carries this run's tag but no journal "
+            "row of the run tracks it; cancelled", order.orderId, order.clientOrderId)
+        self.store_ctx.log_event(
+            _OWN_ORDER_DEBRIS_EVENT, exchange_order_id=str(order.orderId),
+            payload={**payload, 'cancelled': True})
+
+    def _note_unlabelled_leg(self, position: 'OpenApiModelMessages.ProtoOAPosition') -> None:
+        """An untracked, unlabelled position on the run's symbol: ERROR + audit once."""
+        assert self.store_ctx is not None
+        ref = str(position.positionId)
+        if any(xoid == ref for _intent, _coid, xoid, _payload
+               in self.store_ctx.iter_events_by_kind_for_run_id(_UNLABELLED_LEG_EVENT)):
+            return
+        logger.error(
+            "cTrader startup: open position %d on the run's symbol carries no label and no "
+            "journal row of the run tracks it; none of the runs opened it, so it is not the "
+            "bot's, but whose it is cannot be told", position.positionId)
+        self.store_ctx.log_event(
+            _UNLABELLED_LEG_EVENT, exchange_order_id=ref,
+            payload={'position_id': position.positionId,
+                     'volume': position.tradeData.volume,
+                     'side': int(position.tradeData.tradeSide)})
 
     async def _recover_one_pending_row(
             self, row, orders_by_coid: 'dict[str, OpenApiModelMessages.ProtoOAOrder]',

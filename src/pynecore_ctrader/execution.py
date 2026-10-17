@@ -1051,16 +1051,19 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         a manual close: it claims fills of the close ``orderId`` the response
         names, and any closing fill on the position while the response is
         outstanding or its outcome unknown. A definitive reject or a pre-write
-        failure drops it; nothing was executed.
+        failure the venue provably refused (:func:`_write_refused`) drops it;
+        nothing was executed. Any other failure — a timeout, a drop after the
+        write, an unexpected response, a cancellation — may have executed the
+        close: its outcome is unknown.
         """
         record = self._open_own_close(req.positionId, volume_to_units(req.volume))
         try:
             event = await self._dispatch_order(req, coid=coid, context=context)
-        except (ExchangeOrderRejectedError, ExchangeConnectionError):
-            self._drop_own_close(record)
-            raise
-        except BaseException:
-            self._settle_own_close(record, None)
+        except BaseException as exc:
+            if _write_refused(exc):
+                self._drop_own_close(record)
+            else:
+                self._settle_own_close(record, None)
             raise
         answer_fill: _AnswerFill | None = None
         if event.HasField('deal') and event.deal.filledVolume > 0:
@@ -1076,10 +1079,9 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                       == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED))
         net = self._signed_share(req.positionId)
         if answer_fill is not None and net:
-            # The journal retires this close only once its event is translated,
-            # and then by the close net of its credit (already retired); the
-            # close takes the bot's net toward zero.
-            closed = max(0.0, answer_fill.closed - record.credit)
+            # The journal retires this close only once its event is
+            # translated; the close takes the bot's net toward zero.
+            closed = answer_fill.closed
             self._record_share_effect(
                 req.positionId, -closed if net > 0.0 else closed, counted=False,
                 executed_ms=answer_fill.executed_ms, deal_id=answer_fill.deal_id,
@@ -1505,12 +1507,15 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             req.limitPrice = round_price(intent.limit, rules.digits)
         elif intent.order_type is OrderType.STOP and intent.stop is not None:
             req.stopPrice = round_price(intent.stop, rules.digits)
+        terms_before = self._own_order_terms(order_id)
         sent = self._remember_amended_terms(order_id, req)
         self._begin_own_amend(order_id)
         try:
             answer = await self._dispatch_order(req, coid=coid, context="amend entry",
                                                 predecessor_cancel_ids=())
-        except BaseException:
+        except BaseException as exc:
+            if sent is not None and _write_refused(exc):
+                self._withdraw_own_order_terms(order_id, sent, terms_before)
             self._end_own_amend(order_id, None)
             raise
         self._end_own_amend(order_id, answer, sent=sent)
@@ -1649,25 +1654,19 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             if snapshot.trailing_stop is not None:
                 req.trailingStopLoss = True
             # The core fail-safe manager judges this position's levels and
-            # quarantines on an external edit itself; the plugin guard stays
-            # off it, before and after the write, so a concurrent exit amend
-            # cannot leave it judging the fail-safe's levels. A stale view of
-            # an own fill must not make the position bare meanwhile. A
-            # protection firing before the manager saw an edit is judged
-            # against the levels sent here. A refused write left the venue as
-            # it was: whatever guards the position then (its bare guard
-            # restored, a concurrent exit amend) keeps judging it.
-            try:
-                await self._write_unguarded_protection(
-                    req, position_id=position_id,
-                    coid=snapshot.parent_entry_dispatch_ref,
-                    context="native fail-safe SL",
-                )
-            except BaseException as exc:
-                if not _write_refused(exc):
-                    self._release_protection(position_id)
-                raise
-            self._release_protection(position_id)
+            # quarantines on an external edit itself; the plugin guard judges
+            # no view of it while the write is in flight and lets it go once
+            # the write landed or its outcome is unknown, a concurrent exit
+            # amend's levels included. A stale view of an own fill must not
+            # make the position bare meanwhile. A protection firing before
+            # the manager saw an edit is judged against the levels sent here.
+            # A refused write left the venue as it was: the guard holding the
+            # position (its bare guard restored) keeps judging it.
+            await self._write_unguarded_protection(
+                req, position_id=position_id,
+                coid=snapshot.parent_entry_dispatch_ref,
+                context="native fail-safe SL",
+            )
         self.store_ctx.log_event(
             'native_failsafe_sl_put',
             client_order_id=snapshot.parent_entry_dispatch_ref,

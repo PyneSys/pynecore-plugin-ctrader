@@ -261,6 +261,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: execution events to ``_exec_events`` (consumed by ``watch_orders``).
         self._spot_events: asyncio.Queue | None = None
         self._exec_events: asyncio.Queue | None = None
+        #: Engine events of closing fills an own close took while it was in
+        #: flight, released once it was answered and delivered by
+        #: ``watch_orders`` ahead of the next message. See
+        #: ``_ProtectionMixin._release_held_claims``.
+        self._released_close_events: 'deque[OrderEvent]' = deque()
         self._event_router_task: asyncio.Task | None = None
         #: Deal ids already surfaced to ``watch_orders``. A correlated fill the
         #: dispatch path re-injects (``send_request`` consumes the wire copy) and
@@ -328,7 +333,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: See ``_ProtectionMixin._flush_external_interventions``.
         self._deferred_interventions: list[
             tuple[str, dict, str | None, str | None, str]] = []
-        #: Positions a manual close was already reported for (once each).
+        #: Positions with a manual-close report queued and not handled yet:
+        #: one report covers every close of the position until the policy ran.
         self._external_close_reported: set[int] = set()
         #: Keys of the manual-close reports queued (by this process, or
         #: replayed from an earlier one) and not handled yet; venue writes wait
@@ -432,6 +438,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self._shrink_watch: dict[int, tuple[tuple[int, int], int]] = {}
         #: ``(position_id, (venue_cents, share_cents))`` shrinks already judged.
         self._shrink_judged: set[tuple[int, tuple[int, int]]] = set()
+        #: Venue time (ms) up to which a reconcile pass retired a position's
+        #: closes from the journal without an event of theirs, per position: a
+        #: closing-fill push executed earlier is a late copy of one of them.
+        #: See ``_ReconcileMixin._cover_closes``.
+        self._closes_covered_until: dict[int, int] = {}
         #: Positions a restart found shrunk below the journal share whose
         #: deals are not judged yet: this process's finding and those an
         #: earlier process of the run journalled and never judged. See

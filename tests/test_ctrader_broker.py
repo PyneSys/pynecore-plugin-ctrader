@@ -302,8 +302,15 @@ def __test_entry_reject_marks_rejected__(tmp_path):
                          qty=10.0, order_type=OrderType.MARKET)
     with pytest.raises(ExchangeOrderRejectedError):
         asyncio.run(broker.execute_entry(_envelope(intent)))
-    # Definitive reject — the persist-first row lands terminal.
-    assert _only_live_order(broker).state == 'rejected'
+    # Definitive reject — the persist-first row lands terminal and closed:
+    # nothing of it can reach the venue, so the run owns no live order.
+    assert list(broker.store_ctx.iter_live_orders()) == []
+    rows = broker.store_ctx._store._conn.execute(
+        "SELECT state, closed_ts_ms FROM orders",
+    ).fetchall()
+    assert [(row['state'], row['closed_ts_ms'] is not None) for row in rows] == [
+        ('rejected', True),
+    ]
 
 
 # === execute_exit / close: bracket + position close =======================
@@ -834,7 +841,7 @@ def __test_translate_partial_close_fill_foreign_coid_persists_no_row__(tmp_path)
     # ``_resolve_identity`` run-ownership isolation). The own-close record
     # marks the fill as this run's, not a manual close.
     broker._close_dispatch_pine_by_position[52695200] = 'pineL'
-    broker._open_own_close(52695200)
+    broker._settle_own_close(broker._open_own_close(52695200), 777)
 
     order = _make_order(order_id=777, executed=1000, position_id=52695200,
                         closing=True,
@@ -1004,6 +1011,32 @@ def _venue_bracket_close_event(*, position_id, order_id=70215164):
 def _ignored_external(broker) -> list:
     return list(broker.store_ctx.iter_events_by_kind_since(
         'external_activity_ignored', 0))
+
+
+@pytest.mark.parametrize('by', ['coid', 'label', 'foreign'])
+def __test_fill_of_an_own_order_without_a_row_is_an_error__(tmp_path, by):
+    """A fill of an order carrying the run's tag whose journal row was lost
+    cannot be booked, but it is the bot's own: ERROR + an audit of its own."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    run_tag = broker.store_ctx.run_tag
+    order = _make_order(order_id=555, executed=1000, position_id=58367450,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    if by == 'coid':
+        order.clientOrderId = f"{run_tag}-7rxpdapr-0mv9ub05c-e0"
+    elif by == 'label':
+        order.tradeData.label = run_tag
+    else:
+        order.clientOrderId = 'intruder-1'
+    event = _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+                        deal=_model.ProtoOADeal(dealId=4242, filledVolume=1000,
+                                                executionPrice=1.1))
+
+    assert broker._translate_exec_event(event) is None
+
+    own = _store_events(broker, 'ctrader_own_fill_untracked')
+    assert len(own) == (0 if by == 'foreign' else 1)
+    assert len(_ignored_external(broker)) == 1
 
 
 def __test_venue_bracket_close_attributes_to_owning_entry__(tmp_path):
@@ -3475,6 +3508,13 @@ def _close(broker, qty=10.0):
     return asyncio.run(broker.execute_close(_envelope(intent)))
 
 
+def _released(broker) -> list:
+    """The events of the close fills an own close's answer released, in order."""
+    events = list(broker._released_close_events)
+    broker._released_close_events.clear()
+    return events
+
+
 def __test_own_close_correlated_by_order_id_is_not_reported__(tmp_path):
     broker = _owned_broker(tmp_path)
     calls = _spy_quarantine(broker)
@@ -3509,10 +3549,13 @@ def __test_own_close_fill_before_the_response_is_not_reported__(tmp_path):
         order=_make_order(order_id=889, position_id=_PID, closing=True))
     _close(broker)
     broker.on_dispatch = None
+    assert seen == [None], "held until the close is answered"
+    seen = _released(broker)
     seen.append(broker._translate_exec_event(_closing_fill(
         order_id=889, closed_cents=1000, deal_id=9001)))
     broker._flush_external_interventions()
 
+    assert len(seen) == 2
     assert all(out is not None and out.leg_type is LegType.CLOSE for out in seen)
     assert calls == []
     assert broker._own_closes == []
@@ -4397,15 +4440,18 @@ def __test_fill_taken_for_an_own_close_but_of_another_order_is_reported__(tmp_pa
     async def foreign_fill_in_flight(_req):
         out = broker._translate_exec_event(_closing_fill(
             order_id=70700000, closed_cents=400, remaining_cents=600))
-        assert out is not None and out.leg_type is LegType.CLOSE
+        assert out is None, "held until the close is answered"
 
     broker.on_dispatch = foreign_fill_in_flight
     broker._canned_event = _exec_event(
         _model.ProtoOAExecutionType.ORDER_ACCEPTED,
         order=_make_order(order_id=889, position_id=_PID, closing=True))
     _close(broker, qty=4.0)
+    released = _released(broker)
     broker._flush_external_interventions()
 
+    assert len(released) == 1 and released[0].leg_type is LegType.CLOSE
+    assert released[0].fill_qty == pytest.approx(4.0)
     assert len(calls) == 1
     assert calls[0][1]['order_id'] == 70700000
     assert calls[0][1]['claimed_as_own'] is True
@@ -4754,6 +4800,103 @@ def __test_native_failsafe_leg_is_not_judged_while_a_write_is_in_flight__(tmp_pa
     assert seen[0] is not None and calls == []
 
 
+# === Native fail-safe write over the bot's own bracket ====================
+
+def _failsafe_failed_over_bracket(broker, failure: Exception):
+    """The native fail-safe write of SL 1.08 over the bot's SL 1.1 / TP 1.3
+    bracket fails with ``failure``."""
+    broker._raise_on_dispatch = failure
+    with pytest.raises(type(failure)):
+        _failsafe(broker)
+    broker._raise_on_dispatch = None
+    return broker
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['same-process', 'restarted'])
+def __test_stop_moved_after_a_refused_failsafe_over_the_bot_s_bracket_is_reported__(
+        tmp_path, restart):
+    """The venue refused the fail-safe write, so the bot's bracket stayed on
+    the position and stays guarded, across a restart too."""
+    broker = _failsafe_failed_over_bracket(_guarded_broker(tmp_path), _bad_stops_reject())
+    if restart:
+        broker = _restart(broker)
+    calls = _spy_quarantine(broker)
+
+    _set_venue(broker, sl=1.05, tp=1.3)
+    _snapshot_pass(broker)
+    _snapshot_pass(broker)
+
+    assert len(calls) == 1
+    assert calls[0][1]['observed'][0] == pytest.approx(1.05)
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['same-process', 'restarted'])
+def __test_moved_stop_firing_after_a_refused_failsafe_over_the_bot_s_bracket_is_reported__(
+        tmp_path, restart):
+    broker = _failsafe_failed_over_bracket(_guarded_broker(tmp_path), _bad_stops_reject())
+    if restart:
+        broker = _restart(broker)
+    calls = _spy_quarantine(broker)
+
+    out = broker._translate_exec_event(_sltp_fill(stop=1.05))
+    broker._flush_external_interventions()
+
+    assert out is not None and out.fill_qty == pytest.approx(10.0)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('restart_first', [False, True], ids=['same-process', 'restarted'])
+@pytest.mark.parametrize(('fired', 'reported'), [
+    ({'stop': 1.1}, 0),
+    ({'limit': 1.3}, 0),
+    ({'stop': 1.08}, 0),
+    ({'stop': 1.05}, 1),
+], ids=['bracket-stop', 'bracket-take-profit', 'failsafe-stop', 'foreign-stop'])
+def __test_protection_firing_after_an_unknown_failsafe_over_the_bot_s_bracket_is_judged__(
+        tmp_path, restart_first, fired, reported):
+    """The fail-safe write's outcome is unknown, so the venue carries either
+    the bot's bracket (known only from the journal after a restart) or the
+    fail-safe stop: a level of either firing is the bot's, any other is not."""
+    broker = _guarded_broker(tmp_path)
+    if restart_first:
+        broker = _restart(broker)
+    _failsafe_failed_over_bracket(broker, _unknown_amend())
+    calls = _spy_quarantine(broker)
+
+    broker._translate_exec_event(_sltp_fill(**fired))
+    broker._flush_external_interventions()
+
+    assert len(calls) == reported
+
+
+def __test_failsafe_levels_seen_while_its_write_is_in_flight_are_no_edit__(tmp_path):
+    """The fail-safe write lands before its answer arrives: snapshots and a
+    push showing its levels meanwhile are not judged against the bracket."""
+    broker = _HookedBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker._wire = object()
+    _set_venue(broker)
+    asyncio.run(broker.execute_exit(_envelope(ExitIntent(
+        pine_id="Exit", from_entry="L", symbol="EURUSD", side="sell", qty=10.0,
+        tp_price=1.3, sl_price=1.1))))
+    calls = _spy_quarantine(broker)
+
+    async def landed_before_the_answer(_req):
+        _set_venue(broker, sl=1.08)
+        for _ in range(3):
+            _ = [e async for e in broker._reconcile_snapshot()]
+        broker._translate_exec_event(_replaced_push(sl=1.08))
+
+    broker.on_dispatch = landed_before_the_answer
+    _failsafe(broker)
+    broker.on_dispatch = None
+    for _ in range(3):
+        _snapshot_pass(broker)
+
+    assert calls == []
+
+
 # === NETTING: the bot's share follows the side of its own net =============
 
 _SELL = _model.ProtoOATradeSide.SELL
@@ -4938,69 +5081,166 @@ def __test_netting_foreign_close_taken_for_an_own_close_is_not_booked_as_the_bot
     assert _store_events(broker, 'ctrader_close_claim_misbooked') == []
 
 
-def __test_netting_foreign_close_taken_for_a_refused_own_close_is_audited__(tmp_path):
-    """The own close was refused: the volume booked for it was the bot's share
-    the venue still holds. ERROR, an audit event and a write-blocking
-    quarantine, whatever the intervention policy is."""
-    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID, volume=4000))
-    _open_store(tmp_path, broker)
-    _seed_owned_entry(broker)
-    broker.store_ctx.upsert_order('c1', qty=20.0, filled_qty=20.0)
+@pytest.mark.parametrize('sink', ['working', 'missing', 'failing'])
+def __test_netting_foreign_close_taken_for_a_refused_own_close_is_rebooked__(tmp_path, sink):
+    """The bot holds 20 of 40 and closes 10; meanwhile the other party closes
+    exactly its own 20, and the bot's close is refused. That fill was the other
+    party's own business: the engine never books it, the journal keeps the
+    bot's 20, a WARNING and an audit event — no quarantine and no halt, with or
+    without a working sink."""
+    broker = _merged_broker(tmp_path, venue_cents=4000, share=20.0)
     calls = _spy_quarantine(broker)
+    if sink == 'missing':
+        broker.quarantine_sink = None
+    elif sink == 'failing':
+        def failing_sink(_reason, _context, *, kind):
+            raise RuntimeError(f"sink down ({kind})")
+
+        broker.quarantine_sink = failing_sink
+    seen: list = []
 
     async def foreign_fill_in_flight(_req):
-        broker._translate_exec_event(_closing_fill(
-            order_id=70700000, closed_cents=2000, remaining_cents=2000))
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=2000, remaining_cents=2000)))
         broker._raise_on_dispatch = _position_locked_reject()
 
     broker.on_dispatch = foreign_fill_in_flight
     broker.on_unexpected_cancel = 'ignore'
     with pytest.raises(OrderSkippedByPlugin):
         _close(broker, qty=10.0)
+    seen.extend(_released(broker))
     broker._flush_external_interventions()
 
-    assert len(calls) == 1
-    reason, context, kind = calls[0]
-    assert kind is QuarantineKind.EXTERNAL_INTERVENTION
-    assert context['position_id'] == _PID and context['volume'] == pytest.approx(10.0)
-    assert 'still holds them' in reason
-    audits = _store_events(broker, 'ctrader_close_claim_misbooked')
+    assert seen == [None]
+    assert calls == []
+    assert broker._own_share(_PID) == pytest.approx(20.0)
+    audits = _store_events(broker, 'ctrader_close_claim_rebooked')
+    assert len(audits) == 1 and audits[0]['volume'] == pytest.approx(10.0)
+    assert audits[0]['restored'] == pytest.approx(10.0)
+
+
+def __test_netting_foreign_close_taken_for_a_cancelled_own_close_is_rebooked__(tmp_path):
+    """The bot holds 20 of 40 and closes 10; meanwhile the other party closes
+    exactly its own 20, the venue accepts the bot's close and later cancels
+    it. Nothing of the bot's was closed: the engine never books the taken
+    fill, the journal keeps the bot's 20, and nothing is reported."""
+    broker = _merged_broker(tmp_path, venue_cents=4000, share=20.0)
+    calls = _spy_quarantine(broker)
+    seen: list = []
+
+    async def foreign_fill_in_flight(_req):
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=2000, remaining_cents=2000)))
+
+    broker.on_dispatch = foreign_fill_in_flight
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    _close(broker, qty=10.0)
+    broker.on_dispatch = None
+    seen.extend(_released(broker))
+    seen.append(broker._translate_exec_event(_exec_event(
+        _model.ProtoOAExecutionType.ORDER_CANCELLED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))))
+    broker._flush_external_interventions()
+
+    assert sum(event.fill_qty or 0.0 for event in seen if event is not None) == 0.0
+    assert calls == []
+    assert broker._own_share(_PID) == pytest.approx(20.0)
+    audits = _store_events(broker, 'ctrader_close_claim_rebooked')
     assert len(audits) == 1 and audits[0]['volume'] == pytest.approx(10.0)
 
 
-@pytest.mark.parametrize('sink', ['missing', 'failing'])
-def __test_netting_misbooked_refused_own_close_halts_without_a_working_sink__(
-        tmp_path, sink):
-    """The refused own close left volume the venue still holds booked as closed;
-    with no quarantine sink, or one that fails, the process-exiting halt must
-    take the quarantine's place."""
-    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID, volume=4000))
-    _open_store(tmp_path, broker)
-    _seed_owned_entry(broker)
-    broker.store_ctx.upsert_order('c1', qty=20.0, filled_qty=20.0)
-    if sink == 'missing':
-        broker.quarantine_sink = None
-    else:
-        def failing_sink(_reason, _context, *, kind):
-            raise RuntimeError(f"sink down ({kind})")
-
-        broker.quarantine_sink = failing_sink
+def __test_netting_refused_close_of_the_whole_share_keeps_the_position_guarded__(tmp_path):
+    """The bot holds 10 of 20 under its own bracket and closes its 10; the other
+    party closes its own 10 meanwhile and the bot's close is refused. The bot
+    still holds its 10: the fill taken for the close must not have vacated the
+    position, so its protection stays guarded and a foreign stop move is
+    reported."""
+    broker = _merged_broker(tmp_path, venue_cents=2000, share=10.0)
+    broker._wire = object()
+    asyncio.run(broker.execute_exit(_envelope(ExitIntent(
+        pine_id="Exit", from_entry="L", symbol="EURUSD", side="sell", qty=10.0,
+        tp_price=1.3, sl_price=1.1))))
+    broker._reconcile_res = _open_eurusd_position(position_id=_PID, volume=2000)
+    calls = _spy_quarantine(broker)
 
     async def foreign_fill_in_flight(_req):
         broker._translate_exec_event(_closing_fill(
-            order_id=70700000, closed_cents=2000, remaining_cents=2000))
+            order_id=70700000, closed_cents=1000, remaining_cents=1000))
         broker._raise_on_dispatch = _position_locked_reject()
 
     broker.on_dispatch = foreign_fill_in_flight
-    broker.on_unexpected_cancel = 'ignore'
-    with pytest.raises(BrokerManualInterventionError) as raised:
+    with pytest.raises(OrderSkippedByPlugin):
         _close(broker, qty=10.0)
+    broker.on_dispatch = None
+    broker._raise_on_dispatch = None
+    assert _released(broker) == []
+    broker._flush_external_interventions()
 
-    assert raised.value.context['position_id'] == _PID
-    assert raised.value.context['volume'] == pytest.approx(10.0)
-    assert 'still holds them' in raised.value.reason
-    audits = _store_events(broker, 'ctrader_close_claim_misbooked')
-    assert len(audits) == 1 and audits[0]['volume'] == pytest.approx(10.0)
+    assert calls == []
+    assert broker._own_share(_PID) == pytest.approx(10.0)
+    assert broker._protection_guard().known(f"position:{_PID}")
+    broker._translate_exec_event(_replaced_push(sl=1.05, tp=1.3))
+    broker._translate_exec_event(_replaced_push(sl=1.05, tp=1.3))
+    assert len(calls) == 1 and 'protection_key' in calls[0][1]
+
+
+def __test_released_close_fill_is_yielded_before_the_next_message_and_its_report__(tmp_path):
+    """A foreign close takes 4 of the bot's 10 while the bot's close is in
+    flight. Once the answer names the bot's order, the held fill is yielded
+    first, ahead of the close's own fill already queued, and only then is the
+    report handled."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    broker.on_unexpected_cancel = 'halt'
+    broker._exec_events = asyncio.Queue()
+    own_fill = _closing_fill(order_id=889, closed_cents=400, remaining_cents=200)
+
+    async def foreign_fill_in_flight(_req):
+        assert broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=400, remaining_cents=600)) is None
+        broker._exec_events.put_nowait(own_fill)
+
+    broker.on_dispatch = foreign_fill_in_flight
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    _close(broker, qty=4.0)
+
+    async def run():
+        agen = broker.watch_orders()
+        try:
+            first = await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+            with pytest.raises(UnexpectedCancelError):
+                await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+            return first
+        finally:
+            await agen.aclose()
+
+    first = asyncio.run(run())
+    assert first.order.id == '70700000' and first.fill_qty == pytest.approx(4.0)
+
+
+def __test_own_close_failing_on_an_unexpected_response_has_an_unknown_outcome__(tmp_path):
+    """An unexpected response is no proof the close was refused: it may have
+    executed, so a closing fill that follows is claimed and audited, never
+    reported as a manual close."""
+    broker = _owned_broker(tmp_path)
+    calls = _spy_quarantine(broker)
+    broker._raise_on_dispatch = ExchangeOrderRejectedError(
+        "cTrader close: unexpected response ProtoOAErrorRes")
+    with pytest.raises(ExchangeOrderRejectedError):
+        _close(broker)
+    broker._raise_on_dispatch = None
+
+    out = broker._translate_exec_event(_closing_fill(order_id=892))
+    broker._flush_external_interventions()
+
+    assert out is not None and out.leg_type is LegType.CLOSE
+    assert calls == []
+    assert len(_store_events(broker, 'ctrader_close_claim_ambiguous')) == 1
 
 
 @pytest.mark.parametrize('own_fill_before_answer', [False, True])
@@ -5032,6 +5272,7 @@ def __test_netting_own_full_close_with_a_foreign_close_taken_for_it_books_the_sh
         order=_make_order(order_id=888, position_id=_PID, closing=True))
     _close(broker, qty=10.0)
     broker.on_dispatch = None
+    seen.extend(_released(broker))
     if not own_fill_before_answer:
         own_fill()
     broker._flush_external_interventions()
@@ -5073,6 +5314,7 @@ def _close_with_a_foreign_push_first(broker, *, own_cents, own_ms, own_remaining
         cents=own_cents, executed_ms=own_ms, remaining_cents=own_remaining)
     _close(broker, qty=own_cents / 100)
     broker.on_dispatch = None
+    seen.extend(_released(broker))
     seen.append(broker._translate_exec_event(broker._canned_event))
     broker._flush_external_interventions()
     return seen
@@ -5148,6 +5390,7 @@ def __test_netting_venue_stop_after_an_own_full_close_executed_books_only_the_sh
         cents=1000, executed_ms=1_000, remaining_cents=500)
     _close(broker, qty=10.0)
     broker.on_dispatch = None
+    seen.extend(_released(broker))
     seen.append(broker._translate_exec_event(broker._canned_event))
     broker._flush_external_interventions()
 
@@ -5177,6 +5420,7 @@ def __test_netting_close_before_the_own_answer_fill_is_translated_sees_the_true_
         cents=1000, executed_ms=1_000, remaining_cents=2000)
     _close(broker, qty=10.0)
     broker.on_dispatch = None
+    seen.extend(_released(broker))
     later = _closing_fill(order_id=70800000, closed_cents=500, remaining_cents=500)
     later.deal.executionTimestamp = 3_000
     seen.append(broker._translate_exec_event(later))
@@ -5389,15 +5633,17 @@ def __test_netting_close_taken_for_an_own_close_of_an_unknown_share_is_audited__
     async def foreign_fill_in_flight(_req):
         out = broker._translate_exec_event(_closing_fill(
             order_id=70700000, closed_cents=400, remaining_cents=1100))
-        assert out is not None and out.leg_type is LegType.CLOSE
+        assert out is None, "held until the close is answered"
 
     broker.on_dispatch = foreign_fill_in_flight
     broker._canned_event = _exec_event(
         _model.ProtoOAExecutionType.ORDER_ACCEPTED,
         order=_make_order(order_id=889, position_id=_PID, closing=True))
     _close(broker, qty=4.0)
+    released = _released(broker)
     broker._flush_external_interventions()
 
+    assert len(released) == 1 and released[0].leg_type is LegType.CLOSE
     assert calls == []
     audits = _store_events(broker, 'ctrader_close_share_unknown')
     assert len(audits) == 1 and audits[0]['order_id'] == 70700000
@@ -5567,6 +5813,35 @@ def _apply_resume(broker, resume_ts_ms: int) -> None:
     uses its guard."""
     rebaseline_after_resume(broker.store_ctx)
     broker.operator_resume_ts_ms = resume_ts_ms
+
+
+def __test_foreign_edit_pushed_before_the_first_pass_after_a_resume_is_reported__(tmp_path):
+    """After an operator resume the venue as it stands is the new baseline.
+    Someone moves the stop right after the stream starts: the pushes of that
+    edit, queued before any reconcile pass, are judged against the snapshot
+    the stream took first, never taken as the baseline themselves."""
+    broker = _guarded_broker(tmp_path, sl=1.1, tp=1.3)
+    restarted = _restart(broker)
+    _set_venue(restarted, sl=1.1, tp=1.3)
+    _apply_resume(restarted, int(time.time() * 1000) - 1)
+    calls = _spy_quarantine(restarted)
+
+    async def start_stream():
+        restarted._exec_events = asyncio.Queue()
+        restarted._exec_events.put_nowait(_replaced_push(sl=1.05, tp=1.3))
+        restarted._exec_events.put_nowait(_replaced_push(sl=1.05, tp=1.3))
+        agen = restarted.watch_orders()
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(agen.__anext__(), timeout=0.05)
+        finally:
+            await agen.aclose()
+
+    asyncio.run(start_stream())
+
+    assert len(calls) == 1
+    assert calls[0][1]['expected'][:2] == pytest.approx([1.1, 1.3])
+    assert calls[0][1]['observed'][:2] == pytest.approx([1.05, 1.3])
 
 
 def __test_protection_firing_on_a_bare_position_after_a_restart_is_reported__(tmp_path):
@@ -5819,6 +6094,29 @@ def __test_foreign_amend_pushed_while_an_own_amend_is_in_flight_is_reported_afte
 
     assert len(calls) == 1
     assert calls[0][1]['observed'][0] == pytest.approx(1.15)
+
+
+@pytest.mark.parametrize('refused', [True, False])
+def __test_terms_of_a_refused_own_amend_are_not_the_bot_s__(tmp_path, refused):
+    """The venue refused the amend: the order never carried its terms by the
+    bot's hand, so someone else's edit to exactly them is reported. An amend
+    of unknown outcome may have applied: its terms stay the bot's."""
+    broker = _HookedBroker()
+    _open_store(tmp_path, broker)
+    _dispatch_limit_entry(broker)
+    calls = _spy_quarantine(broker)
+    broker._raise_on_dispatch = (_position_locked_reject() if refused else
+                                 OrderDispositionUnknownError("timed out", client_order_id="x"))
+    with pytest.raises((ExchangeOrderRejectedError, OrderDispositionUnknownError)):
+        _modify_long(broker, limit=1.18)
+    broker._raise_on_dispatch = None
+
+    broker._translate_exec_event(_replaced_entry(limit=1.18))
+    broker._flush_external_interventions()
+
+    assert len(calls) == (1 if refused else 0)
+    broker._translate_exec_event(_replaced_entry(limit=1.2))
+    assert len(calls) == (1 if refused else 0)
 
 
 def __test_own_amend_echo_pushed_while_it_is_in_flight_is_never_reported__(tmp_path):

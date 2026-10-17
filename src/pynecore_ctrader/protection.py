@@ -110,14 +110,18 @@ record), a HEDGED position still has one owner and an external close is booked
 and reported in full; on a NETTING account nothing proves the close took the
 bot's part, so it is booked as the venue shows it, with an ERROR and an audit
 event, never reported. A fill an own close took before its order id was known
-is booked for at most the volume the close asked for. Once the answer
-names the close order, the fills taken are judged again in the order they were
-taken, each against the share of its moment — less the answer's own fill when
-that executed first but is translated later; one that shows to be another
-order's is reported only for the part of the share it took, and what it booked
-beyond that becomes the close's credit: the close's own fills are booked net of
-it, against a share that much larger than the journal's, so the engine ends
-with what the venue did.
+is booked for at most the volume the close asked for, and its event is held
+until the close is answered. Once the answer names the close order, or the
+venue refused the close, the fills taken are judged again in the order they
+were taken, each against the share of its moment — less the answer's own fill
+when that executed first but is translated later; one that shows to be another
+order's is reported only for the part of the share it took. What it booked
+beyond that was never the bot's close (another party closed its own
+exposure): its held event is delivered without that volume and the journal
+gets it back, with a WARNING and an audit event, so the engine and the journal
+end with what the venue did — whether the close fills later, is cancelled or
+was refused. A close whose outcome stays unknown delivers the held events as
+they were booked.
 
 ``ProtoOAClosePositionReq`` carries no client-order-id or label, so the own
 close can only be recognised from this run's dispatch record.
@@ -189,7 +193,7 @@ import time
 import uuid
 from abc import ABC
 from collections.abc import Callable, Container, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from time import time as epoch_time
 from typing import TYPE_CHECKING, cast
@@ -200,13 +204,12 @@ from pynecore.core.broker.disappearance import (
 )
 from pynecore.core.broker.exceptions import (
     BrokerError,
-    BrokerManualInterventionError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     UnexpectedCancelError,
     VenueWritesQuarantinedError,
 )
-from pynecore.core.broker.models import CANCEL_REASON_VENUE_REJECTED, QuarantineKind
+from pynecore.core.broker.models import CANCEL_REASON_VENUE_REJECTED, OrderEvent
 from pynecore.core.broker.protection_guard import (
     PROTECTION_LEVELS_EXTRA,
     ProtectionLevelGuard,
@@ -303,9 +306,10 @@ _CLOSE_UNATTRIBUTED_EVENT = 'ctrader_close_unattributed'
 #: Audit of a close of the bot's position an operator resume accepted.
 _CLOSE_ACCEPTED_BY_RESUME_EVENT = 'ctrader_close_accepted_by_resume'
 
-#: Audit of volume booked as the bot's own close that the bot's share did not
-#: lose: the engine shows less than the venue still holds of the bot's.
-_CLOSE_MISBOOKED_EVENT = 'ctrader_close_claim_misbooked'
+#: Audit of volume a fill taken for the bot's own close booked although the
+#: bot's share did not lose it: taken off the fill's held event and given back
+#: to the journal.
+_CLAIM_REBOOKED_EVENT = 'ctrader_close_claim_rebooked'
 
 #: Audit of a NETTING close of a position whose bot share is not known: it is
 #: booked as the venue shows it, nothing proves it took the bot's part.
@@ -362,6 +366,10 @@ _ENTRY_ROW_STATES = frozenset({
 
 _STOP_LOSS_TAKE_PROFIT = OpenApiModelMessages.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT
 
+#: Put on the execution queue when held close fills are released, so the
+#: order-event stream wakes and delivers them; translates to nothing.
+_RELEASE_WAKEUP = object()
+
 
 class CloseOrigin(StrEnum):
     """Who caused a closing fill on a run-owned position."""
@@ -372,13 +380,16 @@ class CloseOrigin(StrEnum):
     #: proves another client sent it either (a server-initiated close looks
     #: the same in the order history); never reported.
     UNATTRIBUTED = 'unattributed'
-    #: The venue reports the closing order as not found; never reported.
+    #: The venue reports the closing order as not found; never reported, but
+    #: a recovered close of it that took the bot's share is logged as an
+    #: ERROR and audited like an unattributed one.
     UNKNOWN = 'unknown'
 
 
-#: Origins of a close that is not the bot's and takes the bot's share only
-#: where it left the venue below that share.
-_FOREIGN_ORIGINS = frozenset({CloseOrigin.EXTERNAL, CloseOrigin.UNATTRIBUTED})
+#: Origins of a close that is not proven the bot's and takes the bot's share
+#: only where it left the venue below that share.
+_FOREIGN_ORIGINS = frozenset({
+    CloseOrigin.EXTERNAL, CloseOrigin.UNATTRIBUTED, CloseOrigin.UNKNOWN})
 
 
 class FiredProtection(StrEnum):
@@ -421,6 +432,12 @@ class _ClaimedFill:
         close, as what it took of the share.
     :ivar venue: Whether the fill is the venue's own close (SL / TP, stop-out,
         server-initiated), never the bot's close nor reported.
+    :ivar event: The fill's engine event, held while the close is in flight
+        (:meth:`_ProtectionMixin._release_held_claims`); ``None`` once
+        delivered, or when nothing was booked.
+    :ivar settles_share: The fill left the position open, so the bot's share
+        is checked once the event is delivered (a share it no longer holds
+        vacates the position).
     """
     order_id: int
     deal_id: int | None
@@ -435,6 +452,8 @@ class _ClaimedFill:
     venue_after: float
     booked: float = 0.0
     venue: bool = False
+    event: OrderEvent | None = None
+    settles_share: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,10 +484,6 @@ class _OwnClose:
     :ivar claims: Fills taken for this close before its order id was known.
     :ivar volume: The volume (units) the close asked for; ``None`` when not
         known (a close an earlier process sent).
-    :ivar credit: Volume (units) booked as the bot's own close — and retired
-        from the journal — that the bot's share did not lose: fills taken for
-        this close that turned out to be other orders'. Taken off the close's
-        own fills.
     :ivar from_entry: The Pine entry the close serves, so its own fills are
         attributed even after the journal closed the position's rows.
     :ivar executed: Volume (units) of the close's own fills seen by its order
@@ -486,7 +501,6 @@ class _OwnClose:
     key: str = field(default_factory=lambda: uuid.uuid4().hex)
     claims: list[_ClaimedFill] = field(default_factory=list)
     volume: float | None = None
-    credit: float = 0.0
     from_entry: str | None = None
     executed: float = 0.0
     executed_deals: set[int] = field(default_factory=set)
@@ -793,7 +807,7 @@ def _replay_share_closes(
 
 
 def _foreign_claims_taken(
-        claims: Sequence[_ClaimedFill], own_orders: Container[int], credit: float,
+        claims: Sequence[_ClaimedFill], own_orders: Container[int],
 ) -> tuple[float, float]:
     """What the fills an own close took that were not its own took of the bot's share.
 
@@ -807,11 +821,10 @@ def _foreign_claims_taken(
 
     :param claims: The fills the close took, in the order it took them.
     :param own_orders: The orders taken as the bot's own close.
-    :param credit: The close's credit before the first claim.
     :return: ``(low, high)``: the part of the share the other orders' fills
         provably took, and the most they may have taken.
     """
-    taken_low = taken_high = 0.0
+    taken_low = taken_high = credit = 0.0
     for claim in claims:
         if not claim.venue and claim.order_id in own_orders:
             if claim.share_high is not None:
@@ -1079,24 +1092,34 @@ class _ProtectionMixin(_CTraderBase, ABC):
 
         The native fail-safe (whose levels the core fail-safe manager judges)
         and a trailing stop without an anchor (whose stop the venue seeds)
-        write outside the guard: the guard is released before the write, and
-        the position is never bare after it. The levels the write sends are
-        still the bot's (the seeded stop is left open): a protection firing on
-        the position is judged against them (:meth:`_fired_protection`) once
-        one such write landed in this process, which makes the venue's
-        protection one the bot wrote. A write that fails on a position the bot
-        left bare keeps the bot's protection judged
-        (:meth:`_unguarded_write_failed`).
+        write outside the guard, and the position is never bare while such a
+        write is in flight or after it landed. The guard keeps what it holds
+        until the venue answered, but judges no view of the position
+        meanwhile; it is released once the write landed or its outcome is
+        unknown. The levels the write sends are still the bot's (the seeded
+        stop is left open): a protection firing on the position is judged
+        against them (:meth:`_fired_protection`) once one such write landed in
+        this process, which makes the venue's protection one the bot wrote. A
+        write whose outcome is unknown leaves the venue with either the
+        protection the bot knew it carried before (guarded, bare, or written
+        by an earlier landed write outside the guard) or the levels it sent,
+        so the position is judged the same way then; without such knowledge
+        nothing is judged. A refused write left the venue as it was: the
+        position is guarded (or bare) as before (:meth:`_unguarded_write_refused`).
         """
         key = protection_key(position_id)
+        guard = self._protection_guard()
         was_bare = self._is_bare(position_id)
+        was_unguarded = position_id in self._unguarded_protection
+        was_baseline = position_id in self._unguarded_baseline
+        venue_known = was_bare or was_baseline or (guard.known(key) and (
+                key in self._protection_baselined or not self._protection_in_flight.get(key)))
         levels = ProtectionLevels(
             stop=req.stopLoss if req.HasField('stopLoss') else None,
             limit=req.takeProfit if req.HasField('takeProfit') else None,
             trailing=req.HasField('trailingStopLoss') and req.trailingStopLoss)
         new_levels = levels not in self._own_protection_levels.get(key, ())
         self._unmark_bare(position_id)
-        self._release_protection(position_id)
         self._unguarded_protection.add(position_id)
         self._remember_own_levels(key, levels)
         self._begin_unguarded_write(position_id)
@@ -1106,47 +1129,55 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 predecessor_cancel_ids=predecessor_cancel_ids)
         except BaseException as exc:
             self._end_unguarded_write(position_id)
-            if was_bare:
-                self._unguarded_write_failed(
-                    position_id, levels if new_levels else None, refused=_write_refused(exc))
+            if _write_refused(exc):
+                self._unguarded_write_refused(
+                    position_id, levels if new_levels else None, was_bare=was_bare,
+                    was_unguarded=was_unguarded, was_baseline=was_baseline)
+            else:
+                self._release_protection(position_id)
+                if venue_known and position_id in self._unguarded_protection:
+                    self._unguarded_baseline.add(position_id)
             raise
         self._end_unguarded_write(position_id)
+        self._release_protection(position_id)
         self._unguarded_baseline.add(position_id)
         return event
 
-    def _unguarded_write_failed(
-            self, position_id: int, new_levels: ProtectionLevels | None, *, refused: bool,
+    def _unguarded_write_refused(
+            self, position_id: int, new_levels: ProtectionLevels | None, *,
+            was_bare: bool, was_unguarded: bool, was_baseline: bool,
     ) -> None:
-        """An unguarded protection write of a position the bot left bare failed.
+        """The venue refused an unguarded protection write: it left the venue as it was.
 
-        A refused write left the venue as it was: the position is bare again,
-        and the levels the write sent are not the bot's. A write whose outcome
-        is unknown may have landed: the venue carries either no protection or
-        the levels the write sent, so a protection firing on the position is
-        judged against those (:meth:`_fired_protection`). Nothing is restored
-        once the position is no longer the one the write left: vacated or
-        cleared meanwhile, guarded by a newer own write, or with another own
-        write of it in flight or landed outside the guard.
+        The guard kept what it held through the write, so it judges the
+        position on; the levels the write sent are not the bot's, the
+        position is written outside the guard only if it was before, and bare
+        again if the bot had left it bare. Nothing is restored once the
+        position is no longer the one the write left: vacated or cleared
+        meanwhile, guarded by a newer own write, or with another own write of
+        it in flight or landed outside the guard.
 
         :param new_levels: The levels the write sent, when no earlier own
             write had set them.
+        :param was_bare: The bot had left the position bare before the write.
+        :param was_unguarded: The position was written outside the guard before.
+        :param was_baseline: A write outside the guard had landed on the
+            position before.
         """
         key = protection_key(position_id)
         if (position_id not in self._unguarded_protection
-                or position_id in self._unguarded_baseline
-                or self._protection_guard().known(key)
+                or (position_id in self._unguarded_baseline and not was_baseline)
                 or self._protection_in_flight.get(key)
                 or self._unguarded_in_flight.get(position_id)):
-            return
-        if not refused:
-            self._unguarded_baseline.add(position_id)
             return
         if new_levels is not None:
             known = self._own_protection_levels.get(key)
             if known is not None and new_levels in known:
                 known.remove(new_levels)
-        self._unguarded_protection.discard(position_id)
-        self._mark_bare(position_id)
+        if not was_unguarded:
+            self._unguarded_protection.discard(position_id)
+        if was_bare:
+            self._mark_bare(position_id)
 
     def _end_protection_write(self, key: str) -> None:
         """One write of ``key`` got its answer (or lost it)."""
@@ -1183,11 +1214,14 @@ class _ProtectionMixin(_CTraderBase, ABC):
         """Stop guarding a position's protection (gone, vacated, written outside the guard).
 
         The levels the bot set on the position stay its own for judging a
-        protection that fires (:meth:`_own_levels`): the venue may still carry
-        them while a write that replaces them is in flight or was refused.
-        They are forgotten with the position (:meth:`_vacate_position`).
+        protection that fires (:meth:`_own_levels`), the ones only the
+        journal held included: the venue may still carry them while a write
+        that replaces them is in flight or its outcome is unknown. They are
+        forgotten with the position (:meth:`_vacate_position`).
         """
         key = protection_key(position_id)
+        for levels in self._own_levels(key, position_id):
+            self._remember_own_levels(key, levels)
         self._protection_guard().forget(key)
         self._protection_baselined.discard(key)
         self._last_venue_protection.pop(key, None)
@@ -1246,7 +1280,8 @@ class _ProtectionMixin(_CTraderBase, ABC):
         levels = self._venue_protection(position)
         self._last_venue_protection[key] = levels
         tick = self._cached_tick(position.tradeData.symbolId)
-        if tick is None or position_id in self._fill_views_deferred:
+        if (tick is None or position_id in self._fill_views_deferred
+                or self._unguarded_in_flight.get(position_id)):
             return
         guard.observe(key, levels, tick=tick)
 
@@ -1322,6 +1357,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
                         for own in self._own_levels(key, position_id))
         if (not may_have_changed and not explained and read_started_at is None
                 and not self._protection_in_flight.get(key)
+                and not self._unguarded_in_flight.get(position_id)
                 and tick is not None and position_id not in self._fill_views_deferred):
             # The fill left the protection as it was and no own write explains
             # these levels: someone else set them, the view is judged.
@@ -1394,9 +1430,38 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 continue
             levels = self._venue_protection(position)
             self._last_venue_protection[key] = levels
-            if tick is None:
+            if tick is None or self._unguarded_in_flight.get(position_id):
                 continue
             guard.observe(key, levels, tick=tick, read_started_at=read_started_at)
+
+    async def _observe_resume_baseline(self) -> None:
+        """Take the venue as the operator left it right after a resume.
+
+        An operator resume makes the next observation of every guarded key
+        its new baseline (:func:`rebaseline_after_resume`). Pushes queue from
+        the moment the connection opens, so waiting for the first reconcile
+        pass would let an edit someone makes in between become that baseline;
+        a snapshot read before the stream judges any push closes the window.
+        A no-op unless a resume flagged a persisted protection; a failed read
+        leaves the push / reconcile path to set the baseline (WARNING).
+        """
+        if self.store_ctx is None or not any(
+                isinstance(saved := (row.extras or {}).get(PROTECTION_LEVELS_EXTRA), dict)
+                and saved.get('rebaseline')
+                for row in self.store_ctx.iter_live_orders()):
+            return
+        read_started_at = epoch_time()
+        try:
+            res = await self._reconcile()
+        except (BrokerError, CTraderWireError, TimeoutError) as exc:
+            logger.warning(
+                "cTrader: the resume baseline snapshot failed (the next view sets it): %s", exc)
+            return
+        await self._observe_protection_snapshot(
+            {position.positionId: position for position in res.position
+             if position.positionStatus
+             == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN},
+            read_started_at=read_started_at, filled_positions=set())
 
     def _read_predates_own_write(self, position_id: int, read_started_at: float) -> bool:
         """Whether a snapshot read may show a position before an own protection write of it."""
@@ -2297,6 +2362,19 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 and not position.HasField('stopLoss') and not position.HasField('takeProfit')
                 and position.positionId not in self._unguarded_protection)
 
+    def _is_run_client_order_id(self, coid: str) -> bool:
+        """Whether a client-order-id is one this run sent.
+
+        A journal row of this run instance names it, or it carries the run's
+        tag: a row an earlier process of the run closed belongs to that
+        process's instance, which this process's lookups do not see.
+        """
+        store = self.store_ctx
+        if store is None or not coid:
+            return False
+        return (store.get_order(coid) is not None
+                or coid.startswith(f"{store.run_tag}-"))
+
     def _is_own_entry_order(self, order_id: int) -> bool:
         """Whether an order is one of this run's entry orders."""
         return (self.store_ctx is not None and bool(order_id)
@@ -2330,12 +2408,13 @@ class _ProtectionMixin(_CTraderBase, ABC):
         The answer's order id is authoritative: the fills taken for the close
         before the answer are judged again in the order they were taken
         (:meth:`_rejudge_claims`). One the answer shows to be another order's
-        is judged as the close it is; the volume booked for it that the bot's
-        share did not lose becomes the close's credit, which the close's later
-        fills are booked net of. Without an order id the outcome is unknown,
-        and every fill the close took may be someone else's. Until its fills
-        account for the volume it asked for, the close may have executed
-        unseen (:meth:`_OwnClose.unresolved`).
+        is judged as the close it is; what it booked that the bot's share did
+        not lose comes off its held event and back to the journal
+        (:meth:`_release_held_claims`). Without an order id the outcome is
+        unknown, and every fill the close took may be someone else's: their
+        events are delivered as booked. Until its fills account for the volume
+        it asked for, the close may have executed unseen
+        (:meth:`_OwnClose.unresolved`).
 
         :param answer_fill: The fill the answer carried, when it carried one.
         :param complete: Whether the answer is the close order's final fill.
@@ -2346,12 +2425,15 @@ class _ProtectionMixin(_CTraderBase, ABC):
         record.answered_ms = int(epoch_time() * 1000)
         record.complete = record.complete or complete
         self._journal_own_close(record)
+        claims = list(record.claims)
         if record.order_id is None:
-            for claim in record.claims:
+            for claim in claims:
                 if not claim.venue:
                     self._flag_ambiguous_claim(record, claim)
+            self._release_held_claims(record, claims)
             return
-        self._rejudge_claims(record, answer_fill)
+        cuts = self._rejudge_claims(record, answer_fill)
+        self._release_held_claims(record, claims, cuts)
         if answer_fill is not None and not any(
                 claim.deal_id == answer_fill.deal_id for claim in record.claims):
             record.count_executed(answer_fill.deal_id, answer_fill.closed)
@@ -2359,23 +2441,25 @@ class _ProtectionMixin(_CTraderBase, ABC):
             record.complete = True
             if record in self._own_closes:
                 self._own_closes.remove(record)
-            self._flag_misbooked(record)
 
     def _drop_own_close(self, record: _OwnClose) -> None:
-        """The close was provably not executed: every fill it took was someone else's.
+        """The venue refused the close: every fill it took was someone else's.
 
-        Whatever was booked for them that the bot's share did not lose stays
-        booked as closed while the venue still holds it: ERROR + audit.
+        They are judged like the fills of an answered close
+        (:meth:`_rejudge_claims`); what they booked that the bot's share did
+        not lose comes off their held events and back to the journal.
         """
         if record in self._own_closes:
             self._own_closes.remove(record)
         if record in self._own_close_history:
             self._own_close_history.remove(record)
         self._journal_own_close(record, refused=True)
-        self._rejudge_claims(record, None)
-        self._flag_misbooked(record)
+        claims = list(record.claims)
+        self._release_held_claims(record, claims, self._rejudge_claims(record, None))
 
-    def _rejudge_claims(self, record: _OwnClose, answer_fill: _AnswerFill | None) -> None:
+    def _rejudge_claims(
+            self, record: _OwnClose, answer_fill: _AnswerFill | None,
+    ) -> list[tuple[_ClaimedFill, float]]:
         """Judge the fills an own close took before its order id was known.
 
         The claims are walked in the order they were taken, keeping the
@@ -2400,9 +2484,13 @@ class _ProtectionMixin(_CTraderBase, ABC):
         (no order of its own) has none of its own.
 
         :param answer_fill: The fill the answer carried, when it carried one.
+        :return: The volume to take off each claim's held event: the credit at
+            the end, over the claims that booked beyond the share they took,
+            in the order they were taken.
         """
-        credit = record.credit
+        credit = 0.0
         own: list[_ClaimedFill] = []
+        excess: list[tuple[_ClaimedFill, float]] = []
         ahead = answer_fill
         if ahead is not None and any(claim.deal_id == ahead.deal_id for claim in record.claims):
             ahead = None
@@ -2433,60 +2521,126 @@ class _ProtectionMixin(_CTraderBase, ABC):
             else:
                 taken = self._rejudge_claim(record.position_id, claim, share)
             credit += claim.booked - taken
+            if claim.booked - taken > _VOLUME_TOL:
+                excess.append((claim, claim.booked - taken))
         record.claims = own
-        record.credit = max(0.0, credit)
+        cuts: list[tuple[_ClaimedFill, float]] = []
+        left = max(0.0, credit)
+        for claim, extra in excess:
+            cut = min(extra, left)
+            if cut > _VOLUME_TOL:
+                cuts.append((claim, cut))
+                left -= cut
+        return cuts
 
-    def _absorb_close_credit(self, record: _OwnClose, booked: float, *, terminal: bool) -> float:
-        """Take the close's credit off one of its own fills; the volume left to book."""
-        taken = min(booked, record.credit)
-        record.credit -= taken
-        if terminal:
-            self._flag_misbooked(record)
-        return booked - taken
+    def _release_held_claims(
+            self, record: _OwnClose, claims: Sequence[_ClaimedFill],
+            cuts: Sequence[tuple[_ClaimedFill, float]] = (),
+    ) -> None:
+        """Deliver the events of the fills an own close took while it was in flight.
 
-    def _flag_misbooked(self, record: _OwnClose) -> None:
-        """Credit no fill of the close will take off any more: ERROR + audit + quarantine.
+        Each event goes to the order-event stream, in the order the fills were
+        taken, ahead of anything the stream receives later (the close's own
+        answer fill included). A cut is volume a fill booked as the bot's close
+        that the bot's share did not lose — another party closed its own
+        exposure: it comes off the fill's event, so the engine never books it,
+        and the journal gets it back (:meth:`_restore_retired_exposure`). That
+        is the bot's own misattribution corrected, not an intervention: a
+        WARNING and an audit event, never a report. The share check a held
+        partial close skipped runs once its event is delivered.
 
-        That volume was booked as the bot's own close, yet the venue still
-        holds it as the bot's share; the engine shows less than the venue. No
-        reconcile restores that ownership, so a later exit would close less
-        than the bot holds and leave the rest unowned on the venue. The
-        quarantine is latched whatever the intervention policy is, with no
-        venue write allowed: it is persisted, and only the operator resume
-        (after the operator settled the venue-held volume) clears it. Without
-        a quarantine sink, or when the sink fails, the process-exiting halt
-        takes its place.
-
-        :raises BrokerManualInterventionError: When no quarantine sink could
-            latch the quarantine.
+        :param claims: The fills the close took, as they were before judging.
+        :param cuts: The volume to take off each claim's event.
         """
-        volume, record.credit = record.credit, 0.0
-        if volume <= _VOLUME_TOL:
-            return
-        reason = (
-            f"{volume} units of bot position {record.position_id} were booked as closed by "
-            f"the bot's own close, but another order took that fill and the bot's share did "
-            f"not lose it; the venue still holds them"
-        )
-        logger.error("cTrader: %s", reason)
-        context = {'position_id': record.position_id, 'volume': volume,
-                   'own_close_key': record.key, 'order_id': record.order_id}
-        if self.store_ctx is not None:
+        cut_of = {id(claim): cut for claim, cut in cuts}
+        total_cut = 0.0
+        released = False
+        settle_share = False
+        for claim in claims:
+            event = claim.event
+            if event is None:
+                continue
+            claim.event = None
+            released = True
+            settle_share = settle_share or claim.settles_share
+            booked = event.fill_qty or 0.0
+            cut = min(cut_of.get(id(claim), 0.0), booked)
+            total_cut += cut
+            if booked - cut > _VOLUME_TOL:
+                self._released_close_events.append(
+                    replace(event, fill_qty=booked - cut) if cut > 0.0 else event)
+        if total_cut > _VOLUME_TOL:
+            restored = self._restore_retired_exposure(record.position_id, total_cut)
+            logger.warning(
+                "cTrader: %s units booked for the bot's own close of position %d were "
+                "another party's close of its own exposure; not booked, %s units given "
+                "back to the journal", total_cut, record.position_id, restored)
+            if self.store_ctx is not None:
+                self.store_ctx.log_event(
+                    _CLAIM_REBOOKED_EVENT, exchange_order_id=str(record.position_id),
+                    payload={'position_id': record.position_id, 'volume': total_cut,
+                             'restored': restored, 'own_close_key': record.key,
+                             'order_id': record.order_id,
+                             'claims': [[claim.order_id, claim.deal_id, cut]
+                                        for claim, cut in cuts]})
+        if settle_share:
+            self._settle_own_partial_close(record.position_id)
+        if released and self._exec_events is not None:
+            # Wakes the stream, which delivers the events before the next message.
+            self._exec_events.put_nowait(_RELEASE_WAKEUP)
+
+    def _restore_retired_exposure(self, position_id: int, qty: float) -> float:
+        """Give retired exposure back to a position's journal rows, newest first.
+
+        The inverse of :meth:`_retire_partial_close_exposure` for volume
+        retired by a fill that turned out not to have closed the bot's share.
+        A closed row (the venue went flat) gets nothing back.
+
+        :return: The volume (units) given back.
+        """
+        if self.store_ctx is None or not position_id or qty <= 0.0:
+            return 0.0
+        pid_str = str(position_id)
+        remaining = qty
+        for row in reversed(list(self.store_ctx.iter_live_orders())):
+            if remaining <= 1e-9:
+                break
+            extras = dict(row.extras or {})
+            position_id_raw = extras.get('position_id')
+            matches_position = (
+                position_id_raw is not None
+                and parse_protocol_id(position_id_raw, field='position_id') == position_id
+            )
+            if not matches_position and row.exchange_order_id != pid_str:
+                continue
+            already_raw = extras.get(JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY)
+            already = float(already_raw) if isinstance(already_raw, (int, float)) else 0.0
+            give = min(already, remaining)
+            if give <= 1e-9:
+                continue
+            extras[JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY] = already - give
+            self.store_ctx.upsert_order(row.client_order_id, extras=extras)
             self.store_ctx.log_event(
-                _CLOSE_MISBOOKED_EVENT, exchange_order_id=str(record.position_id),
-                payload=context)
-        sink = self.quarantine_sink
-        if sink is not None:
-            # noinspection PyBroadException
-            try:
-                sink(reason, context, kind=QuarantineKind.EXTERNAL_INTERVENTION)
-            except Exception:
-                logger.exception(
-                    "cTrader: quarantine sink failed for misbooked close %s; "
-                    "falling back to the process-exiting halt", record.key)
-            else:
-                return
-        raise BrokerManualInterventionError(reason, context=context)
+                'journal_exposure_restored',
+                client_order_id=row.client_order_id, exchange_order_id=pid_str,
+                payload={'restored': give, 'total_retired': already - give,
+                         'source': 'close_claim_rebooked'})
+            remaining -= give
+        return qty - remaining
+
+    def _settle_own_partial_close(self, position_id: int) -> None:
+        """The bot's own close left a position open: check what it holds of it."""
+        share = self._own_share(position_id)
+        if share is None:
+            if not self._hedging_enabled:
+                # A startup-adopted NETTING position: a later close of it is
+                # no longer one this run sent.
+                self._close_dispatch_pine_by_position.pop(position_id, None)
+        elif share <= _VOLUME_TOL:
+            # The bot closed its whole share of a position someone else still
+            # holds: nothing on it is the bot's any more, its protection
+            # included.
+            self._vacate_position(position_id)
 
     def _journal_own_close(self, record: _OwnClose, *, refused: bool = False) -> None:
         """Persist the state of one own close for a restarted process."""
@@ -2571,8 +2725,8 @@ class _ProtectionMixin(_CTraderBase, ABC):
             reason = payload.get('reason')
             context = payload.get('context')
             if (not isinstance(key, str) or key in handled
+                    or key in self._unhandled_close_reports
                     or not isinstance(position_id, int)
-                    or position_id in self._external_close_reported
                     or not isinstance(reason, str) or not isinstance(context, dict)):
                 continue
             self._external_close_reported.add(position_id)
@@ -2654,7 +2808,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
         if record is not None:
             return CloseOrigin.OWN, record
         if self.store_ctx is not None:
-            if order.clientOrderId and self.store_ctx.get_order(order.clientOrderId) is not None:
+            if self._is_run_client_order_id(order.clientOrderId):
                 return CloseOrigin.OWN, None
             if self._is_own_entry_order(order.orderId):
                 return CloseOrigin.OWN, None
@@ -2709,8 +2863,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
             all it booked when the share is not known or the order is own.
         """
         store = self.store_ctx
-        if store is not None and ((claim.client_order_id
-                                   and store.get_order(claim.client_order_id) is not None)
+        if store is not None and (self._is_run_client_order_id(claim.client_order_id)
                                   or self._is_own_entry_order(claim.order_id)):
             return claim.booked
         if any(c.order_id == claim.order_id for c in self._own_close_history):
@@ -2843,10 +2996,12 @@ class _ProtectionMixin(_CTraderBase, ABC):
     def _queue_external_close(
             self, position_id: int, context: dict, *, reason: str | None = None,
     ) -> None:
-        """Queue one manual-close report, unless the position already had one.
+        """Queue one manual-close report, unless one of the position waits already.
 
         Venue writes wait until the report is handled
-        (:meth:`ensure_venue_writes_allowed`).
+        (:meth:`ensure_venue_writes_allowed`). Once it is, a later close of
+        the position is judged and reported on its own: under the ``ignore``
+        and ``re_place`` policies the run goes on trading.
         """
         if position_id in self._external_close_reported:
             return
@@ -2947,7 +3102,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
             origin = by_order.get(deal.order_id)
             if origin is None:
                 origin = await self._recovered_close_origin(
-                    position_id, deal.order_id, deal.executed_ms)
+                    position_id, deal.order_id, deal.executed_ms, own_orders=own_orders)
                 if origin is None:
                     return None
                 by_order[deal.order_id] = origin
@@ -2968,7 +3123,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
         external = [(deal, taken) for deal, taken in replay.reported
                     if origins[deal.deal_id] is CloseOrigin.EXTERNAL]
         unattributed = [(deal, taken) for deal, taken in replay.reported
-                        if origins[deal.deal_id] is CloseOrigin.UNATTRIBUTED]
+                        if origins[deal.deal_id] is not CloseOrigin.EXTERNAL]
         if external and share is None and not self._hedging_enabled:
             first = external[0][0]
             self._note_share_unknown(
@@ -3019,14 +3174,20 @@ class _ProtectionMixin(_CTraderBase, ABC):
             self, position_id: int, deals: Sequence[tuple[_PositionDeal, int]], *,
             from_entry: str | None,
     ) -> None:
-        """Book recovered closes nothing proves someone else's: ERROR + audit, no report."""
+        """Book recovered closes nothing proves someone else's: ERROR + audit, no report.
+
+        Their orders are neither the bot's nor the venue's SL / TP or
+        stop-out and carry no client-order-id, or the venue no longer knows
+        them (:attr:`CloseOrigin.UNKNOWN`).
+        """
         deal_ids = [deal.deal_id for deal, _taken in deals]
         booked = volume_to_units(sum(taken for _deal, taken in deals))
         logger.error(
             "cTrader: deals %s closed %s units of bot position %d while the stream was "
             "down; their orders are neither the bot's nor the venue's SL / TP or stop-out "
-            "and carry no client-order-id, so another client's close cannot be told from "
-            "a server-initiated one — booked, not reported", deal_ids, booked, position_id)
+            "and carry no client-order-id, or the venue no longer knows them, so another "
+            "client's close cannot be told from a server-initiated one — booked, not "
+            "reported", deal_ids, booked, position_id)
         if self.store_ctx is not None:
             self.store_ctx.log_event(
                 _CLOSE_UNATTRIBUTED_EVENT, exchange_order_id=str(position_id),
@@ -3052,14 +3213,18 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 payload={'position_id': position_id, 'volume': volume, 'deal_ids': ids})
 
     async def _recovered_close_origin(
-            self, position_id: int, order_id: int, executed_ms: int,
+            self, position_id: int, order_id: int, executed_ms: int, *,
+            own_orders: Container[int] = (),
     ) -> CloseOrigin | None:
         """Classify one closing order found in the deal history.
 
+        :param own_orders: Entry orders of the bot's whose journal rows are
+            closed (:meth:`_judge_recovered_closes`).
         :return: The origin, or ``None`` when the order lookup failed for now.
         """
-        if any(record.claims_recovered(position_id, order_id, executed_ms)
-               for record in self._own_close_history):
+        if order_id in own_orders or any(
+                record.claims_recovered(position_id, order_id, executed_ms)
+                for record in self._own_close_history):
             return CloseOrigin.OWN
         return await self._closing_order_kind(position_id, order_id, judge_protection=True)
 
@@ -3112,8 +3277,9 @@ class _ProtectionMixin(_CTraderBase, ABC):
     ) -> CloseOrigin | None:
         """Classify a closing order by what is known of it, without the own-close grace.
 
-        *own* when it is one of this run's orders or a close the run sent with
-        that order id; *venue* when ``ProtoOAOrderDetailsReq`` shows the
+        *own* when it is one of this run's orders (its journal row, or a
+        client-order-id carrying the run's tag: :meth:`_is_run_client_order_id`)
+        or a close the run sent with that order id; *venue* when ``ProtoOAOrderDetailsReq`` shows the
         position's ``STOP_LOSS_TAKE_PROFIT`` order or a stop-out; *external*
         when the order carries a client-order-id that is not this run's (an
         API client sent it, the venue never does); *unknown* when the venue
@@ -3160,7 +3326,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
         if order.orderType == _STOP_LOSS_TAKE_PROFIT or order.isStopOut:
             return CloseOrigin.VENUE
         if order.clientOrderId:
-            if store is not None and store.get_order(order.clientOrderId) is not None:
+            if self._is_run_client_order_id(order.clientOrderId):
                 return CloseOrigin.OWN
             return CloseOrigin.EXTERNAL
         return CloseOrigin.UNATTRIBUTED
@@ -3187,6 +3353,41 @@ class _ProtectionMixin(_CTraderBase, ABC):
         terms.append(entry)
         extras[_OWN_ORDER_TERMS_EXTRA] = terms
         self.store_ctx.upsert_order(coid, extras=extras)
+
+    def _own_order_terms(self, order_id: int) -> list:
+        """The terms recorded as the bot's for its working entry order."""
+        if self.store_ctx is None:
+            return []
+        row = self.store_ctx.find_by_ref('order_id', str(order_id))
+        if row is None:
+            return []
+        return list((row.extras or {}).get(_OWN_ORDER_TERMS_EXTRA) or [])
+
+    def _withdraw_own_order_terms(self, order_id: int, sent: list, before: list) -> None:
+        """Take back terms an own write the venue refused recorded as the bot's.
+
+        The order never carried them by the bot's hand, so a later view showing
+        them is judged like any other. An entry of the same terms an earlier
+        write left stays where it was.
+
+        :param sent: The ``[limit, stop, volume]`` the refused write sent.
+        :param before: The recorded terms before the write
+            (:meth:`_own_order_terms`).
+        """
+        if self.store_ctx is None:
+            return
+        row = self.store_ctx.find_by_ref('order_id', str(order_id))
+        if row is None:
+            return
+        extras = dict(row.extras or {})
+        terms = [t for t in extras.get(_OWN_ORDER_TERMS_EXTRA) or []
+                 if not (isinstance(t, list) and t[:3] == sent[:3])]
+        for index, entry in enumerate(before):
+            if isinstance(entry, list) and entry[:3] == sent[:3]:
+                terms.insert(min(index, len(terms)), entry)
+                break
+        extras[_OWN_ORDER_TERMS_EXTRA] = terms
+        self.store_ctx.upsert_order(row.client_order_id, extras=extras)
 
     def _remember_own_order_answer(
             self, coid: str, sent: list, order: OpenApiModelMessages.ProtoOAOrder,
@@ -3641,7 +3842,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
         """Report the queued manual closes, and those an earlier process left unhandled.
 
         Each report is journalled as handled once the policy ran, the halt
-        included. Views of working entry orders pushed while an own amend was
+        included; its position is then open to the next report. Views of working entry orders pushed while an own amend was
         in flight are judged here once the amend is answered.
 
         :raises UnexpectedCancelError: When the policy requires the halt.
@@ -3657,6 +3858,10 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 self._journal_close_report_done(key, context)
                 raise
             self._journal_close_report_done(key, context)
+            position_id = context.get('position_id')
+            if not any(queued[1].get('position_id') == position_id
+                       for queued in self._deferred_interventions):
+                self._external_close_reported.discard(position_id)
 
     def ensure_venue_writes_allowed(self, what: str = "venue write") -> None:
         """Refuse a venue write while the quarantine or an unhandled report forbids it.

@@ -795,3 +795,130 @@ def __test_recover_protection_added_to_a_bare_recovered_fill_is_reported__(tmp_p
     assert len(calls) == 1
     assert calls[0][1]['protection_key'].endswith(':222')
 
+
+
+# === The bot's own venue state its journal lost ===========================
+
+class _CancelWire(_RecoveryWire):
+    """Answers ``ProtoOACancelOrderReq`` with the order's cancel, after the
+    venue-write gate the real wire runs right before the send."""
+
+    async def send_request(self, req, *, timeout=None, write_gate=None, **_kwargs):
+        if isinstance(req, _oa.ProtoOACancelOrderReq):
+            if write_gate is not None:
+                write_gate()
+            self.requests.append(req)
+            return _oa.ProtoOAExecutionEvent(
+                ctidTraderAccountId=999,
+                executionType=_model.ProtoOAExecutionType.ORDER_CANCELLED,
+                order=_model.ProtoOAOrder(
+                    orderId=req.orderId,
+                    orderStatus=_CANCELLED,
+                    tradeData=_model.ProtoOATradeData(
+                        symbolId=1, volume=2000, tradeSide=_model.ProtoOATradeSide.SELL)))
+        return await super().send_request(req, timeout=timeout)
+
+
+def _labelled_position(label, *, position_id=58367450, volume=2000):
+    position = _position(position_id=position_id, volume=volume)
+    position.tradeData.label = label
+    return position
+
+
+def _labelled_order(label, *, coid, order_id=777):
+    order = _order(order_id=order_id, coid=coid, volume=2000)
+    order.tradeData.label = label
+    return order
+
+
+def _events(broker, kind) -> list:
+    return list(broker.store_ctx.iter_events_by_kind_since(kind, 0))
+
+
+def _lost_journal_broker(tmp_path, *, positions=(), orders=()):
+    broker = _RecoveryBroker(_recon())
+    broker._wire = _CancelWire()
+    broker.symbol = 'EURUSD'
+    _open(tmp_path, broker)
+    broker._recon = _recon(positions=positions, orders=orders)
+    return broker
+
+
+def __test_recover_untracked_position_with_the_run_s_label_is_adopted_as_own__(tmp_path):
+    """The bot's LIMIT filled while it was down and its journal row was lost:
+    the position carries the run's label, so it is the bot's own exposure."""
+    broker = _lost_journal_broker(tmp_path)
+    broker._recon = _recon(positions=[_labelled_position(broker.store_ctx.run_tag)])
+
+    _recover(broker)
+
+    assert 58367450 in broker._owned_position_ids()
+    rows = list(broker.store_ctx.iter_live_orders())
+    assert len(rows) == 1
+    assert rows[0].filled_qty == pytest.approx(volume_to_units(2000))
+    assert not (rows[0].extras or {}).get('adopted_startup')
+    position = asyncio.run(broker.get_position('EURUSD'))
+    assert position is not None and position.size == pytest.approx(volume_to_units(2000))
+    assert 58367450 in broker._bare_positions
+    assert len(_events(broker, 'ctrader_own_leg_recovered')) == 1
+
+
+@pytest.mark.parametrize('label', ['other-run', ''])
+def __test_recover_untracked_position_of_another_label_stays_another_party_s__(
+        tmp_path, label):
+    """Another label is another run's; no label is no run's, whose it is
+    cannot be told: ERROR + audit, once per position."""
+    broker = _lost_journal_broker(tmp_path, positions=[_labelled_position(label)])
+
+    _recover(broker)
+    _recover(broker)
+
+    assert broker._owned_position_ids() == set()
+    assert list(broker.store_ctx.iter_live_orders()) == []
+    assert asyncio.run(broker.get_position('EURUSD')) is None
+    assert len(_events(broker, 'ctrader_untracked_leg_unattributed')) == (0 if label else 1)
+
+
+@pytest.mark.parametrize('by', ['label', 'coid'])
+def __test_recover_untracked_working_order_of_the_run_is_cancelled__(tmp_path, by):
+    """A working entry order of the run no journal row tracks would fill into
+    exposure no intent stands behind: cancelled as the bot's own debris."""
+    broker = _lost_journal_broker(tmp_path)
+    run_tag = broker.store_ctx.run_tag
+    order = (_labelled_order(run_tag, coid='') if by == 'label'
+             else _labelled_order('', coid=f"{run_tag}-7rxpdapr-0mv9ub05c-e0"))
+    broker._recon = _recon(orders=[order])
+
+    _recover(broker)
+
+    cancels = [r for r in broker._wire.requests if isinstance(r, _oa.ProtoOACancelOrderReq)]
+    assert [r.orderId for r in cancels] == [777]
+    audits = _events(broker, 'ctrader_own_order_debris')
+    assert len(audits) == 1 and audits[0]['cancelled'] is True
+
+
+def __test_recover_working_order_of_another_party_or_tracked_is_left_alone__(tmp_path):
+    broker = _lost_journal_broker(tmp_path)
+    run_tag = broker.store_ctx.run_tag
+    _seed_submitted(broker, f"{run_tag}-tracked", qty=volume_to_units(2000))
+    broker._recon = _recon(orders=[
+        _labelled_order('other-run', coid='other-run-1', order_id=778),
+        _labelled_order(run_tag, coid=f"{run_tag}-tracked", order_id=779)])
+
+    _recover(broker)
+
+    assert not [r for r in broker._wire.requests if isinstance(r, _oa.ProtoOACancelOrderReq)]
+    assert _events(broker, 'ctrader_own_order_debris') == []
+
+
+def __test_recover_own_debris_cancel_the_quarantine_refuses_is_audited__(tmp_path):
+    """No write leaves while the quarantine holds: the order stays, ERROR + audit."""
+    broker = _lost_journal_broker(tmp_path)
+    broker.venue_writes_blocked = lambda: True
+    broker._recon = _recon(orders=[_labelled_order(broker.store_ctx.run_tag, coid='')])
+
+    _recover(broker)
+
+    assert not [r for r in broker._wire.requests if isinstance(r, _oa.ProtoOACancelOrderReq)]
+    audits = _events(broker, 'ctrader_own_order_debris')
+    assert len(audits) == 1 and audits[0]['cancelled'] is False

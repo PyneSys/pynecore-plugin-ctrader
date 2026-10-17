@@ -108,21 +108,33 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         before the external-intervention policy acts; a halt raises from here
         and the engine books the queued events before the run stops. Reports
         an earlier process queued but never handled are handled first, before
-        the stream waits for anything; venue writes wait for them.
+        the stream waits for anything; venue writes wait for them. The events
+        of closing fills an own close took while it was in flight are yielded
+        once it was answered, ahead of the next message and before any report.
+        After an operator resume a snapshot sets the protection baseline before
+        any push is judged (``_ProtectionMixin._observe_resume_baseline``).
         """
         execq = self._exec_events
         if execq is None:
             raise CTraderConnectionError("live event router not started")
+        await self._observe_resume_baseline()
+        released = self._released_close_events
+        while released:
+            yield released.popleft()
         self._flush_external_interventions()
         warned = False
         loop = asyncio.get_running_loop()
         next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
         while True:
+            while released:
+                yield released.popleft()
             now = loop.time()
             if now >= next_reconcile_at:
                 async for event in self._run_reconcile_pass():
                     yield event
                 next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
+                while released:
+                    yield released.popleft()
                 self._flush_external_interventions()
                 continue
             try:
@@ -137,6 +149,10 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                     _BACKLOG_WATERMARK,
                 )
                 warned = True
+            # Close fills released while this message waited were taken
+            # before it: delivered first.
+            while released:
+                yield released.popleft()
             try:
                 event = self._translate_exec_event(message)
             except BrokerManualInterventionError:
@@ -335,20 +351,46 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                 # external-order policy (see broker-plugin-responsibility-review.md).
                 # ``store_ctx is None`` (tests / persistence off) keeps the legacy
                 # emit path so identity-less fixtures still observe the event.
+                # An order carrying the run's tag is the bot's own whose journal
+                # row was lost: nothing can book it now, so ERROR + audit; the
+                # next start adopts the position by its label.
+                payload = {
+                    'execution_type': event_type,
+                    'order_id': order.orderId,
+                    'position_id': order.positionId,
+                }
                 self.store_ctx.log_event(
                     'external_activity_ignored',
-                    exchange_order_id=str(order.orderId) or None,
-                    payload={
-                        'execution_type': event_type,
-                        'order_id': order.orderId,
-                        'position_id': order.positionId,
-                    },
-                )
+                    exchange_order_id=str(order.orderId) or None, payload=payload)
+                if (self._is_run_client_order_id(order.clientOrderId)
+                        or order.tradeData.label == self.store_ctx.run_tag):
+                    logger.error(
+                        "cTrader: order %d (%s) of this run filled, but no live journal row "
+                        "of the run tracks it; not booked (the next start adopts its "
+                        "position)", order.orderId, order.clientOrderId)
+                    self.store_ctx.log_event(
+                        'ctrader_own_fill_untracked',
+                        exchange_order_id=str(order.orderId) or None, payload=payload)
                 return None
         is_fill = event_type in ('filled', 'partial') and (fill_qty or 0.0) > 0.0
         closing = self._is_closing_fill(order, deal)
         filled_view: OpenApiModelMessages.ProtoOAPosition | None = None
         close_origin: CloseOrigin | None = None
+        held_claim: _ClaimedFill | None = None
+        if (is_fill and leg_type is LegType.CLOSE and deal is not None
+                and deal.executionTimestamp
+                and deal.executionTimestamp < self._closes_covered_until.get(
+                    order.positionId, 0)):
+            # A reconcile pass already retired this close from the journal
+            # from the deal history: a late copy, never booked twice.
+            if self.store_ctx is not None:
+                self.store_ctx.log_event(
+                    'external_activity_ignored',
+                    exchange_order_id=str(order.orderId) or None,
+                    payload={'execution_type': 'close', 'order_id': order.orderId,
+                             'position_id': order.positionId, 'deal_id': deal.dealId,
+                             'reason': 'covered_by_reconcile'})
+            return None
         if is_fill and leg_type is LegType.CLOSE:
             if not order.closingOrder and deal is not None:
                 # Another party's opposite order reduced the position: only its
@@ -358,7 +400,7 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                 message, order, deal, fill_qty=fill_qty or 0.0, from_entry=from_entry)
             if judged is None:
                 return None
-            fill_qty, close_origin = judged
+            fill_qty, close_origin, held_claim = judged
         elif deal is not None and is_fill and leg_type is not None and closing:
             # The run's own order (an entry) that closed volume.
             self._mark_close_judged([deal.dealId], {deal.dealId: CloseOrigin.OWN})
@@ -399,18 +441,12 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # reconciliation reads a position the venue no longer holds.
             self._retire_partial_close_exposure(
                 order.positionId, fill_qty or 0.0)
-            if close_origin is CloseOrigin.OWN:
-                share = self._own_share(order.positionId)
-                if share is None:
-                    if not self._hedging_enabled:
-                        # A startup-adopted NETTING position: a later close of
-                        # it is no longer one this run sent.
-                        self._close_dispatch_pine_by_position.pop(order.positionId, None)
-                elif share <= _VOLUME_TOL:
-                    # The bot closed its whole share of a position someone
-                    # else still holds: nothing on it is the bot's any more,
-                    # its protection included.
-                    self._vacate_position(order.positionId)
+            if held_claim is not None:
+                # Whether the fill was the bot's close is known once the close
+                # is answered; the share is checked then.
+                held_claim.settles_share = close_origin is CloseOrigin.OWN
+            elif close_origin is CloseOrigin.OWN:
+                self._settle_own_partial_close(order.positionId)
         elif (event_type in ('filled', 'partial') and order.positionId
               and not order.closingOrder and leg_type is not LegType.CLOSE):
             # Position-linking mirrors ``positionId`` onto the ENTRY row a fill
@@ -433,7 +469,7 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # a restart.
             self._take_own_fill_protection(filled_view)
 
-        return OrderEvent(
+        event = OrderEvent(
             order=exch_order,
             event_type=event_type,
             fill_price=fill_price,
@@ -447,6 +483,11 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             fill_id=fill_id,
             cancel_reason=cancel_reason,
         )
+        if held_claim is not None:
+            # Taken for an own close in flight: its answer releases it.
+            held_claim.event = event
+            return None
+        return event
 
     def _order_from_proto(self, order) -> ExchangeOrder:
         """Build an :class:`ExchangeOrder` snapshot from a ``ProtoOAOrder``."""
@@ -598,7 +639,7 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
 
     def _judge_close_fill(
             self, message, order, deal, *, fill_qty: float, from_entry: str | None,
-    ) -> tuple[float, CloseOrigin] | None:
+    ) -> tuple[float, CloseOrigin, _ClaimedFill | None] | None:
         """Classify a closing fill on a run-owned position and size its booking.
 
         Only the bot's share of the position is the bot's: its own close
@@ -624,17 +665,17 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         instead (:meth:`_note_share_unknown`).
 
         A fill an own close takes before its order id is known is booked for
-        at most what the close asked for and has not booked yet; the
-        close's own fills are booked net of its credit — what fills taken for
-        it, that turned out to be other orders', booked and retired beyond the
-        share they took (:meth:`_settle_own_close`) — against a share that
-        much larger than the journal's. A venue close judged while an own
-        close of the position is unanswered is kept on that close too: the
-        close may have executed first and taken the share the journal still
-        counts, so its answer judges again what the venue close took.
+        at most what the close asked for and has not booked yet. A venue close
+        judged while an own close of the position is unanswered is kept on
+        that close too: the close may have executed first and taken the share
+        the journal still counts, so its answer judges again what the venue
+        close took. While that close is in flight the event of such a fill is
+        held, and the answer decides what of it is delivered
+        (:meth:`_ProtectionMixin._release_held_claims`).
 
-        :return: ``(booked_qty, origin)``, or ``None`` when nothing of the
-            bot's was closed and the event is dropped.
+        :return: ``(booked_qty, origin, held)`` — ``held`` is the claim whose
+            event waits for the answer of an own close in flight — or ``None``
+            when nothing of the bot's was closed and the event is dropped.
         """
         position_id = order.positionId
         deal_id = deal.dealId if deal is not None else None
@@ -670,11 +711,7 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                          and not self._hedging_enabled)
         if bounds is not None:
             if origin is CloseOrigin.OWN:
-                # The close's credit was retired from the journal without the
-                # share losing it: the share the fill can take is that much
-                # larger than the journal's.
-                credit = record.credit if record is not None and claimer is None else 0.0
-                booked = min(fill_qty, bounds.high + credit)
+                booked = min(fill_qty, bounds.high)
                 if claimer is not None and claimer.volume is not None:
                     booked = min(booked, max(0.0, claimer.volume - claimer.claimed_volume()))
             else:
@@ -711,11 +748,6 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                             'order_type': int(order.orderType),
                             'from_entry': from_entry,
                         })
-        credited = False
-        if record is not None and claimer is None:
-            unabsorbed = booked
-            booked = self._absorb_close_credit(record, booked, terminal=terminal)
-            credited = booked < unabsorbed
         share: dict | None = None
         if bounds is not None:
             share = {'share': (bounds.low if bounds.low == bounds.high
@@ -727,14 +759,16 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # The share an own close still in flight may already have taken
             # is not in the journal yet: its answer judges this close again.
             holder = self._own_close_wildcard(position_id)
+        claim: _ClaimedFill | None = None
         if holder is not None:
-            self._record_claim(holder, _ClaimedFill(
+            claim = _ClaimedFill(
                 order_id=order.orderId, deal_id=deal_id, fill_qty=fill_qty,
                 order_type=int(order.orderType), client_order_id=order.clientOrderId,
                 from_entry=from_entry, terminal=terminal, executed_ms=executed_ms,
                 share_before=claim_low,
                 share_high=bounds.high if bounds is not None else None,
-                venue_after=venue_after, booked=booked, venue=venue_claim))
+                venue_after=venue_after, booked=booked, venue=venue_claim)
+            self._record_claim(holder, claim)
         if share_unknown:
             self._note_share_unknown(
                 position_id, order_id=order.orderId, deal_ids=[deal_id], closed_qty=fill_qty,
@@ -761,13 +795,13 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                              'position_id': position_id, 'deal_id': deal_id,
                              'closed_qty': fill_qty, 'origin': str(origin),
                              'reason': ('share_undecided' if ambiguous
-                                        else 'booked_with_a_taken_fill' if credited
                                         else 'foreign_exposure_only')},
                 )
             if venue_after <= _VOLUME_TOL:
                 self._mark_position_closed(position_id)
             return None
-        return booked, origin
+        return booked, origin, (
+            claim if holder is not None and holder.answered_ms is None else None)
 
     def _run_owned_position_entry(self, position_id: int) -> str | None:
         """Pine entry id of the run-owned exposure a venue close just flattened.

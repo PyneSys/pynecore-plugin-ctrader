@@ -578,6 +578,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     volume=share - venue)
                 self._retire_partial_close_exposure(
                     position_id, share - venue, source='resume_accepted')
+                self._cover_closes(position_id, read_started_at)
                 continue
             if startup is not None:
                 taken = await self._judge_shrink(
@@ -585,6 +586,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     read_started_at=read_started_at)
                 if taken is not None:
                     self._end_startup_shrink(position_id)
+                    self._cover_closes(position_id, read_started_at)
                     if taken - startup.volume > _VOLUME_TOL:
                         self._retire_partial_close_exposure(
                             position_id, taken - startup.volume, source='position_shrink')
@@ -603,9 +605,21 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             if taken is not None:
                 self._shrink_judged.add((position_id, key))
                 self._shrink_watch.pop(position_id, None)
+                self._cover_closes(position_id, read_started_at)
                 retired = max(share - venue, taken)
                 self._retire_partial_close_exposure(
                     position_id, retired, source='position_shrink')
+
+    def _cover_closes(self, position_id: int, read_started_at: float) -> None:
+        """A pass retired a position's closes from the journal without their events.
+
+        Every closing deal it covered executed before the snapshot read
+        (margined by the clock skew): a push of one of them that arrives later
+        must not be booked again (:attr:`_closes_covered_until`).
+        """
+        until = int(read_started_at * 1000) - _CLOCK_SKEW_MS
+        if until > self._closes_covered_until.get(position_id, 0):
+            self._closes_covered_until[position_id] = until
 
     async def _judge_shrink(
             self, position_id: int, position: 'OpenApiModelMessages.ProtoOAPosition', *,
@@ -670,6 +684,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             own_orders=pending.order_ids)
         if taken is not None:
             self._end_startup_shrink(position_id)
+            self._cover_closes(position_id, read_started_at)
 
     def _record_startup_shrink(
             self, position: 'OpenApiModelMessages.ProtoOAPosition', row: 'OrderRow',
@@ -817,7 +832,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     for chosen in combinations(maybe_own, count):
                         own_orders = own | set(chosen)
                         takes.append(sum(
-                            _foreign_claims_taken(record.claims, own_orders, record.credit)[0]
+                            _foreign_claims_taken(record.claims, own_orders)[0]
                             for record in records))
                 taken = min(takes)
                 if taken <= _VOLUME_TOL:
