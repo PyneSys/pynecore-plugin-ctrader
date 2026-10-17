@@ -47,6 +47,7 @@ Resolution rules:
   :attr:`_seen_deal_ids`, so a reconnect PUSH replay of the same deal is not
   double-applied after the event stream opens.
 """
+import asyncio
 import logging
 from abc import ABC
 from dataclasses import dataclass
@@ -56,9 +57,10 @@ from typing import cast
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.store_helpers import find_pending_dispatch
 
-from .helpers import parse_protocol_id, volume_to_units
+from .helpers import REQUEST_TIMEOUT, parse_protocol_id, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
+from .protection import _accepted_by_resume
 from .reconcile import _SINCE_ANCHOR_SKEW_MS, _ReconcileMixin
 
 logger = logging.getLogger(__name__)
@@ -121,7 +123,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         for row in pending:
             if await self._recover_one_pending_row(row, orders_by_coid, open_positions):
                 promoted_coids.add(row.client_order_id)
-        self._retire_startup_orphans(res, promoted_coids)
+        await self._retire_startup_orphans(res, promoted_coids)
 
     async def _recover_one_pending_row(
             self, row, orders_by_coid: 'dict[str, OpenApiModelMessages.ProtoOAOrder]',
@@ -182,6 +184,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                 submitted_at_ms=(live_order.utcLastUpdateTimestamp
                                  or int(epoch_time() * 1000)),
                 source='live_order',
+                position=open_positions.get(live_order.positionId),
             )
             return True
         # Source 2 — order history by coid. A crash-before-ack row carries no
@@ -227,10 +230,35 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         if position_id and position_id not in open_positions:
             if (bridge.closed_cents > 0 and bridge.filled_cents > 0
                     and bridge.deal is not None):
-                # Filled then closed while down — seed the shared de-dup BEFORE
-                # retiring so a reconnect PUSH replay of these deals is not
-                # re-applied, then land the row closed through the existing writer.
+                # Filled then closed while down. Who closed it is judged first,
+                # against the bot's share counting the fill this row recovers (its
+                # order is the bot's entry, though no ref links it yet): a retired
+                # row leaves every later reconcile scan, so this is the only pass
+                # that can apply the intervention policy. Right after an
+                # operator resume the close is accepted instead. While a closing
+                # order cannot be looked up the row stays pending with its refs,
+                # like an inconclusive history read below.
+                if _accepted_by_resume(row):
+                    self._note_accepted_by_resume(
+                        position_id, client_order_id=row.client_order_id, volume=None,
+                        deal_ids=bridge.closing_deal_ids)
+                    self._mark_close_judged(list(bridge.closing_deal_ids))
+                elif await self._judge_recovered_closes(
+                        position_id, bridge.position_deals, from_entry=row.pine_entry_id,
+                        share_now=self._share_with_recovered_fill(
+                            row, position_id, volume_to_units(bridge.filled_cents)),
+                        counted=bridge.deal_ids, own_orders=(order.orderId,)) is None:
+                    self._record_recovered_refs(
+                        row, order_id=order.orderId, position_id=position_id,
+                        submitted_at_ms=(order.utcLastUpdateTimestamp
+                                         or int(epoch_time() * 1000)),
+                    )
+                    return False
+                # Seed the shared de-dup with the entry fills AND the closing
+                # deals BEFORE retiring, so a reconnect PUSH replay of either is
+                # not re-applied, then land the row closed through the writer.
                 self._seen_deal_ids.update(bridge.deal_ids)
+                self._seen_deal_ids.update(bridge.closing_deal_ids)
                 self._retire_filled_then_closed(
                     row, bridge.deal, position_id, bridge.closed_cents)
                 self._clear_intent_anchor(row)
@@ -285,6 +313,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             avg_price=(bridge.avg_price or order.executionPrice or None),
             submitted_at_ms=order.utcLastUpdateTimestamp or int(epoch_time() * 1000),
             source='order_history', partial_terminal=partial_terminal,
+            position=open_positions.get(position_id) if position_id else None,
         )
         return True
 
@@ -292,6 +321,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             self, row, *, order_id: int, position_id: int | None,
             filled: float, avg_price: float | None, submitted_at_ms: int,
             source: str, partial_terminal: bool = False,
+            position: 'OpenApiModelMessages.ProtoOAPosition | None' = None,
     ) -> None:
         """Promote a pending persist-first row to ``confirmed`` from broker truth.
 
@@ -307,6 +337,14 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         adoption, which adopts the broker net position; the adoption-bounded
         baseline then aligns the cursor. The shared de-dup is seeded by the
         caller so a reconnect PUSH replay is not double-counted.
+
+        The open position the recovered fill built (``position``, from the
+        recovery snapshot) gets the protection the fill left on it, as a
+        pushed fill of the bot's own does
+        (:meth:`~pynecore_ctrader.protection._ProtectionMixin._take_own_fill_protection`):
+        a position without any is bare, so protection someone adds to it later
+        is an intervention. The PUSH replay of the fill is dropped by the
+        seeded de-dup, so nothing else takes the position up.
 
         The crashed dispatch may have left a parked ``pending_verifications``
         row (the sync engine parks a coid on ``OrderDispositionUnknownError``).
@@ -338,6 +376,10 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         self.store_ctx.record_unpark(coid)
         if position_id:
             self._link_position_ref(coid, position_id)
+        if (position is not None and cumulative > 1e-9
+                and position.positionId == position_id
+                and self._position_owned(position.positionId)):
+            self._take_own_fill_protection(position)
         self.store_ctx.log_event(
             'recovered_in_flight_confirmed', client_order_id=coid,
             exchange_order_id=str(order_id), intent_key=row.intent_key,
@@ -513,7 +555,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             return _OrderLookupResult(None, False)
         return _OrderLookupResult(None, True)
 
-    def _retire_startup_orphans(
+    async def _retire_startup_orphans(
             self, res: 'OpenApiMessages.ProtoOAReconcileRes', promoted_coids: set[str],
     ) -> None:
         """Retire live rows whose broker counterpart is gone (single pass).
@@ -522,11 +564,20 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         separate TP/SL leg rows), so unlike Capital.com's two-pass retirement
         this is a single pass over the entry rows: a ``confirmed`` / ``closing``
         / ``rejected`` row whose ``orderId`` / ``positionId`` is absent from BOTH
-        the live ``order[]`` and ``position[]`` snapshots is an operator-closed
-        orphan (the bot was stopped, then the position closed manually). Close
-        it + delete its envelope anchor so the runtime ``_reconcile_snapshot``
-        does not later stamp ``missing_pending_since`` and the grace tracker
-        raise a false ``UnexpectedCancelError`` that halts a clean restart.
+        the live ``order[]`` and ``position[]`` snapshots is an orphan: its
+        position was closed while the bot was stopped. Close it + delete its
+        envelope anchor so the runtime ``_reconcile_snapshot`` does not later
+        stamp ``missing_pending_since`` and the grace tracker raise a false
+        ``UnexpectedCancelError`` that halts a clean restart.
+
+        Who closed the position is judged first, from its deal history
+        (:meth:`_judge_recovered_closes`): someone else's close is reported
+        like one the running bot missed. A row whose history cannot be read or
+        judged within the budget (:data:`REQUEST_TIMEOUT` for the whole pass)
+        stays live; the runtime reconcile retires it through the grace
+        tracker, which judges the same evidence. Right after an operator
+        resume the close is accepted instead: the operator accepted the venue
+        as it stands.
 
         ``promoted_coids`` (rows the in-flight recovery just confirmed) are
         skipped: a freshly opened position may not yet be in this snapshot.
@@ -536,52 +587,100 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         live_order_ids = {str(o.orderId) for o in res.order}
         live_position_ids = {str(p.positionId) for p in res.position}
         retired = 0
-        for row in list(self.store_ctx.iter_live_orders()):
-            if row.client_order_id in promoted_coids:
-                continue
-            if row.state not in ('confirmed', 'closing', 'rejected'):
-                continue
-            extras = row.extras or {}
-            order_id = extras.get('order_id')
-            position_id = extras.get('position_id')
-            ref = row.exchange_order_id
-            present = (
-                    (ref is not None and (ref in live_order_ids or ref in live_position_ids))
-                    or (order_id is not None and str(order_id) in live_order_ids)
-                    or (position_id is not None and str(position_id) in live_position_ids)
-            )
-            if present:
-                continue
-            if ref is None and order_id is None and position_id is None:
-                # No broker handle at all — cannot prove it is an orphan; leave it
-                # for the runtime reconcile rather than retire a row blindly.
-                continue
-            if (position_id is None and row.filled_qty < row.qty - 1e-9
-                    and order_id is not None):
-                # An un-promoted working order (LIMIT / STOP) whose only handle is
-                # an ``order_id`` absent from ``order[]``. cTrader sheds a filled
-                # working order from ``order[]`` and the resulting ``position[]``
-                # entry carries no coid / orderId link, so a fill that landed while
-                # the bot was offline looks identical to a cancel here. Retiring it
-                # would close a freshly filled position's row before the runtime
-                # ``_reconcile_snapshot`` deal-history bridge can promote it, so
-                # leave it pending for that evidence-gated resolution.
-                continue
-            self.store_ctx.log_event(
-                'startup_orphan_retired', client_order_id=row.client_order_id,
-                exchange_order_id=ref,
-                payload={'state': row.state, 'order_id': order_id,
-                         'position_id': position_id},
-            )
-            self.store_ctx.close_order(row.client_order_id)
-            # The envelope anchor survives ``close_order``; without this delete
-            # the next dispatch of the same Pine intent reuses the stale
-            # ``bar_ts_ms`` and regenerates the SAME coid onto the just-closed
-            # row, hiding the fresh entry from ``iter_live_orders``.
-            if row.intent_key:
-                self.store_ctx.record_complete(row.intent_key)
-            retired += 1
+        self._reconcile_pass_deadline = asyncio.get_running_loop().time() + REQUEST_TIMEOUT
+        try:
+            for row in list(self.store_ctx.iter_live_orders()):
+                if row.client_order_id in promoted_coids:
+                    continue
+                if await self._retire_startup_orphan(
+                        row, live_order_ids=live_order_ids,
+                        live_position_ids=live_position_ids):
+                    retired += 1
+        finally:
+            self._reconcile_pass_deadline = None
         if retired:
             logger.info(
                 "cTrader startup: retired %d orphan order row(s) — no matching "
                 "order/position on exchange", retired)
+
+    async def _retire_startup_orphan(
+            self, row, *, live_order_ids: set[str], live_position_ids: set[str],
+    ) -> bool:
+        """Retire one row if it is an orphan whose close could be judged.
+
+        :return: Whether the row was retired.
+        """
+        assert self.store_ctx is not None
+        if row.state not in ('confirmed', 'closing', 'rejected'):
+            return False
+        extras = row.extras or {}
+        order_id = extras.get('order_id')
+        position_id = extras.get('position_id')
+        ref = row.exchange_order_id
+        present = (
+                (ref is not None and (ref in live_order_ids or ref in live_position_ids))
+                or (order_id is not None and str(order_id) in live_order_ids)
+                or (position_id is not None and str(position_id) in live_position_ids)
+        )
+        if present:
+            return False
+        if ref is None and order_id is None and position_id is None:
+            # No broker handle at all — cannot prove it is an orphan; leave it
+            # for the runtime reconcile rather than retire a row blindly.
+            return False
+        if (position_id is None and row.filled_qty < row.qty - 1e-9
+                and order_id is not None):
+            # An un-promoted working order (LIMIT / STOP) whose only handle is
+            # an ``order_id`` absent from ``order[]``. cTrader sheds a filled
+            # working order from ``order[]`` and the resulting ``position[]``
+            # entry carries no coid / orderId link, so a fill that landed while
+            # the bot was offline looks identical to a cancel here. Retiring it
+            # would close a freshly filled position's row before the runtime
+            # ``_reconcile_snapshot`` deal-history bridge can promote it, so
+            # leave it pending for that evidence-gated resolution.
+            return False
+        if position_id is not None and order_id is not None:
+            if _accepted_by_resume(row):
+                self._note_accepted_by_resume(
+                    parse_protocol_id(position_id, field='position_id'),
+                    client_order_id=row.client_order_id, volume=None)
+            elif not await self._judge_orphan_close(row, order_id, position_id):
+                return False
+        self.store_ctx.log_event(
+            'startup_orphan_retired', client_order_id=row.client_order_id,
+            exchange_order_id=ref,
+            payload={'state': row.state, 'order_id': order_id,
+                     'position_id': position_id},
+        )
+        self.store_ctx.close_order(row.client_order_id)
+        # The envelope anchor survives ``close_order``; without this delete
+        # the next dispatch of the same Pine intent reuses the stale
+        # ``bar_ts_ms`` and regenerates the SAME coid onto the just-closed
+        # row, hiding the fresh entry from ``iter_live_orders``.
+        if row.intent_key:
+            self.store_ctx.record_complete(row.intent_key)
+        return True
+
+    async def _judge_orphan_close(self, row, order_id, position_id) -> bool:
+        """Judge who closed an orphan's position, from its deal history.
+
+        The closing deals are seeded into the fill de-dup set, so a PUSH
+        replay of them after the stream opens is not booked again.
+
+        :return: ``False`` when the history could not be read or a closing
+            order not looked up yet: the row stays live.
+        """
+        pid = parse_protocol_id(position_id, field='position_id')
+        bridge = await self._find_fill_deal(
+            parse_protocol_id(order_id, field='order_id'),
+            self._recovery_lower_bound_ms(row), close_position_id=pid,
+            deadline=self._reconcile_pass_deadline)
+        if not bridge.conclusive:
+            return False
+        if bridge.closed_cents > 0:
+            if await self._judge_recovered_closes(
+                    pid, bridge.position_deals, from_entry=row.pine_entry_id,
+                    counted=bridge.deal_ids) is None:
+                return False
+            self._seen_deal_ids.update(bridge.closing_deal_ids)
+        return True

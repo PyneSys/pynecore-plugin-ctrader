@@ -2,6 +2,11 @@
 @pyne
 """
 import asyncio
+import os
+import stat
+import subprocess
+import sys
+import threading
 
 import pytest
 
@@ -15,7 +20,7 @@ from pynecore.core.broker.exceptions import (
 from pynecore.core.plugin import is_retryable_provider_error
 
 from pynecore_ctrader import CTrader, CTraderConfig
-from pynecore_ctrader import auth
+from pynecore_ctrader import auth, session
 from pynecore_ctrader.exceptions import (
     is_account_auth_lost,
     is_client_auth_lost,
@@ -1010,3 +1015,182 @@ def __test_populated_account_list_never_refreshes__(monkeypatch):
     assert asyncio.run(broker._full_handshake(wire)) == 999
     assert wire.refresh_calls == 0
     assert saved == []
+
+
+# === Token pair shared with other processes ===============================
+
+def __test_refresh_adopts_a_pair_another_process_rotated__(_isolated_session_cache):
+    """Another process sharing the session file refreshed meanwhile: its
+    rotated pair is used instead of refreshing with a stale refresh token."""
+    session.save_session(auth.TokenSet(
+        access_token="other-access", refresh_token="other-refresh", expires_in=1),
+        demo=True)
+    wire = _ReauthWire().script(
+        _oa.ProtoOAReconcileReq,
+        CTraderProtocolError('OA_AUTH_TOKEN_EXPIRED', 'token expired'),
+    )
+    broker = _ReauthBroker(wire)
+    broker._session_pair = ("tok", "ref")
+
+    res = asyncio.run(broker._reconcile())
+
+    assert isinstance(res, _oa.ProtoOAReconcileRes)
+    assert wire.refresh_calls == 0
+    assert broker._tokens.refresh_token == "other-refresh"
+    auths = [r for r in wire.requests if isinstance(r, _oa.ProtoOAAccountAuthReq)]
+    assert auths[-1].accessToken == "other-access"
+
+
+def __test_refresh_persists_the_rotated_pair_and_releases_the_lock__(_isolated_session_cache):
+    wire = _ReauthWire().script(
+        _oa.ProtoOAReconcileReq,
+        CTraderProtocolError('OA_AUTH_TOKEN_EXPIRED', 'token expired'),
+    )
+    broker = _ReauthBroker(wire)
+
+    asyncio.run(broker._reconcile())
+
+    assert wire.refresh_calls == 1
+    stored = session.load_session(demo=True)
+    assert stored is not None and stored.refresh_token == "fresh-refresh"
+    assert broker._session_pair[1] == "fresh-refresh"
+    lock = session.acquire_session_lock()
+    lock.release()
+    lock.release()
+
+
+def __test_session_file_is_written_privately_without_leftovers__(_isolated_session_cache):
+    session.save_session(auth.TokenSet(access_token="a", refresh_token="r"), demo=True)
+    session.save_session(auth.TokenSet(access_token="b", refresh_token="s"), demo=False)
+
+    directory = _isolated_session_cache.parent
+    assert sorted(p.name for p in directory.iterdir()) == ["ctrader.json"]
+    assert stat.S_IMODE(os.stat(_isolated_session_cache).st_mode) == 0o600
+    assert session.load_session(demo=True).refresh_token == "r"
+    assert session.load_session(demo=False).refresh_token == "s"
+
+
+def __test_session_lock_excludes_another_process__(_isolated_session_cache):
+    probe = (
+        "import fcntl, os, sys\n"
+        "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+        "try:\n"
+        "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "except BlockingIOError:\n"
+        "    sys.exit(3)\n"
+        "sys.exit(0)\n"
+    )
+    lock_path = str(_isolated_session_cache.with_name("ctrader.json.lock"))
+    lock = session.acquire_session_lock()
+    try:
+        held = subprocess.run([sys.executable, "-c", probe, lock_path], check=False)
+    finally:
+        lock.release()
+    free = subprocess.run([sys.executable, "-c", probe, lock_path], check=False)
+
+    assert held.returncode == 3
+    assert free.returncode == 0
+
+
+def __test_cancelled_session_lock_wait_never_leaks_the_lock__(_isolated_session_cache):
+    """A refresh abandoned while another holder had the lock must not keep
+    the lock once its worker obtains it."""
+    held = session.acquire_session_lock()
+
+    async def abandon_wait():
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(CTrader._acquire_session_lock(), timeout=0.05)
+
+    asyncio.run(abandon_wait())
+    held.release()
+    acquired: list = []
+    taker = threading.Thread(
+        target=lambda: acquired.append(session.acquire_session_lock()), daemon=True)
+    taker.start()
+    taker.join(timeout=5.0)
+
+    assert acquired, "the abandoned acquire kept the session lock"
+    acquired[0].release()
+
+
+class _KeptRefreshWire(_ReauthWire):
+    """A venue that hands back the same refresh token on every refresh."""
+
+    async def send_request(self, req, *, write_gate=None):
+        if isinstance(req, _oa.ProtoOARefreshTokenReq):
+            self.requests.append(req)
+            self.refresh_calls += 1
+            return _oa.ProtoOARefreshTokenRes(
+                accessToken=f"access-{id(self)}-{self.refresh_calls}",
+                refreshToken=req.refreshToken, tokenType="bearer", expiresIn=2_628_000)
+        return await super().send_request(req, write_gate=write_gate)
+
+
+def __test_refresh_adopts_another_process_s_access_token_when_the_refresh_token_is_kept__(
+        _isolated_session_cache):
+    """Two processes share the session file and the venue keeps the refresh
+    token: the second one must take the first one's fresh access token instead
+    of refreshing again, which would end the first one's session."""
+    session.save_session(auth.TokenSet(
+        access_token="tok", refresh_token="ref", expires_in=2_628_000), demo=True)
+    expired = CTraderProtocolError('OA_AUTH_TOKEN_EXPIRED', 'token expired')
+    first_wire = _KeptRefreshWire().script(_oa.ProtoOAReconcileReq, expired)
+    second_wire = _KeptRefreshWire().script(_oa.ProtoOAReconcileReq, expired)
+    first = _ReauthBroker(first_wire)
+    second = _ReauthBroker(second_wire)
+
+    asyncio.run(first._reconcile())
+    asyncio.run(second._reconcile())
+
+    assert first_wire.refresh_calls == 1
+    assert second_wire.refresh_calls == 0
+    assert second._tokens.access_token == first._tokens.access_token
+    stored = session.load_session(demo=True)
+    assert stored is not None and stored.access_token == first._tokens.access_token
+    auths = [r for r in second_wire.requests if isinstance(r, _oa.ProtoOAAccountAuthReq)]
+    assert auths[-1].accessToken == first._tokens.access_token
+
+
+class _RotatingRefreshWire(_ReauthWire):
+    """A venue that rotates the refresh token on every refresh."""
+
+    async def send_request(self, req, *, write_gate=None):
+        if isinstance(req, _oa.ProtoOARefreshTokenReq):
+            self.requests.append(req)
+            self.refresh_calls += 1
+            return _oa.ProtoOARefreshTokenRes(
+                accessToken=f"access-{self.refresh_calls}",
+                refreshToken=f"refresh-{self.refresh_calls}", tokenType="bearer",
+                expiresIn=2_628_000)
+        return await super().send_request(req, write_gate=write_gate)
+
+
+def __test_refresh_after_a_failed_session_save_keeps_the_newer_pair__(
+        _isolated_session_cache, monkeypatch):
+    """The refreshed pair could not be saved, so the file still holds the
+    pair the venue rotated away. The next refresh uses the newer pair in
+    memory, never the stale stored one, and saves its successor."""
+    session.save_session(auth.TokenSet(
+        access_token="tok", refresh_token="ref", expires_in=2_628_000), demo=True)
+    wire = _RotatingRefreshWire()
+    broker = _ReauthBroker(wire)
+    real_save = session.save_session
+    failures = [OSError("disk full")]
+
+    def flaky_save(tokens, *, demo):
+        if failures:
+            raise failures.pop()
+        real_save(tokens, demo=demo)
+
+    monkeypatch.setattr('pynecore_ctrader.session.save_session', flaky_save)
+
+    with pytest.raises(OSError):
+        asyncio.run(broker._refresh_and_persist(wire))
+    assert broker._tokens.refresh_token == "refresh-1"
+    asyncio.run(broker._refresh_and_persist(wire))
+
+    refreshes = [r for r in wire.requests if isinstance(r, _oa.ProtoOARefreshTokenReq)]
+    assert [r.refreshToken for r in refreshes] == ["ref", "refresh-1"]
+    assert broker._tokens.refresh_token == "refresh-2"
+    stored = session.load_session(demo=True)
+    assert stored is not None and stored.refresh_token == "refresh-2"

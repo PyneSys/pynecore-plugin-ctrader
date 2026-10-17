@@ -27,8 +27,8 @@ import functools
 import logging
 from abc import ABC, abstractmethod
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from collections.abc import AsyncIterator, Callable, Coroutine
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from google.protobuf.message import Message
@@ -67,11 +67,13 @@ if TYPE_CHECKING:
         PositionLeg,
     )
     from pynecore.core.broker.protection_guard import ProtectionLevelGuard
-    from pynecore.core.broker.storage import RunContext
+    from pynecore.core.broker.storage import OrderRow, RunContext
 
     from .models import _SymbolRules
-    from .protection import _OwnClose
-    from .reconcile import _DealWalk
+    from pynecore.core.broker.protection_guard import ProtectionLevels
+
+    from .protection import CloseOrigin, _HeldCloseVerdict, _OwnClose, _ShareEffect
+    from .reconcile import _DealWalk, _StartupShrink
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +110,21 @@ _RATE_LIMIT_BACKOFF_CAP_SECONDS = 120.0
 #: is skipped instead of stalling its loop.
 _RATE_LIMIT_HISTORY_ATTEMPTS = 12
 _RATE_LIMIT_HISTORY_BUDGET_SECONDS = 900.0
+
+#: Worker the blocking cross-process session-lock acquire runs on, so the
+#: event loop never blocks while another process refreshes the token pair.
+_SESSION_LOCK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="ctrader-session-lock")
+
+
+def _release_abandoned_session_lock(acquired: 'Future[session.SessionLock]') -> None:
+    """Release a session lock whose waiter was cancelled before it got it.
+
+    Runs on the worker thread once the acquire finished, so it works even
+    after the waiter's event loop is gone.
+    """
+    if not acquired.cancelled() and acquired.exception() is None:
+        acquired.result().release()
 
 
 class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
@@ -174,6 +191,12 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self._tokens = session.load_session(demo=self._demo) or auth.TokenSet(
             access_token="", refresh_token=""
         )
+        #: The ``(access_token, refresh_token)`` this process last loaded from
+        #: or saved to the session file. A stored pair that differs was
+        #: refreshed by another process sharing the file; see
+        #: :meth:`_adopt_rotated_session`.
+        self._session_pair: tuple[str, str] = (
+            self._tokens.access_token, self._tokens.refresh_token)
 
         #: Persistent live connection (``None`` until :meth:`connect`).
         self._wire: WireClient | None = None
@@ -301,16 +324,124 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self._close_lookup_warned: set[int] = set()
         #: Manual-close reports waiting for the stream to yield their fill
         #: event (or the reconcile pass that recovered them to end), as
-        #: ``(reason, context, client_order_id, exchange_order_id)``.
+        #: ``(reason, context, client_order_id, exchange_order_id, key)``.
         #: See ``_ProtectionMixin._flush_external_interventions``.
         self._deferred_interventions: list[
-            tuple[str, dict, str | None, str | None]] = []
+            tuple[str, dict, str | None, str | None, str]] = []
         #: Positions a manual close was already reported for (once each).
         self._external_close_reported: set[int] = set()
-        #: Positions whose manual-close report an earlier process queued but
-        #: never handled, replayed and not handled yet; venue writes wait for
-        #: them. See ``_ProtectionMixin.ensure_venue_writes_allowed``.
-        self._unhandled_close_replays: set[int] = set()
+        #: Keys of the manual-close reports queued (by this process, or
+        #: replayed from an earlier one) and not handled yet; venue writes wait
+        #: for them. See ``_ProtectionMixin.ensure_venue_writes_allowed``.
+        self._unhandled_close_reports: set[str] = set()
+        #: Recorded origin of every judged closing deal, for replaying a
+        #: NETTING position's deals against the bot's share. See
+        #: ``_ProtectionMixin._judge_recovered_closes``.
+        self._judged_close_origins: 'dict[int, CloseOrigin]' = {}
+        #: Own closes with an unknown outcome that took a closing fill, per
+        #: position, for a later check of the closing orders. See
+        #: ``_ProtectionMixin._flag_ambiguous_claim``.
+        self._ambiguous_closes: 'dict[int, _OwnClose]' = {}
+        #: Own fills the journal share counts before their event is
+        #: translated. See ``_ProtectionMixin._share_bounds``.
+        self._share_effects: 'list[_ShareEffect]' = []
+        #: Entry dispatches awaiting their answer: client-order-id ->
+        #: ``(symbol, signed volume)`` (units, buy positive) that may already
+        #: have executed.
+        self._entry_dispatches_in_flight: dict[str, tuple[str, float]] = {}
+        #: Closes of another party whose verdict waits for the answers of own
+        #: entries that were in flight. See
+        #: ``_ProtectionMixin._hold_close_verdict``.
+        self._held_close_verdicts: 'list[_HeldCloseVerdict]' = []
+        #: Every protection level the bot set (or accepted after its own fill)
+        #: per guard key in this process, through the guard or outside it,
+        #: until the bot holds nothing of the position. See
+        #: ``_ProtectionMixin._judge_fired_protection``.
+        self._own_protection_levels: 'dict[str, list[ProtectionLevels]]' = {}
+        #: The protection the venue last showed per guarded key.
+        self._last_venue_protection: 'dict[str, ProtectionLevels]' = {}
+        #: Positions the bot left without protection: it cleared the bracket,
+        #: or its fill opened the position without one. Also marked on the
+        #: position's journal row; see ``_ProtectionMixin._is_bare``.
+        self._bare_positions: set[int] = set()
+        #: Positions whose protection the bot wrote outside the level guard
+        #: (the native fail-safe, a trailing stop without an anchor): never
+        #: bare, whatever a stale own fill view shows.
+        self._unguarded_protection: set[int] = set()
+        #: Protection writes outside the level guard awaiting their answer,
+        #: per position.
+        self._unguarded_in_flight: dict[int, int] = {}
+        #: Positions a protection write outside the level guard landed on in
+        #: this process: the venue carries protection the bot wrote, so a
+        #: protection firing on them is judged. See
+        #: ``_ProtectionMixin._write_unguarded_protection``.
+        self._unguarded_baseline: set[int] = set()
+        #: Wall-clock time of the latest own protection write of a position,
+        #: sent or answered, through the guard or outside it: a reconcile
+        #: snapshot read that started earlier may show the position before it.
+        self._protection_written_at: dict[int, float] = {}
+        #: Positions an own fill of a reconcile pass was booked on whose view
+        #: that pass read before an own protection write: the first snapshot
+        #: read after the write stands in for it. See
+        #: ``_ProtectionMixin._observe_protection_snapshot``.
+        self._fill_views_deferred: set[int] = set()
+        #: Positions a protection edit was already reported for.
+        self._protection_reported: set[int] = set()
+        #: Working orders a foreign amend was already reported for.
+        self._replaced_reported: set[int] = set()
+        #: Own amends of a working entry order awaiting their answer, per
+        #: ``orderId``.
+        self._own_amends_in_flight: dict[int, int] = {}
+        #: The last ``ORDER_REPLACED`` view of a working entry order pushed
+        #: while an own amend of it was in flight, judged once the amend is
+        #: answered. See ``_ProtectionMixin._judge_replaced_order``.
+        self._replaced_during_amend: 'dict[int, OpenApiModelMessages.ProtoOAOrder]' = {}
+        #: The attributes (``protection._order_attrs``) of the latest view of
+        #: a working entry order the bot judged or got as an answer, per
+        #: ``orderId``.
+        self._order_attrs_seen: dict[int, list[float | int]] = {}
+        #: The attributes of the latest view of a working entry order before
+        #: the own amends of it now in flight were sent, per ``orderId``. See
+        #: ``_ProtectionMixin._end_own_amend``.
+        self._attrs_before_amend: dict[int, list[float | int]] = {}
+        #: What the venue's ``tradeData.volume`` of a partly filled order is:
+        #: ``'whole'`` or ``'remainder'``; ``None`` until a fill of the bot's
+        #: working entry taught it. See
+        #: ``_ProtectionMixin._learn_order_volume_semantics``.
+        self._order_volume_semantics: str | None = None
+        #: Wall-clock time the last own amend of a working entry order was
+        #: answered, per ``orderId``: a snapshot read started earlier is not
+        #: judged.
+        self._own_amend_settled_at: dict[int, float] = {}
+        #: Working entry orders a reconcile snapshot showed with terms the bot
+        #: never sent: ``(observed terms, consecutive passes)`` per ``orderId``.
+        #: See ``_ProtectionMixin._observe_working_order``.
+        self._order_terms_watch: dict[int, tuple[tuple, int]] = {}
+        #: Working entry orders whose baseline view after the operator resume
+        #: this process applies was taken, by this process or by an earlier one
+        #: applying the same resume (marked on the order's journal row). See
+        #: ``_ProtectionMixin._observe_working_order``.
+        self._orders_seen_after_resume: set[int] = set()
+        #: Closing orders recovered from the deal history that are a
+        #: protection the bot did not set, with what fired, per ``orderId``.
+        #: See ``_ProtectionMixin._recovered_protection_origin``.
+        self._fired_foreign_orders: dict[int, dict] = {}
+        #: Open positions holding less than the bot's share, per position:
+        #: ``((venue_cents, share_cents), consecutive_passes)``. See
+        #: ``_ReconcileMixin._judge_position_shrinks``.
+        self._shrink_watch: dict[int, tuple[tuple[int, int], int]] = {}
+        #: ``(position_id, (venue_cents, share_cents))`` shrinks already judged.
+        self._shrink_judged: set[tuple[int, tuple[int, int]]] = set()
+        #: Positions a restart found shrunk below the journal share whose
+        #: deals are not judged yet: this process's finding and those an
+        #: earlier process of the run journalled and never judged. See
+        #: ``_ReconcileMixin._judge_position_shrinks``.
+        self._startup_shrinks: 'dict[int, _StartupShrink]' = {}
+        #: Positions whose rows an operator resume marked at this start: a
+        #: shortfall the first settled reconcile pass finds on one is the
+        #: venue the operator accepted. See
+        #: ``_ReconcileMixin._judge_position_shrinks``.
+        self._resume_accepted_positions: set[int] = set()
         #: Protection level guard and the journal it was built on. Built
         #: lazily by ``_ProtectionMixin._protection_guard`` — ``store_ctx`` is
         #: injected after ``__init__``.
@@ -468,10 +599,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
             if is_rate_limited(exc.error_code) or not self._tokens.refresh_token:
                 raise
             logger.debug("cTrader token-scoped request failed; refreshing on socket")
-            self._tokens = await auth.refresh_via_socket(wire, self._tokens.refresh_token)
-            # cTrader may rotate the refresh token on refresh; persist the new pair
-            # so it survives a restart (the old refresh token may now be invalid).
-            session.save_session(self._tokens, demo=self._demo)
+            await self._refresh_and_persist(wire)
             return await self._retry_rate_limited(
                 lambda: call(self._tokens.access_token),
                 context="token-scoped request after refresh",
@@ -548,6 +676,15 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     async def _refresh_and_persist(self, wire: WireClient) -> None:
         """Refresh the access token on the socket and persist the rotated pair.
 
+        A refresh rotates the refresh token, and every process sharing the
+        session file (another bot on an account of the same grant, a ``pyne
+        data`` download) holds the pair it loaded. The whole
+        read-check-refresh-save sequence therefore runs under the
+        cross-process session lock: when the stored pair is not the one this
+        process last loaded, saved or uses, another process already refreshed
+        it, and that pair is adopted instead of refreshing again with a token
+        the venue may no longer accept (:meth:`_adopt_rotated_session`).
+
         Shielded from the recovery budget's cancellation: the outer
         :data:`_REAUTH_TIMEOUT` (20s) is shorter than the wire request timeout
         (:data:`~pynecore_ctrader.helpers.REQUEST_TIMEOUT`, 30s), so an unshielded
@@ -564,8 +701,15 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         """
 
         async def refresh() -> None:
-            self._tokens = await auth.refresh_via_socket(wire, self._tokens.refresh_token)
-            session.save_session(self._tokens, demo=self._demo)
+            lock = await self._acquire_session_lock()
+            try:
+                if self._adopt_rotated_session():
+                    return
+                self._tokens = await auth.refresh_via_socket(wire, self._tokens.refresh_token)
+                session.save_session(self._tokens, demo=self._demo)
+                self._session_pair = (self._tokens.access_token, self._tokens.refresh_token)
+            finally:
+                lock.release()
 
         task = asyncio.ensure_future(refresh())
         # When the await below completes normally its result/exception is already
@@ -575,6 +719,48 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         # warning (the next operational request re-drives recovery anyway).
         task.add_done_callback(lambda t: t.cancelled() or t.exception())
         await asyncio.shield(task)
+
+    @staticmethod
+    async def _acquire_session_lock() -> session.SessionLock:
+        """Take the cross-process session lock without blocking the event loop.
+
+        The blocking acquire runs on a worker thread. If the waiting coroutine
+        is cancelled, a lock the thread still obtains is released as soon as
+        it is held.
+        """
+        pending = _SESSION_LOCK_EXECUTOR.submit(session.acquire_session_lock)
+        try:
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            pending.add_done_callback(_release_abandoned_session_lock)
+            raise
+
+    def _adopt_rotated_session(self) -> bool:
+        """Adopt a token pair another process refreshed since this one loaded it.
+
+        Called under the session lock. Another process refreshed when the
+        stored pair differs from the one this process last loaded from or
+        saved to the file — its refresh token, or, should the venue hand back
+        the same refresh token, its access token. A refresh of this process
+        would then only invalidate the other's session, and the other's
+        refresh this one's again. The pair this process uses is not the
+        reference: after a refresh whose save failed it is newer than the
+        file, and the stale stored pair must not replace it.
+
+        :return: ``True`` when the stored pair was adopted; a refresh is then
+            unnecessary.
+        """
+        stored = session.load_session(demo=self._demo)
+        if stored is None or not stored.refresh_token:
+            return False
+        if (stored.access_token, stored.refresh_token) == self._session_pair:
+            return False
+        self._tokens = stored
+        self._session_pair = (stored.access_token, stored.refresh_token)
+        logger.info(
+            "cTrader: another process refreshed the OAuth token pair; using the stored pair "
+            "instead of refreshing again")
+        return True
 
     async def _reauth_account(
             self, *, force_refresh: bool = False, reauth_app: bool = False,
@@ -1496,7 +1682,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
                 payload={'fifo_head_coid': existing.client_order_id},
             )
 
-    def _retire_cancelled_working_order(self, order_id: int) -> None:
+    def _retire_cancelled_working_order(
+            self, order_id: int, *, cancel_reason: str | None = None,
+    ) -> None:
         """Close the BrokerStore working-order row of a confirmed cancel.
 
         A synchronous ``ORDER_CANCELLED`` acknowledgement is consumed by the
@@ -1524,6 +1712,8 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         reach the venue with no local terminal progression.
 
         :param order_id: The broker ``orderId`` of the cancelled working order.
+        :param cancel_reason: The venue's own cause of the cancel, when it
+            named one; recorded on the audit event.
         """
         if self.store_ctx is None or not order_id:
             return
@@ -1536,6 +1726,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
             client_order_id=row.client_order_id,
             exchange_order_id=str(order_id),
             intent_key=row.intent_key,
+            payload={'cancel_reason': cancel_reason} if cancel_reason is not None else None,
         )
 
     # --- assembled feature surface -----------------------------------------
@@ -1567,6 +1758,24 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
     @abstractmethod
     async def _recover_in_flight_submissions(self) -> None: ...
+
+    @abstractmethod
+    def _note_accepted_by_resume(
+            self, position_id: int, *, client_order_id: str | None, volume: float | None,
+            deal_ids: Iterable[int] = (),
+    ) -> None: ...
+
+    @abstractmethod
+    def _rebaseline_bare_marks(self, res: OpenApiMessages.ProtoOAReconcileRes) -> None: ...
+
+    @abstractmethod
+    def _record_startup_shrink(
+            self, position: OpenApiModelMessages.ProtoOAPosition, row: 'OrderRow',
+            volume: float,
+    ) -> None: ...
+
+    @abstractmethod
+    def _restore_startup_shrinks(self) -> None: ...
 
     @abstractmethod
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...

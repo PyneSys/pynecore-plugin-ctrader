@@ -35,7 +35,9 @@ recovery is the M3 startup-recovery's job, not this loop's.
 """
 import asyncio
 import logging
+import uuid
 from abc import ABC
+from itertools import combinations
 from dataclasses import dataclass, field
 from time import time as epoch_time
 from typing import TYPE_CHECKING, AsyncIterator, cast
@@ -45,6 +47,7 @@ from pynecore.core.broker.disappearance import (
     MissingConfirmation,
     MissingResolution,
 )
+from pynecore.core.broker.exceptions import BrokerError
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.models import (
     ExchangeOrder,
@@ -54,11 +57,26 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 
-from .helpers import REQUEST_TIMEOUT, money_value, parse_protocol_id, volume_to_units
+from .exceptions import is_not_found
+from .helpers import (
+    REQUEST_TIMEOUT,
+    money_value,
+    parse_protocol_id,
+    raw_volume,
+    volume_to_units,
+)
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
-from .protection import _ProtectionMixin
-from .wire import CTraderTimeoutError
+from .protection import (
+    _CLOCK_SKEW_MS,
+    _VOLUME_TOL,
+    CloseOrigin,
+    _accepted_by_resume,
+    _foreign_claims_taken,
+    _PositionDeal,
+    _ProtectionMixin,
+)
+from .wire import CTraderProtocolError, CTraderTimeoutError, CTraderWireError
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -81,6 +99,24 @@ _SINCE_ANCHOR_SKEW_MS = 60_000
 
 #: ``maxRows`` per ``ProtoOADealListReq`` page.
 _DEAL_PAGE_MAX_ROWS = 1000
+
+#: Consecutive reconcile passes an open position must show the same shortfall
+#: below the bot's share before its deal history is judged.
+_SHRINK_CONFIRMATIONS = 2
+
+#: Deal statuses that executed volume.
+_EXECUTED_DEAL_STATUSES = frozenset({
+    OpenApiModelMessages.ProtoOADealStatus.FILLED,
+    OpenApiModelMessages.ProtoOADealStatus.PARTIALLY_FILLED,
+})
+
+#: Journal event of a shrink a restart found and retired from the journal; its
+#: deals are judged later, by this process or a later one of the run.
+_STARTUP_SHRINK_PENDING_EVENT = 'ctrader_startup_shrink_pending'
+
+#: Journal event naming the pending startup shrinks whose deals were judged, or
+#: that an operator resume accepted.
+_STARTUP_SHRINK_DONE_EVENT = 'ctrader_startup_shrink_done'
 
 #: Disappearance grace window (seconds). A bot-owned row stamped
 #: ``missing_pending_since`` (vanished from BOTH ``order[]`` and ``position[]``)
@@ -121,9 +157,9 @@ class _DealBridgeResult:
         they are absent from :ivar:`deal_ids` — yet a closure concluded from
         them must seed the de-dup channel too, or a late PUSH replay of the
         closing execution would re-book against the retired position.
-    :ivar closing_deals: ``(deal_id, order_id, executed_ms, closed_cents)`` of
-        the same deals, for judging who closed the position
-        (:meth:`_ProtectionMixin._judge_recovered_closes`).
+    :ivar position_deals: Every deal that executed volume on the resolved
+        target position in the window, in execution order, for judging who
+        closed it (:meth:`_ProtectionMixin._judge_recovered_closes`).
     :ivar fills: ``(timestamp_ms, deal_id, volume_cents, price, fee)`` of every
         matching FILLED deal, oldest first — the per-execution terms a
         recovered DELTA is priced and charged from when part of the order's
@@ -138,7 +174,26 @@ class _DealBridgeResult:
     deal_ids: tuple[int, ...] = ()
     closing_deal_ids: tuple[int, ...] = ()
     fills: tuple[tuple[int, int, int, float, float], ...] = ()
-    closing_deals: tuple[tuple[int, int, int, int], ...] = ()
+    position_deals: tuple[_PositionDeal, ...] = ()
+
+
+@dataclass(slots=True)
+class _StartupShrink:
+    """A shrink a restart found and retired whose deals are not judged yet.
+
+    :ivar volume: The bot's share (units) the startup baselines retired.
+    :ivar since_ms: The earliest time (ms) a deal of the bot's on the position
+        can carry.
+    :ivar from_entry: The Pine entry the position belongs to.
+    :ivar order_ids: The bot's entry orders on the position at the restart,
+        which a closed journal row no longer resolves.
+    :ivar keys: The journal keys of the pending records this one merges.
+    """
+    volume: float
+    since_ms: int
+    from_entry: str | None
+    order_ids: list[int] = field(default_factory=list)
+    keys: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -156,6 +211,9 @@ class _DealWalk:
     :ivar fills: The order's FILLED deals by ``dealId``.
     :ivar closes: ``(positionId, closedVolume, orderId, executed_ms)`` by
         ``dealId`` of every deal in the window that closed volume.
+    :ivar deals: ``(positionId, orderId, executed_ms, filledVolume,
+        closedVolume)`` by ``dealId`` of every deal in the window that
+        executed volume.
     :ivar last_request: Event-loop time the walk last sent a page request
         (``-inf`` before its first), so unfinished walks take turns.
     """
@@ -164,6 +222,7 @@ class _DealWalk:
     segments: list[list[int]] = field(default_factory=list)
     fills: 'dict[int, OpenApiModelMessages.ProtoOADeal]' = field(default_factory=dict)
     closes: dict[int, tuple[int, int, int, int]] = field(default_factory=dict)
+    deals: dict[int, tuple[int, int, int, int, int]] = field(default_factory=dict)
     last_request: float = float('-inf')
 
     def ingest(self, deal: 'OpenApiModelMessages.ProtoOADeal', order_id: int) -> None:
@@ -180,6 +239,12 @@ class _DealWalk:
             self.closes[deal.dealId] = (
                 deal.positionId, deal.closePositionDetail.closedVolume, deal.orderId,
                 deal.executionTimestamp or deal.createTimestamp)
+        if deal.filledVolume > 0 and deal.dealStatus in _EXECUTED_DEAL_STATUSES:
+            self.deals[deal.dealId] = (
+                deal.positionId, deal.orderId, deal.executionTimestamp or deal.createTimestamp,
+                deal.filledVolume,
+                deal.closePositionDetail.closedVolume
+                if deal.HasField('closePositionDetail') else 0)
         if (deal.orderId == order_id
                 and deal.dealStatus == OpenApiModelMessages.ProtoOADealStatus.FILLED):
             kept = OpenApiModelMessages.ProtoOADeal()
@@ -216,11 +281,14 @@ class _DealWalk:
                  d.executionPrice, money_value(d.commission, d.moneyDigits))
                 for d in fills
             ),
-            tuple(
-                (deal_id, self.closes[deal_id][2], self.closes[deal_id][3],
-                 self.closes[deal_id][1])
-                for deal_id in closing_ids
-            ),
+            tuple(sorted(
+                (_PositionDeal(deal_id=deal_id, order_id=order_ref, executed_ms=executed_ms,
+                               filled=filled, closed=min(closed, filled))
+                 for deal_id, (position_id, order_ref, executed_ms, filled, closed)
+                 in self.deals.items()
+                 if closed_target is not None and position_id == closed_target),
+                key=lambda deal: (deal.executed_ms, deal.deal_id),
+            )),
         )
 
 
@@ -236,8 +304,10 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         ``missing_pending_since`` on rows whose broker counterpart has
         deterministically vanished. Emits nothing — and stamps nothing — for an
         ambiguous observation; the next pass or the live PUSH event resolves it.
-        Finally judges the guarded positions' protection levels against the
-        levels this run set (:meth:`_observe_protection_snapshot`).
+        Each working entry order's terms are judged against the terms this run
+        sent (:meth:`_observe_working_order`), and finally the guarded
+        positions' protection levels against the levels this run set
+        (:meth:`_observe_protection_snapshot`).
 
         A no-op when persistence is off (the test paths) or the live connection
         is not established.
@@ -260,6 +330,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         # spends the same pass budget as the deal-history reads below; an
         # overrun fails the pass as transient and the next pass reads afresh.
         read_started_at = epoch_time()
+        queue_idle = self._exec_events is None or self._exec_events.empty()
         try:
             async with asyncio.timeout_at(self._reconcile_pass_deadline):
                 res = await self._reconcile()
@@ -279,14 +350,21 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             rows.append((row, parse_protocol_id(order_id_raw, field='order_id')
                          if order_id_raw is not None else None))
         live_order_ids = {order_id for _row, order_id in rows}
-        for stale in [oid for oid in self._deal_walks if oid not in live_order_ids]:
+        # Position-history walks are keyed by the negated position id
+        # (:meth:`_position_history`); they live while their position is open
+        # or a shrink a restart found on it waits for its judgment.
+        for stale in [oid for oid in self._deal_walks
+                      if (oid not in live_order_ids if oid >= 0
+                          else -oid not in open_positions
+                          and -oid not in self._startup_shrinks)]:
             del self._deal_walks[stale]
         # Rows whose deal-history walk an earlier pass left unfinished go first,
         # so a lookup that keeps spending most of the budget cannot starve them;
         # among those, the walk that waited longest for a request goes first,
         # so one stalled lookup cannot starve the other unfinished walks.
         def walk_turn(item: tuple['OrderRow', int | None]) -> tuple[bool, float]:
-            walk = self._deal_walks.get(item[1]) if item[1] is not None else None
+            walk: _DealWalk | None = (
+                self._deal_walks.get(item[1]) if item[1] is not None else None)
             if walk is None or not walk.segments:
                 return True, 0.0
             return False, walk.last_request
@@ -308,6 +386,9 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 if event is not None:
                     filled_coids.append(row.client_order_id)
                     yield event
+                # An edit of the working order made while the stream was
+                # down reaches the bot only through this view.
+                self._observe_working_order(order, read_started_at=read_started_at)
                 continue
             position_id = extras.get('position_id')
             if position_id and row.filled_qty >= row.qty - 1e-9:
@@ -344,6 +425,11 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             open_positions, read_started_at=read_started_at,
             filled_positions=self._row_position_ids(filled_coids),
         )
+        queue_idle = queue_idle and not filled_coids and (
+                self._exec_events is None or self._exec_events.empty())
+        await self._judge_position_shrinks(
+            open_positions, read_started_at=read_started_at, queue_idle=queue_idle)
+        await self._judge_ambiguous_close_claims()
 
     def _row_position_ids(self, coids: list[str]) -> set[int]:
         """Positions the given journal rows are linked to now."""
@@ -356,6 +442,406 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             if raw is not None:
                 position_ids.add(parse_protocol_id(raw, field='position_id'))
         return position_ids
+
+    def _record_reconciled_fill(
+            self, order_id: int, position_id: int | None, side: str, units: float,
+            fills: tuple[tuple[int, int, int, float, float], ...], deal_ids: set[int],
+    ) -> None:
+        """The journal now counts own fills whose events the stream may still deliver.
+
+        One share effect per execution the history names, the rest as one
+        effect of unknown time (see :meth:`_ProtectionMixin._share_bounds`).
+
+        :param side: The side of the row the fills belong to.
+        """
+        if not position_id or units <= 0.0:
+            return
+        sign = 1.0 if side == 'buy' else -1.0
+        remaining = units
+        for executed_ms, deal_id, cents, _price, _fee in fills:
+            if deal_id not in deal_ids or remaining <= _VOLUME_TOL:
+                continue
+            part = min(remaining, volume_to_units(cents))
+            self._record_share_effect(position_id, sign * part, counted=True,
+                                      executed_ms=executed_ms, deal_id=deal_id,
+                                      order_id=order_id)
+            remaining -= part
+        if remaining > _VOLUME_TOL:
+            self._record_share_effect(position_id, sign * remaining, counted=True,
+                                      executed_ms=None, deal_id=None, order_id=order_id)
+
+    def _share_with_recovered_fill(
+            self, row: 'OrderRow', position_id: int, recovered: float,
+    ) -> float:
+        """The bot's share of a position counting a row's fill recovered from history."""
+        rows = self._position_entry_rows(position_id)
+        net = sum(self._signed_exposure(r) for r in rows)
+        counted = (row.filled_qty
+                   if any(r.client_order_id == row.client_order_id for r in rows) else 0.0)
+        added = max(0.0, min(row.qty, recovered) - counted)
+        return abs(net + (added if row.side == 'buy' else -added))
+
+    async def _position_history(self, position_id: int, from_ms: int) -> '_DealBridgeResult':
+        """Every deal on a position since ``from_ms``, within the pass budget.
+
+        Walked like an order's history, keyed by the negated position id, so
+        the walk resumes across passes; no order's fills are collected.
+        """
+        return await self._find_fill_deal(
+            -position_id, from_ms, close_position_id=position_id,
+            deadline=self._reconcile_pass_deadline)
+
+    def _position_window_start(
+            self, position_id: int, position: 'OpenApiModelMessages.ProtoOAPosition',
+    ) -> int:
+        """The earliest time (ms) a deal of the bot's on a position can carry."""
+        anchors = [self._deal_since_ms(row.extras or {})
+                   for row in self._position_entry_rows(position_id)]
+        if position.tradeData.openTimestamp:
+            anchors.append(position.tradeData.openTimestamp - _CLOCK_SKEW_MS)
+        return min(anchors) if anchors else int(epoch_time() * 1000) - int(
+            _DEAL_LOOKBACK_S * 1000)
+
+    def _side_volume(
+            self, position_id: int, position: 'OpenApiModelMessages.ProtoOAPosition',
+    ) -> float:
+        """The volume (units) an open position holds on the bot's side."""
+        side = self._share_side(position_id)
+        venue_side = ('buy' if position.tradeData.tradeSide
+                      == OpenApiModelMessages.ProtoOATradeSide.BUY else 'sell')
+        if side is not None and side != venue_side:
+            return 0.0
+        return volume_to_units(position.tradeData.volume)
+
+    async def _judge_position_shrinks(
+            self, open_positions: 'dict[int, OpenApiModelMessages.ProtoOAPosition]', *,
+            read_started_at: float, queue_idle: bool,
+    ) -> None:
+        """Judge open positions holding less than the bot's share.
+
+        A partial close the PUSH stream missed (the stream was down) leaves a
+        run-owned position open below the bot's journal share. Once the same
+        shortfall shows on :data:`_SHRINK_CONFIRMATIONS` consecutive passes —
+        with nothing of the bot's in flight and no event waiting in the queue,
+        so the journal share is final — the position's deal history is judged
+        like a recovered close (:meth:`_judge_recovered_closes`) and the share
+        those deals took retired from the journal: the venue is the truth.
+        That can be more than the shortfall when the venue counts another
+        party's exposure too (a NETTING position); never less. A shrink a
+        restart found and the startup baseline already retired
+        (:attr:`_startup_shrinks`) is judged once, against the share the
+        journal held before, and whatever the deals took beyond the baseline
+        is retired then; on a position that closed, or that the bot holds no
+        journal share of any more, before such a pass, from the position's
+        deal history alone (:meth:`_judge_unshared_startup_shrink`). A
+        shortfall the first settled pass after an operator resume finds on a
+        position the resume marked (:attr:`_resume_accepted_positions`) is the
+        venue the operator accepted: retired with a WARNING and an audit
+        event, never judged.
+
+        :param open_positions: The snapshot's open positions by id.
+        :param read_started_at: Wall-clock time the snapshot read started.
+        :param queue_idle: Whether no execution event waited in the queue
+            around the snapshot read and the pass booked no fill.
+        """
+        if self.store_ctx is None:
+            return
+        for position_id in [pid for pid in self._shrink_watch if pid not in open_positions]:
+            del self._shrink_watch[position_id]
+        self._resume_accepted_positions.intersection_update(open_positions)
+        for position_id in list(self._startup_shrinks):
+            position = open_positions.get(position_id)
+            if (position is None or self._own_share(position_id) is None
+                    or position_id in self._external_close_reported):
+                await self._judge_unshared_startup_shrink(
+                    position_id, position, read_started_at=read_started_at,
+                    queue_idle=queue_idle)
+        for position_id, position in open_positions.items():
+            share = self._own_share(position_id)
+            if share is None or position_id in self._external_close_reported:
+                self._shrink_watch.pop(position_id, None)
+                self._resume_accepted_positions.discard(position_id)
+                continue
+            venue = self._side_volume(position_id, position)
+            startup = self._startup_shrinks.get(position_id)
+            if startup is None and venue >= share - _VOLUME_TOL:
+                self._shrink_watch.pop(position_id, None)
+                self._resume_accepted_positions.discard(position_id)
+                continue
+            if not queue_idle or not self._share_settled(position_id):
+                continue
+            if position_id in self._resume_accepted_positions:
+                self._resume_accepted_positions.discard(position_id)
+                rows = self._position_entry_rows(position_id)
+                self._note_accepted_by_resume(
+                    position_id, client_order_id=rows[0].client_order_id if rows else None,
+                    volume=share - venue)
+                self._retire_partial_close_exposure(
+                    position_id, share - venue, source='resume_accepted')
+                continue
+            if startup is not None:
+                taken = await self._judge_shrink(
+                    position_id, position, venue=venue, share_now=share + startup.volume,
+                    read_started_at=read_started_at)
+                if taken is not None:
+                    self._end_startup_shrink(position_id)
+                    if taken - startup.volume > _VOLUME_TOL:
+                        self._retire_partial_close_exposure(
+                            position_id, taken - startup.volume, source='position_shrink')
+                continue
+            key = (raw_volume(venue), raw_volume(share))
+            if (position_id, key) in self._shrink_judged:
+                continue
+            seen_key, count = self._shrink_watch.get(position_id, (None, 0))
+            count = count + 1 if seen_key == key else 1
+            self._shrink_watch[position_id] = (key, count)
+            if count < _SHRINK_CONFIRMATIONS:
+                continue
+            taken = await self._judge_shrink(
+                position_id, position, venue=venue, share_now=share,
+                read_started_at=read_started_at)
+            if taken is not None:
+                self._shrink_judged.add((position_id, key))
+                self._shrink_watch.pop(position_id, None)
+                retired = max(share - venue, taken)
+                self._retire_partial_close_exposure(
+                    position_id, retired, source='position_shrink')
+
+    async def _judge_shrink(
+            self, position_id: int, position: 'OpenApiModelMessages.ProtoOAPosition', *,
+            venue: float, share_now: float, read_started_at: float,
+    ) -> float | None:
+        """Judge the deal history of one position open below the bot's share.
+
+        :return: The volume (units) of the bot's share the judged deals took
+            (:meth:`_judge_recovered_closes`); ``None`` when the history could
+            not be read or judged yet, or a deal in it may postdate the
+            snapshot: the caller retries on a later pass.
+        """
+        history = await self._position_history(
+            position_id, self._position_window_start(position_id, position))
+        if not history.conclusive:
+            return None
+        cutoff = int(read_started_at * 1000) - _CLOCK_SKEW_MS
+        if any(deal.executed_ms >= cutoff for deal in history.position_deals):
+            return None
+        rows = self._position_entry_rows(position_id)
+        return await self._judge_recovered_closes(
+            position_id, history.position_deals,
+            from_entry=rows[0].pine_entry_id if rows else None,
+            venue_now=venue, share_now=share_now)
+
+    async def _judge_unshared_startup_shrink(
+            self, position_id: int,
+            position: 'OpenApiModelMessages.ProtoOAPosition | None', *,
+            read_started_at: float, queue_idle: bool,
+    ) -> None:
+        """Judge a shrink a restart found once nothing ties the position to the journal share.
+
+        The position closed, or the bot's rows of it were retired, before a
+        settled pass judged the shrink against the share. Its deals are judged
+        from the position's history alone: against the share the startup
+        baseline retired, on top of whatever share the journal still counts,
+        with the closes that came later judged when they came. A position
+        whose close was reported already needs no other verdict.
+
+        :param position: The snapshot's view of the position; ``None`` when
+            it is gone.
+        :param read_started_at: Wall-clock time the snapshot read started.
+        :param queue_idle: Whether no execution event waited in the queue
+            around the snapshot read and the pass booked no fill.
+        """
+        if position_id in self._external_close_reported:
+            self._end_startup_shrink(position_id)
+            return
+        if not queue_idle or not self._share_settled(position_id):
+            return
+        pending = self._startup_shrinks[position_id]
+        history = await self._position_history(position_id, pending.since_ms)
+        if not history.conclusive:
+            return
+        cutoff = int(read_started_at * 1000) - _CLOCK_SKEW_MS
+        if any(deal.executed_ms >= cutoff for deal in history.position_deals):
+            return
+        venue = self._side_volume(position_id, position) if position is not None else 0.0
+        taken = await self._judge_recovered_closes(
+            position_id, history.position_deals, from_entry=pending.from_entry,
+            venue_now=venue, share_now=(self._own_share(position_id) or 0.0) + pending.volume,
+            own_orders=pending.order_ids)
+        if taken is not None:
+            self._end_startup_shrink(position_id)
+
+    def _record_startup_shrink(
+            self, position: 'OpenApiModelMessages.ProtoOAPosition', row: 'OrderRow',
+            volume: float,
+    ) -> None:
+        """Keep a shrink the startup baseline retired pending until its deals are judged.
+
+        Journalled: a process that stops before a reconcile pass judges it
+        leaves it to the next process of the run, whose journal share already
+        matches the venue.
+
+        :param position: The startup snapshot's view of the shrunk position.
+        :param row: The one live entry row holding the position.
+        :param volume: The share (units) the baseline retired.
+        """
+        if self.store_ctx is None:
+            return
+        position_id = position.positionId
+        key = uuid.uuid4().hex
+        since_ms = self._position_window_start(position_id, position)
+        order_ids = sorted({
+            parse_protocol_id(raw, field='order_id')
+            for raw in ((r.extras or {}).get('order_id')
+                        for r in self._position_entry_rows(position_id))
+            if raw is not None})
+        self.store_ctx.log_event(
+            _STARTUP_SHRINK_PENDING_EVENT, client_order_id=row.client_order_id,
+            exchange_order_id=str(position_id),
+            payload={'key': key, 'position_id': position_id, 'volume': volume,
+                     'since_ms': since_ms, 'from_entry': row.pine_entry_id,
+                     'order_ids': order_ids, 'found_ms': int(epoch_time() * 1000)})
+        self._merge_startup_shrink(position_id, _StartupShrink(
+            volume=volume, since_ms=since_ms, from_entry=row.pine_entry_id,
+            order_ids=order_ids, keys=[key]))
+
+    def _restore_startup_shrinks(self) -> None:
+        """Take over the startup shrinks earlier processes of the run left unjudged.
+
+        Runs once, from the startup adoption baseline, after this process's
+        own findings. An operator resume accepted the venue as it stood: a
+        pending shrink found before the resume, or on a position whose rows
+        the resume marked, is accepted with a WARNING and an audit event.
+        """
+        store = self.store_ctx
+        if store is None:
+            return
+        done: set[str] = set()
+        for _intent, _coid, _ref, payload in store.iter_events_by_kind_for_run_id(
+                _STARTUP_SHRINK_DONE_EVENT):
+            keys = payload.get('keys')
+            if isinstance(keys, list):
+                done.update(key for key in keys if isinstance(key, str))
+        done.update(key for pending in self._startup_shrinks.values() for key in pending.keys)
+        resume_ts_ms = self.operator_resume_ts_ms
+        for _intent, coid, _ref, payload in store.iter_events_by_kind_for_run_id(
+                _STARTUP_SHRINK_PENDING_EVENT):
+            key = payload.get('key')
+            position_id = payload.get('position_id')
+            volume = payload.get('volume')
+            since_ms = payload.get('since_ms')
+            found_ms = payload.get('found_ms')
+            from_entry = payload.get('from_entry')
+            order_ids = payload.get('order_ids')
+            if (not isinstance(key, str) or key in done or not isinstance(position_id, int)
+                    or not isinstance(volume, (int, float)) or not isinstance(since_ms, int)
+                    or not isinstance(found_ms, int) or not isinstance(order_ids, list)):
+                continue
+            done.add(key)
+            if position_id in self._resume_accepted_positions or (
+                    resume_ts_ms is not None and found_ms <= resume_ts_ms):
+                self._note_accepted_by_resume(
+                    position_id, client_order_id=coid, volume=float(volume))
+                store.log_event(
+                    _STARTUP_SHRINK_DONE_EVENT, exchange_order_id=str(position_id),
+                    payload={'keys': [key], 'position_id': position_id})
+                continue
+            self._merge_startup_shrink(position_id, _StartupShrink(
+                volume=float(volume), since_ms=since_ms,
+                from_entry=from_entry if isinstance(from_entry, str) else None,
+                order_ids=[oid for oid in order_ids if isinstance(oid, int)], keys=[key]))
+
+    def _merge_startup_shrink(self, position_id: int, shrink: _StartupShrink) -> None:
+        """Add a pending startup shrink to the one already pending on its position."""
+        pending = self._startup_shrinks.get(position_id)
+        if pending is None:
+            self._startup_shrinks[position_id] = shrink
+            return
+        pending.volume += shrink.volume
+        pending.since_ms = min(pending.since_ms, shrink.since_ms)
+        pending.from_entry = pending.from_entry or shrink.from_entry
+        pending.order_ids.extend(oid for oid in shrink.order_ids if oid not in pending.order_ids)
+        pending.keys.extend(shrink.keys)
+
+    def _end_startup_shrink(self, position_id: int) -> None:
+        """A pending startup shrink got its verdict: never judged again by any process."""
+        pending = self._startup_shrinks.pop(position_id, None)
+        if pending is not None and self.store_ctx is not None:
+            self.store_ctx.log_event(
+                _STARTUP_SHRINK_DONE_EVENT, exchange_order_id=str(position_id),
+                payload={'keys': pending.keys, 'position_id': position_id})
+
+    async def _judge_ambiguous_close_claims(self) -> None:
+        """Settle closing fills taken for an own close whose outcome is unknown.
+
+        On a HEDGED account the closing orders of those fills can settle it:
+        the bot's close is a client order without a client-order-id, so a
+        fill of an order carrying another client's client-order-id is never
+        its own, and one without may be. Every way of taking up to as many of
+        the latter as the run has closes of unknown outcome on the position
+        as the bot's own is weighed: the other orders' fills are judged
+        against the bot's share as an answer naming the close would judge them
+        (:func:`_foreign_claims_taken`) — a close of only another party's
+        exposure merged onto the position takes nothing of it. Reported when
+        another party's fill took the bot's share whichever orders were the
+        bot's; otherwise the ERROR and audit written when the fill was taken
+        stand. On a NETTING account the orders cannot be told apart this way;
+        the ERROR and audit stand.
+        """
+        if not self._ambiguous_closes:
+            return
+        if not self._hedging_enabled:
+            self._ambiguous_closes.clear()
+            return
+        for position_id in list(self._ambiguous_closes):
+            if position_id in self._external_close_reported:
+                del self._ambiguous_closes[position_id]
+                continue
+            records = [own for own in self._own_close_history
+                       if own.position_id == position_id and own.order_id is None]
+            claimed = sorted({claim.order_id for own in records for claim in own.claims
+                              if not claim.venue})
+            kinds: dict[int, CloseOrigin] = {}
+            for order_id in claimed:
+                kind = await self._closing_order_kind(position_id, order_id)
+                if kind is None:
+                    break
+                kinds[order_id] = kind
+            else:
+                del self._ambiguous_closes[position_id]
+                own = {order_id for order_id, kind in kinds.items() if kind is CloseOrigin.OWN}
+                maybe_own = [order_id for order_id, kind in kinds.items()
+                             if kind in (CloseOrigin.UNATTRIBUTED, CloseOrigin.UNKNOWN)]
+                takes: list[float] = []
+                for count in range(min(len(records), len(maybe_own)) + 1):
+                    for chosen in combinations(maybe_own, count):
+                        own_orders = own | set(chosen)
+                        takes.append(sum(
+                            _foreign_claims_taken(record.claims, own_orders, record.credit)[0]
+                            for record in records))
+                taken = min(takes)
+                if taken <= _VOLUME_TOL:
+                    logger.info(
+                        "cTrader: the closes taken for bot position %d's close of unknown "
+                        "outcome may all be the bot's or another party's own exposure; "
+                        "the audit written when they were taken stands", position_id)
+                    continue
+                candidates = [order_id for order_id in claimed if order_id not in own]
+                self._queue_external_close(position_id, {
+                    'position_id': position_id,
+                    'order_id': candidates[0],
+                    'candidate_order_ids': candidates,
+                    'closed_qty': sum(claim.fill_qty for record in records
+                                      for claim in record.claims
+                                      if not claim.venue and claim.order_id in candidates),
+                    'booked_qty': taken,
+                    'own_closes_unknown': len(records),
+                    'recovered': True,
+                }, reason=(
+                    f"bot position {position_id} was closed by client orders "
+                    f"{candidates} while {len(records)} close(s) of the bot had an unknown "
+                    f"outcome: whichever of them was the bot's, someone else took "
+                    f"{taken} units of the bot's share"))
 
     def _feed_native_failsafe_observations(
             self, open_positions: 'dict[int, OpenApiModelMessages.ProtoOAPosition]',
@@ -510,7 +996,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
           (the ``close_position_id`` fallback). The closing deals are first
           judged for an external close the PUSH stream missed
           (:meth:`_judge_recovered_closes`); while a closing order cannot be
-          looked up the verdict stays INCONCLUSIVE.
+          looked up the verdict stays INCONCLUSIVE. A row whose disappearance
+          an operator resume accepted has its close accepted instead.
         * A zero-fill working order that FILLED during the gap: it
           demonstrably opened a position, so it is NOT a cancel — the
           tracker clears the now-false premise and the next
@@ -518,9 +1005,14 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
           snapshot. No fill data is returned here: the snapshot bridge
           owns the promotion (and its dedup seeding), keeping this path
           book-free.
-        * CONCLUSIVE no-fill / no-close: the genuine unexpected
-          disappearance — the tracker retires it as a synthetic cancel
-          and applies the ``on_unexpected_cancel`` policy.
+        * CONCLUSIVE no-fill / no-close: the order's own status decides
+          (:meth:`_vanished_order_verdict`). An order the venue ended
+          (expired, rejected) is retired as a synthetic cancel carrying the
+          venue's reason, no policy applies; one that expired at an expiry
+          the bot never set was edited by someone else, and the tracker
+          applies the ``on_unexpected_cancel`` policy. A cancel the status
+          cannot attribute is retired with an ERROR and an audit event and
+          no policy; an order that executed or still works is no cancel.
         """
         extras = row.extras or {}
         order_id_raw = extras.get('order_id')
@@ -543,8 +1035,14 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     bridge.deal.positionId if bridge.deal is not None else position_id
                 )
                 assert close_pid is not None
-                if not await self._judge_recovered_closes(
-                        close_pid, bridge.closing_deals, from_entry=row.pine_entry_id):
+                if _accepted_by_resume(row):
+                    self._note_accepted_by_resume(
+                        close_pid, client_order_id=row.client_order_id, volume=None,
+                        deal_ids=bridge.closing_deal_ids)
+                    self._mark_close_judged(list(bridge.closing_deal_ids))
+                elif await self._judge_recovered_closes(
+                        close_pid, bridge.position_deals, from_entry=row.pine_entry_id,
+                        counted=bridge.deal_ids) is None:
                     return MissingConfirmation(MissingResolution.INCONCLUSIVE)
                 # Register the entry fills AND the closing deals: the
                 # closure is concluded from the closing evidence, whose
@@ -558,9 +1056,69 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     position_ref=str(close_pid),
                     execution_ids=tuple(str(d) for d in evidence),
                 )
-            if position_id is None and bridge.filled_cents > 0:
-                return MissingConfirmation(MissingResolution.FILLED)
+            if position_id is None:
+                if bridge.filled_cents > 0:
+                    return MissingConfirmation(MissingResolution.FILLED)
+                return await self._vanished_order_verdict(row, order_id)
         return MissingConfirmation(MissingResolution.CANCELLED)
+
+    async def _vanished_order_verdict(
+            self, row: 'OrderRow', order_id: int,
+    ) -> MissingConfirmation:
+        """The verdict on a working order that left the venue without a fill.
+
+        The order's own status (``ProtoOAOrderDetailsReq``) tells what ended
+        it. An order that executed (filled, or executed part of its volume)
+        was not cancelled: the deal history does not list its fill yet, and
+        the snapshot bridge promotes it once it does. An order the venue still
+        reports as accepted is still working. An expired or rejected order
+        was ended by the venue, so the cancel carries the venue's reason
+        (:meth:`_venue_cancel_reason`) and the tracker applies no policy,
+        unless it expired at an expiry the bot never set: someone else's edit,
+        the unexpected cancel the policy handles. A cancelled order, or one
+        the venue reports as not found, was ended by someone the evidence
+        cannot name (:meth:`_unattributed_cancel_reason`). A lookup that
+        failed for now leaves the verdict to a later pass.
+
+        :param row: The vanished order's journal row.
+        :param order_id: The order's id.
+        """
+        if self._live_account_id is None:
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+        try:
+            async with asyncio.timeout_at(self._reconcile_pass_deadline):
+                res = cast(OpenApiMessages.ProtoOAOrderDetailsRes, await self._account_request(
+                    OpenApiMessages.ProtoOAOrderDetailsReq(
+                        ctidTraderAccountId=self._live_account_id, orderId=order_id)))
+        except CTraderProtocolError as exc:
+            if is_not_found(exc.error_code):
+                return MissingConfirmation(
+                    MissingResolution.CANCELLED,
+                    cancel_reason=self._unattributed_cancel_reason(
+                        row, order_id, status=exc.error_code))
+            logger.debug("cTrader vanished-order lookup for %d deferred: %s", order_id, exc)
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+        except (BrokerError, CTraderWireError, TimeoutError) as exc:
+            logger.debug("cTrader vanished-order lookup for %d deferred: %s", order_id, exc)
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+        order = res.order
+        statuses = OpenApiModelMessages.ProtoOAOrderStatus
+        status = order.orderStatus
+        if status == statuses.ORDER_STATUS_FILLED or order.executedVolume > 0:
+            return MissingConfirmation(MissingResolution.FILLED)
+        if status == statuses.ORDER_STATUS_ACCEPTED:
+            return MissingConfirmation(MissingResolution.STILL_PRESENT)
+        if status in (statuses.ORDER_STATUS_EXPIRED, statuses.ORDER_STATUS_REJECTED):
+            return MissingConfirmation(
+                MissingResolution.CANCELLED,
+                cancel_reason=self._venue_cancel_reason(
+                    order, expired=status == statuses.ORDER_STATUS_EXPIRED,
+                    rejected=status == statuses.ORDER_STATUS_REJECTED))
+        return MissingConfirmation(
+            MissingResolution.CANCELLED,
+            cancel_reason=self._unattributed_cancel_reason(
+                row, order_id,
+                status=statuses.Name(status) if status in statuses.values() else str(status)))
 
     def _closed_position_siblings(
             self, row: 'OrderRow', confirmation: MissingConfirmation,
@@ -659,6 +1217,9 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         )
         if position_id is not None:
             self._link_position_ref(row.client_order_id, position_id)
+        self._record_reconciled_fill(
+            order.orderId, position_id, row.side, fill_qty, bridge.fills,
+            {deal_id for deal_id in covered if deal_id not in self._seen_deal_ids})
         self._seen_deal_ids.update(covered)
         avg = (open_positions[position_id].price
                if position_id in open_positions else order.executionPrice)
@@ -714,8 +1275,11 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             closed_pid = bridge.deal.positionId
             if (closed_pid and closed_pid not in open_positions
                     and bridge.closed_cents > 0 and bridge.filled_cents > 0
-                    and not await self._judge_recovered_closes(
-                        closed_pid, bridge.closing_deals, from_entry=row.pine_entry_id)):
+                    and await self._judge_recovered_closes(
+                        closed_pid, bridge.position_deals, from_entry=row.pine_entry_id,
+                        share_now=self._share_with_recovered_fill(
+                            row, closed_pid, volume_to_units(bridge.filled_cents)),
+                        counted=bridge.deal_ids) is None):
                 # Who closed the position is not known yet: retire it on a
                 # later pass, once the closing orders could be looked up.
                 return
@@ -830,6 +1394,9 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             # Every recovered deal was already applied by the PUSH path — the
             # cursor / position link are now consistent, so emit nothing.
             return None
+        self._record_reconciled_fill(
+            deal.orderId, position_id, row.side, cumulative - row.filled_qty, bridge.fills,
+            set(new_deal_ids))
         self._seen_deal_ids.update(new_deal_ids)
         if cumulative - row.filled_qty <= 1e-9:
             # The recovered deals are new to ``_seen_deal_ids`` (now seeded) but
@@ -1108,15 +1675,19 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         (:data:`_MISSING_PENDING_GRACE_S`) has elapsed, and never blindly:
         each expired row is re-verified against a fresh deal-history read
         — see :meth:`_confirm_missing_via_deal_history` for the
-        close-versus-fill-versus-cancel classification. A genuine no-fill
-        / no-close disappearance is retired (``rejected``) with a
-        synthetic ``cancelled`` event — so the engine's ``_route_event``
-        clears it from ``_order_mapping`` and re-syncs the strategy
-        position, exactly as a live ``ORDER_CANCELLED`` PUSH event would —
-        and the configured ``on_unexpected_cancel`` policy is applied
-        (``stop`` latches the engine's external-intervention quarantine;
-        ``halt``, or an unwired quarantine sink, raises
-        :class:`UnexpectedCancelError` through the reconcile pass).
+        close-versus-fill-versus-cancel classification. A no-fill / no-close
+        disappearance is retired (``rejected``) with a synthetic
+        ``cancelled`` event — so the engine's ``_route_event`` clears it from
+        ``_order_mapping`` and re-syncs the strategy position, exactly as a
+        live ``ORDER_CANCELLED`` PUSH event would. Only a cancel the evidence
+        shows to be someone else's (an expiry the bot never set) applies the
+        configured ``on_unexpected_cancel`` policy (``stop`` latches the
+        engine's external-intervention quarantine; ``halt``, or an unwired
+        quarantine sink, raises :class:`UnexpectedCancelError` through the
+        reconcile pass). An order the venue itself ended (expired, rejected)
+        is retired with its venue-driven ``cancel_reason``, and a cancel the
+        evidence cannot attribute with an ERROR and an audit event; no
+        policy applies to either.
 
         Runs as a separate pass AFTER :meth:`_reconcile_snapshot`. The
         presence namespaces are passed as ``None`` (fetch-failed marker)

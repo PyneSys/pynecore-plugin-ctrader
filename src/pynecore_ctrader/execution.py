@@ -82,7 +82,13 @@ from .helpers import (
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .models import _SymbolRules
-from .protection import _ProtectionMixin, protection_key
+from .protection import (
+    _OWN_ORDER_TERMS_EXTRA,
+    _AnswerFill,
+    _ProtectionMixin,
+    _write_refused,
+    protection_key,
+)
 from .wire import (
     CTraderConnectionError,
     CTraderProtocolError,
@@ -462,6 +468,8 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             req.stopPrice = round_price(intent.stop, rules.digits)
             req.timeInForce = OpenApiModelMessages.ProtoOATimeInForce.GOOD_TILL_CANCEL
 
+        sent_terms = [req.limitPrice if req.HasField('limitPrice') else None,
+                      req.stopPrice if req.HasField('stopPrice') else None, volume]
         # Persist-first: write the ``submitted`` row + audit BEFORE the wire send,
         # so a crash between send and ack leaves a recoverable dispatch row keyed
         # on the deterministic coid. ``_dispatch_order`` maps the wire failure
@@ -484,14 +492,24 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                 kind=entry_kind,
                 order_type=intent.order_type.value,
             )
+            if intent.order_type is not OrderType.MARKET:
+                self._remember_own_order_terms(coid, limit=sent_terms[0], stop=sent_terms[1],
+                                               volume=volume)
             self.store_ctx.log_event(
                 'dispatch_submitted', client_order_id=coid,
                 intent_key=intent.intent_key,
                 payload={'kind': entry_kind, 'order_type': intent.order_type.value},
             )
 
+        # Until the venue answers, the order may already have executed: the
+        # share bounds of a close judged meanwhile allow for it, and the
+        # answer decides the closes whose verdict waited for it.
+        self._entry_dispatches_in_flight[coid] = (
+            intent.symbol, qty_units if intent.side == 'buy' else -qty_units)
+        answer: OpenApiMessages.ProtoOAExecutionEvent | None = None
+        refused = False
         try:
-            event = await self._dispatch_order(req, coid=coid, context="entry")
+            event = answer = await self._dispatch_order(req, coid=coid, context="entry")
         except OrderDispositionUnknownError as exc:
             if self.store_ctx is not None:
                 mark_disposition_unknown(self.store_ctx, coid=coid)
@@ -502,6 +520,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                 )
             raise
         except ExchangeOrderRejectedError as exc:
+            refused = _write_refused(exc)
             if self.store_ctx is not None:
                 mark_rejected(self.store_ctx, coid=coid)
                 self.store_ctx.log_event(
@@ -510,9 +529,24 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                     payload={'phase': 'submit', 'reason': str(exc)},
                 )
             raise
+        except ExchangeConnectionError:
+            refused = True
+            raise
+        finally:
+            self._entry_dispatches_in_flight.pop(coid, None)
+            self._settle_entry_answer(coid, answer, refused=refused)
         order = event.order
         filled = volume_to_units(order.executedVolume)
         self._persist_entry(coid, intent, order, qty_units, filled)
+        if intent.order_type is not OrderType.MARKET:
+            self._remember_own_order_answer(coid, sent_terms, order)
+            self._remember_own_order_attrs(coid, order)
+        if filled > 0.0 and event.HasField('deal'):
+            # The journal counts this fill before its event is translated.
+            self._record_share_effect(
+                order.positionId, filled if intent.side == 'buy' else -filled, counted=True,
+                executed_ms=event.deal.executionTimestamp, deal_id=event.deal.dealId,
+                order_id=order.orderId)
 
         status = (OrderStatus.FILLED
                   if event.executionType == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED
@@ -575,7 +609,9 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             symbol=intent.symbol,
             side=intent.side,
             qty=qty_units,
-            filled_qty=filled,
+            # The fill cursor only grows: a fill PUSH that overtook this answer
+            # already advanced it past what the answer reports.
+            filled_qty=max(filled, existing.filled_qty) if existing is not None else filled,
             state='confirmed',
             intent_key=intent.intent_key,
             pine_entry_id=intent.pine_id,
@@ -1017,7 +1053,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         outstanding or its outcome unknown. A definitive reject or a pre-write
         failure drops it; nothing was executed.
         """
-        record = self._open_own_close(req.positionId)
+        record = self._open_own_close(req.positionId, volume_to_units(req.volume))
         try:
             event = await self._dispatch_order(req, coid=coid, context=context)
         except (ExchangeOrderRejectedError, ExchangeConnectionError):
@@ -1026,7 +1062,28 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         except BaseException:
             self._settle_own_close(record, None)
             raise
-        self._settle_own_close(record, event.order.orderId)
+        answer_fill: _AnswerFill | None = None
+        if event.HasField('deal') and event.deal.filledVolume > 0:
+            deal = event.deal
+            answer_fill = _AnswerFill(
+                deal_id=deal.dealId, executed_ms=deal.executionTimestamp or None,
+                closed=volume_to_units(deal.closePositionDetail.closedVolume
+                                       if deal.HasField('closePositionDetail')
+                                       else deal.filledVolume))
+        self._settle_own_close(
+            record, event.order.orderId, answer_fill=answer_fill,
+            complete=(event.executionType
+                      == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED))
+        net = self._signed_share(req.positionId)
+        if answer_fill is not None and net:
+            # The journal retires this close only once its event is translated,
+            # and then by the close net of its credit (already retired); the
+            # close takes the bot's net toward zero.
+            closed = max(0.0, answer_fill.closed - record.credit)
+            self._record_share_effect(
+                req.positionId, -closed if net > 0.0 else closed, counted=False,
+                executed_ms=answer_fill.executed_ms, deal_id=answer_fill.deal_id,
+                order_id=event.order.orderId)
         return event
 
     async def _clear_position_bracket(
@@ -1042,69 +1099,117 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
 
         A guarded position stays guarded while the clear runs: each amend is
         recorded as the bot's own write, so neither the intermediate state nor
-        a clear that fails half-way is mistaken for an external edit. The
-        position leaves the guard once the clear is done — a bare position
-        carries no levels of the bot.
+        a clear that fails half-way is mistaken for an external edit. A
+        position the guard does not hold (its protection was written outside
+        the guard, possibly by an earlier process) is cleared as an own write
+        in flight from its snapshot read on
+        (``_ProtectionMixin._begin_unguarded_write``): an own fill's view of it
+        meanwhile is not taken as its protection. The protection
+        the clear's own snapshot shows, and each step's levels, are the bot's
+        own from then on, so a late view of any of them is no edit. Once the
+        clear is done the position is bare: the guard holds no levels as the
+        bot's protection (``_ProtectionMixin._mark_bare``), so protection
+        someone adds to it later is an edit, and any protection that fires on
+        it was set by someone else (``_ProtectionMixin._judge_fired_protection``).
+
+        A guarded position the venue already shows without protection
+        (``Nothing to amend``) is the clear's goal state when an own write
+        removed it (an earlier clear of the bot's). Otherwise the clear did not
+        make the bot's protection empty: the guard keeps the bot's levels, so
+        the snapshots that follow judge the removal
+        (``_ProtectionMixin._bare_explained_by_own_write``).
         """
-        guarded = self._protection_guard().known(protection_key(position_id))
-        snapshot = await self._reconcile()
-        position = next(
-            (item for item in snapshot.position if item.positionId == position_id),
-            None,
-        )
-        if position is None:
-            self._release_protection(position_id)
-            return
-        trailing = (
-                position.HasField("trailingStopLoss") and position.trailingStopLoss
-        )
-        requests: list[OpenApiMessages.ProtoOAAmendPositionSLTPReq] = []
-        if trailing:
-            if not position.HasField("stopLoss"):
-                raise CTraderBrokerError(
-                    "cannot disable cTrader trailing protection without an "
-                    f"authenticated Stop Loss on position {position_id}"
-                )
+        key = protection_key(position_id)
+        guarded = self._protection_guard().known(key)
+        # Read before the clear's own writes join the accepted levels.
+        bare_explained = guarded and self._bare_explained_by_own_write(key, position_id)
+        if not guarded:
+            # In flight from the snapshot read on: an own fill's view taken
+            # while the clear reads it would otherwise guard the levels the
+            # clear removes as the bot's.
+            self._begin_unguarded_write(position_id)
+        gone = already_bare = False
+        try:
+            snapshot = await self._reconcile()
+            position = next(
+                (item for item in snapshot.position if item.positionId == position_id),
+                None,
+            )
+            if position is None:
+                self._release_protection(position_id)
+                return
+            trailing = (
+                    position.HasField("trailingStopLoss") and position.trailingStopLoss
+            )
+            requests: list[OpenApiMessages.ProtoOAAmendPositionSLTPReq] = []
+            if trailing:
+                if not position.HasField("stopLoss"):
+                    raise CTraderBrokerError(
+                        "cannot disable cTrader trailing protection without an "
+                        f"authenticated Stop Loss on position {position_id}"
+                    )
+                requests.append(OpenApiMessages.ProtoOAAmendPositionSLTPReq(
+                    ctidTraderAccountId=self._live_account_id,
+                    positionId=position_id,
+                    stopLoss=position.stopLoss,
+                    trailingStopLoss=False,
+                ))
             requests.append(OpenApiMessages.ProtoOAAmendPositionSLTPReq(
                 ctidTraderAccountId=self._live_account_id,
                 positionId=position_id,
-                stopLoss=position.stopLoss,
-                trailingStopLoss=False,
             ))
-        requests.append(OpenApiMessages.ProtoOAAmendPositionSLTPReq(
-            ctidTraderAccountId=self._live_account_id,
-            positionId=position_id,
-        ))
-        for index, request in enumerate(requests, start=1):
-            step_context = f"{context} ({index}/{len(requests)})"
-            try:
-                if guarded:
-                    await self._write_protection(
-                        request, position_id=position_id, row_coid=None,
-                        coid=coid, context=step_context,
-                    )
-                else:
-                    await self._dispatch_order(request, coid=coid, context=step_context)
-            except ExchangeOrderRejectedError as exc:
-                cause = exc.__cause__
-                if isinstance(cause, CTraderProtocolError) and is_not_found(
-                        cause.error_code):
-                    self._release_protection(position_id)
-                    return
-                # An amend on a position that already carries no protection
-                # rejects with ``INVALID_REQUEST: Nothing to amend.`` (live
-                # incident: reversal pre-clear raced the close-leg fills — the
-                # first clear had already stripped the shared bracket, and the
-                # forced-cancel retry re-drove the clear on the bare position,
-                # crashing the run). Nothing to amend IS the clear's goal
-                # state, so treat it as an idempotent success.
-                if (isinstance(cause, CTraderProtocolError)
-                        and cause.error_code == 'INVALID_REQUEST'
-                        and 'nothing to amend' in str(cause).lower()):
-                    self._release_protection(position_id)
-                    return
-                raise
-        self._release_protection(position_id)
+            if not guarded:
+                # Still the bot's own levels for the bare position's guard
+                # (``_ProtectionMixin._guard_bare``): what the clear removes, as
+                # its own snapshot shows it, and each step it sends.
+                self._remember_own_levels(key, self._venue_protection(position))
+            for index, request in enumerate(requests, start=1):
+                step_context = f"{context} ({index}/{len(requests)})"
+                try:
+                    if guarded:
+                        await self._write_protection(
+                            request, position_id=position_id, row_coid=None,
+                            coid=coid, context=step_context,
+                        )
+                    else:
+                        levels = self._requested_protection(request)
+                        if levels is not None:
+                            self._remember_own_levels(key, levels)
+                        await self._dispatch_order(request, coid=coid, context=step_context)
+                except ExchangeOrderRejectedError as exc:
+                    cause = exc.__cause__
+                    if isinstance(cause, CTraderProtocolError) and is_not_found(
+                            cause.error_code):
+                        gone = True
+                        break
+                    # An amend on a position that already carries no protection
+                    # rejects with ``INVALID_REQUEST: Nothing to amend.`` (live
+                    # incident: reversal pre-clear raced the close-leg fills — the
+                    # first clear had already stripped the shared bracket, and the
+                    # forced-cancel retry re-drove the clear on the bare position,
+                    # crashing the run). Nothing to amend IS the clear's goal
+                    # state, so treat it as an idempotent success.
+                    if (isinstance(cause, CTraderProtocolError)
+                            and cause.error_code == 'INVALID_REQUEST'
+                            and 'nothing to amend' in str(cause).lower()):
+                        already_bare = True
+                        break
+                    raise
+        finally:
+            if not guarded:
+                self._end_unguarded_write(position_id)
+        if already_bare and guarded and not bare_explained:
+            # No own write removed the bot's protection: the venue being
+            # without it is not the clear's doing, so the guard keeps the
+            # bot's levels and the next snapshots judge the removal.
+            self._note_clear_found_bare(position_id)
+            return
+        if gone or already_bare:
+            self._release_protection(position_id)
+        if gone:
+            return
+        self._unguarded_protection.discard(position_id)
+        self._mark_bare(position_id)
 
     async def _trail_only_position_already_armed(self, position_id: int) -> bool:
         """Return whether one live position already carries trail-only protection."""
@@ -1400,8 +1505,15 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             req.limitPrice = round_price(intent.limit, rules.digits)
         elif intent.order_type is OrderType.STOP and intent.stop is not None:
             req.stopPrice = round_price(intent.stop, rules.digits)
-        await self._dispatch_order(req, coid=coid, context="amend entry",
-                                   predecessor_cancel_ids=())
+        sent = self._remember_amended_terms(order_id, req)
+        self._begin_own_amend(order_id)
+        try:
+            answer = await self._dispatch_order(req, coid=coid, context="amend entry",
+                                                predecessor_cancel_ids=())
+        except BaseException:
+            self._end_own_amend(order_id, None)
+            raise
+        self._end_own_amend(order_id, answer, sent=sent)
         qty_units = volume_to_units(volume)
         return [ExchangeOrder(
             id=str(order_id), symbol=intent.symbol, side=intent.side,
@@ -1416,6 +1528,30 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             average_fill_price=None, status=OrderStatus.OPEN, timestamp=epoch_time(),
             fee=0.0, fee_currency='', reduce_only=False, client_order_id=coid,
         )]
+
+    def _remember_amended_terms(
+            self, order_id: int, req: OpenApiMessages.ProtoOAAmendOrderReq,
+    ) -> list | None:
+        """Record the terms an own amend leaves on a working entry order.
+
+        A price the amend omits stays what the bot sent last.
+
+        :return: The recorded ``[limit, stop, volume]``; ``None`` when the
+            order has no journal row.
+        """
+        if self.store_ctx is None:
+            return None
+        row = self.store_ctx.find_by_ref('order_id', str(order_id))
+        if row is None:
+            return None
+        terms = (row.extras or {}).get(_OWN_ORDER_TERMS_EXTRA)
+        last = terms[-1] if isinstance(terms, list) and terms else [None, None, None]
+        sent = [req.limitPrice if req.HasField('limitPrice') else last[0],
+                req.stopPrice if req.HasField('stopPrice') else last[1],
+                req.volume]
+        self._remember_own_order_terms(
+            row.client_order_id, limit=sent[0], stop=sent[1], volume=sent[2])
+        return sent
 
     @override
     async def modify_exit(
@@ -1515,15 +1651,23 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             # The core fail-safe manager judges this position's levels and
             # quarantines on an external edit itself; the plugin guard stays
             # off it, before and after the write, so a concurrent exit amend
-            # cannot leave it judging the fail-safe's levels.
-            self._release_protection(position_id)
+            # cannot leave it judging the fail-safe's levels. A stale view of
+            # an own fill must not make the position bare meanwhile. A
+            # protection firing before the manager saw an edit is judged
+            # against the levels sent here. A refused write left the venue as
+            # it was: whatever guards the position then (its bare guard
+            # restored, a concurrent exit amend) keeps judging it.
             try:
-                await self._dispatch_order(
-                    req, coid=snapshot.parent_entry_dispatch_ref,
+                await self._write_unguarded_protection(
+                    req, position_id=position_id,
+                    coid=snapshot.parent_entry_dispatch_ref,
                     context="native fail-safe SL",
                 )
-            finally:
-                self._release_protection(position_id)
+            except BaseException as exc:
+                if not _write_refused(exc):
+                    self._release_protection(position_id)
+                raise
+            self._release_protection(position_id)
         self.store_ctx.log_event(
             'native_failsafe_sl_put',
             client_order_id=snapshot.parent_entry_dispatch_ref,

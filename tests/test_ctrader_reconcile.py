@@ -2,12 +2,22 @@
 @pyne
 """
 import asyncio
+import logging
 from time import time as epoch_time
 
 import pytest
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError, UnexpectedCancelError
-from pynecore.core.broker.models import QuarantineKind
+from pynecore.core.broker.disappearance import (
+    MISSING_ACCEPTED_BY_RESUME_EXTRA,
+    accept_missing_before_resume,
+)
+from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_REJECTED,
+    VENUE_DRIVEN_CANCEL_REASONS,
+    QuarantineKind,
+)
+from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 
@@ -17,6 +27,13 @@ from pynecore_ctrader import reconcile as ctrader_reconcile
 from pynecore_ctrader.helpers import volume_to_units
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
+from pynecore_ctrader.models import _SymbolRules
+from pynecore_ctrader.protection import (
+    CloseOrigin,
+    _ClaimedFill,
+    _PositionDeal,
+    protection_key,
+)
 from pynecore_ctrader.reconcile import _DealWalk
 from pynecore_ctrader.wire import CTraderProtocolError, CTraderTimeoutError
 
@@ -1165,23 +1182,188 @@ def __test_grace_expired_inconclusive_recheck_defers_retire__(tmp_path):
     assert (row.extras or {}).get('missing_pending_since') == 0.0
 
 
-def __test_grace_expired_working_no_fill_retires_as_cancel__(tmp_path):
-    # A zero-fill working order, conclusively never filled at the grace-expiry
-    # re-check, is the genuine unexpected cancel: retire + default 'stop' halt.
-    qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+class _OrderStatusWire(_FakeWire):
+    """An empty deal history, and the vanished entry order's own status."""
+
+    def __init__(self, *, status, expiry=None, details_error=None, executed=0):
+        super().__init__(deal_res=_deal_res())
+        self._status = status
+        self._expiry = expiry
+        self._details_error = details_error
+        self._executed = executed
+
+    async def send_request(self, req, *, timeout=None, **kwargs):
+        if not isinstance(req, _oa.ProtoOAOrderDetailsReq):
+            return await super().send_request(req, timeout=timeout, **kwargs)
+        self.requests.append(req)
+        if self._details_error is not None:
+            raise self._details_error
+        order = _order(order_id=req.orderId, volume=2000, executed=self._executed)
+        order.orderStatus = self._status
+        if self._expiry is not None:
+            order.expirationTimestamp = self._expiry
+        return _oa.ProtoOAOrderDetailsRes(order=order)
+
+
+def _foreign_expiry_wire() -> _OrderStatusWire:
+    """The vanished entry order expired at an expiry the bot never set: someone
+    else edited it, the one gap-path cancel the unexpected-cancel policy handles."""
+    return _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED,
+                            expiry=1_700_000_900_000)
+
+
+def _vanished_working_broker(tmp_path, wire) -> tuple[_ReconcileBroker, list]:
+    """A zero-fill working entry stamped missing past the grace window, with
+    the external-intervention reports captured."""
+    broker = _ReconcileBroker(_recon())
+    broker._wire = wire
     _open(tmp_path, broker)
-    _seed_working(broker, 'w1', order_id=600, qty=qty)
-    row = broker.store_ctx.get_order('w1')
-    stamped = dict(row.extras or {})
-    stamped['missing_pending_since'] = 0.0
-    broker.store_ctx.upsert_order('w1', extras=stamped)
+    _seed_working(broker, 'w1', order_id=600, qty=volume_to_units(2000),
+                  extras={'missing_pending_since': 0.0})
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    return broker, reports
+
+
+@pytest.mark.parametrize('status', [
+    _model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED,
+    _model.ProtoOAOrderStatus.ORDER_STATUS_REJECTED,
+], ids=['expired', 'rejected'])
+def __test_grace_expired_working_order_the_venue_ended_is_no_intervention__(tmp_path, status):
+    """The venue expired / rejected the bot's pending entry while the stream was
+    down: the cancel carries the venue's reason and the policy never runs."""
+    broker, reports = _vanished_working_broker(tmp_path, _OrderStatusWire(status=status))
 
     events, err = _drive_tracker(broker)
 
+    assert err is None and reports == []
     assert len(events) == 1 and events[0].event_type == 'cancelled'
-    assert isinstance(err, UnexpectedCancelError)
+    assert events[0].cancel_reason == CANCEL_REASON_VENUE_REJECTED
     assert 'w1' not in _live_coids(broker)
+    assert len(_store_events(broker, 'venue_driven_cancel_recovered')) == 1
+    assert _store_events(broker, 'unexpected_cancel') == []
+
+
+def __test_grace_expired_working_order_with_a_foreign_expiry_is_reported__(tmp_path):
+    """A pending entry that expired at an expiry the bot never set was edited by
+    someone else: the unexpected cancel the policy handles."""
+    broker, reports = _vanished_working_broker(tmp_path, _foreign_expiry_wire())
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert len(events) == 1 and events[0].cancel_reason is None
+    assert len(reports) == 1 and reports[0][2] is QuarantineKind.EXTERNAL_INTERVENTION
+    assert 'w1' not in _live_coids(broker)
+    assert _store_events(broker, 'ctrader_cancel_unattributed') == []
+
+
+@pytest.mark.parametrize('wire', [
+    _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED),
+    _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED,
+                     details_error=CTraderProtocolError('ORDER_NOT_FOUND', 'no such order')),
+], ids=['cancelled', 'not-found'])
+def __test_grace_expired_working_order_cancel_nobody_can_be_named_for_is_audited__(
+        tmp_path, caplog, wire):
+    """The stream missed the cancel of a pending entry; the order's status reads
+    cancelled (or the venue no longer knows the order). Only the push carries
+    ``isServerEvent``, so a server-initiated cancel and someone else's look the
+    same: the cancel is booked, logged as an ERROR and audited, and the
+    unexpected-cancel policy never runs."""
+    broker, reports = _vanished_working_broker(tmp_path, wire)
+
+    with caplog.at_level(logging.ERROR, logger='pynecore_ctrader.protection'):
+        events, err = _drive_tracker(broker)
+
+    assert err is None and reports == []
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    assert events[0].cancel_reason in VENUE_DRIVEN_CANCEL_REASONS
+    assert 'w1' not in _live_coids(broker)
+    audits = _store_events(broker, 'ctrader_cancel_unattributed')
+    assert len(audits) == 1 and audits[0]['order_id'] == 600
+    assert _store_events(broker, 'unexpected_cancel_quarantine') == []
+    assert any(record.levelno == logging.ERROR and 'cannot tell' in record.getMessage()
+               for record in caplog.records)
+
+
+@pytest.mark.parametrize('status, executed', [
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, 2000),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED, 1000),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED, 1000),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED, 1000),
+], ids=['filled', 'partly-filled', 'partly-filled-cancelled', 'partly-filled-expired'])
+def __test_grace_expired_working_order_the_venue_shows_executed_is_no_cancel__(
+        tmp_path, status, executed):
+    """The deal history does not list the fill yet, but the order's own status
+    shows it executed: no cancel and no policy; the stamp is cleared, and the
+    snapshot bridge promotes the row once the history lists the fill."""
+    broker, reports = _vanished_working_broker(
+        tmp_path, _OrderStatusWire(status=status, executed=executed))
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None and reports == []
+    assert 'w1' in _live_coids(broker)
+    assert 'missing_pending_since' not in (broker.store_ctx.get_order('w1').extras or {})
+
+
+def __test_grace_expired_working_order_the_venue_still_holds_is_no_cancel__(tmp_path):
+    """The order's status reads accepted: it still works on the venue, so it is
+    neither cancelled nor retired."""
+    broker, reports = _vanished_working_broker(
+        tmp_path, _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED))
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None and reports == []
+    assert 'w1' in _live_coids(broker)
+    assert 'missing_pending_since' not in (broker.store_ctx.get_order('w1').extras or {})
+
+
+def __test_grace_expired_working_order_with_an_own_expiry_is_no_intervention__(tmp_path):
+    """An expiry the venue's answer to the bot's own write showed is the bot's."""
+    broker, reports = _vanished_working_broker(tmp_path, _OrderStatusWire(
+        status=_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED, expiry=1_700_000_900_000))
+    answered = _order(order_id=600, volume=2000)
+    answered.expirationTimestamp = 1_700_000_900_000
+    broker._remember_own_order_attrs('w1', answered)
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None and reports == []
+    assert events[0].cancel_reason == CANCEL_REASON_VENUE_REJECTED
+
+
+@pytest.mark.parametrize('error', [
+    CTraderTimeoutError("details read timed out"),
+    CTraderProtocolError('INTERNAL_ERROR', 'venue fault'),
+], ids=['timeout', 'venue-error'])
+def __test_grace_expired_working_order_status_unread_defers_the_verdict__(tmp_path, error):
+    """Who ended the order cannot be read now: no verdict, the row waits."""
+    broker, reports = _vanished_working_broker(tmp_path, _OrderStatusWire(
+        status=_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED, details_error=error))
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None and reports == []
+    assert 'w1' in _live_coids(broker)
+
+
+def __test_grace_expired_position_row_reads_no_order_status__(tmp_path):
+    """A settled position's entry order filled: its status cannot name a venue
+    cancel, so the re-check spends no request on it."""
+    wire = _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED)
+    broker = _ReconcileBroker(_recon())
+    broker._wire = wire
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c1', position_id=222, qty=volume_to_units(2000),
+                   extras={'missing_pending_since': 0.0})
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None
+    assert not any(isinstance(req, _oa.ProtoOAOrderDetailsReq) for req in wire.requests)
 
 
 def __test_grace_expired_position_close_wins_over_cancel_aged_fill__(tmp_path):
@@ -1279,7 +1461,8 @@ def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
     # the event stream (and the process) stays alive while the bot leaves the
     # venue untouched, so the other bot-owned working order is not cancelled.
     qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+    broker = _ReconcileBroker(_recon())
+    broker._wire = _foreign_expiry_wire()
     latched: list[tuple[str, dict, QuarantineKind]] = []
     broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
         (reason, context, kind))
@@ -1305,7 +1488,8 @@ def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
 
 def __test_policy_ignore_retires_without_halting__(tmp_path):
     qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+    broker = _ReconcileBroker(_recon())
+    broker._wire = _foreign_expiry_wire()
     broker.on_unexpected_cancel = 'ignore'
     _open(tmp_path, broker)
     _seed_working(broker, 'c4', order_id=222, qty=qty,
@@ -1320,7 +1504,8 @@ def __test_policy_ignore_retires_without_halting__(tmp_path):
 
 def __test_policy_re_place_retires_without_halting__(tmp_path):
     qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+    broker = _ReconcileBroker(_recon())
+    broker._wire = _foreign_expiry_wire()
     broker.on_unexpected_cancel = 're_place'
     _open(tmp_path, broker)
     _seed_working(broker, 'c5', order_id=222, qty=qty,
@@ -1338,7 +1523,8 @@ def __test_reconcile_pass_propagates_unexpected_cancel_halt__(tmp_path):
     # and the halt from the grace tracker propagates through _run_reconcile_pass
     # (it is NOT swallowed by the transient gap-filler guard).
     qty = volume_to_units(2000)
-    broker = _ReconcileBroker(_recon(positions=[]), deal_res=_deal_res())
+    broker = _ReconcileBroker(_recon(positions=[]))
+    broker._wire = _foreign_expiry_wire()
     _open(tmp_path, broker)
     _seed_working(broker, 'c6', order_id=222, qty=qty,
                   extras={'missing_pending_since': 0.0})
@@ -1490,9 +1676,15 @@ class _VenueWire(_FakeWire):
         return await super().send_request(req, timeout=timeout)
 
 
+#: Client-order-id of another API client's order: a close it carries is
+#: provably someone else's.
+_FOREIGN_COID = 'intruder-1'
+
+
 def _closing_order(order_id, *, order_type=_model.ProtoOAOrderType.MARKET,
-                   stop_out=False, coid=''):
-    """The closing order ``ProtoOAOrderDetailsRes`` describes."""
+                   stop_out=False, coid=_FOREIGN_COID):
+    """The closing order ``ProtoOAOrderDetailsRes`` describes; by default another
+    API client's order."""
     return _model.ProtoOAOrder(
         orderId=order_id, orderType=order_type,
         orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
@@ -1901,3 +2093,776 @@ def __test_watch_orders_reports_a_recovered_manual_close_after_the_pass__(
     with pytest.raises(BrokerManualInterventionError):
         asyncio.run(drive())
     assert 'c3' not in _live_coids(broker)
+
+
+# === NETTING: recovered closes judged against the bot's share =============
+
+_SLTP = _model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT
+
+
+def _timed(deal, executed_ms):
+    deal.executionTimestamp = executed_ms
+    return deal
+
+
+def _netting_history(*, foreign_closed, sl_closed, full=True, base_ms=1_700_000_000_000):
+    """Position 222: the bot opened 20 (order 111), someone else added 10
+    (order 500) and closed ``foreign_closed`` (order 600), the SL closed the
+    rest (order 700). ``full=False`` leaves the openings out of the window."""
+    deals = []
+    if full:
+        deals += [
+            _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+                   base_ms + 1_000),
+            _timed(_deal(deal_id=902, order_id=500, position_id=222, filled_volume=1000),
+                   base_ms + 2_000),
+        ]
+    deals += [
+        _timed(_close_deal(deal_id=903, order_id=600, position_id=222,
+                           closed_volume=foreign_closed), base_ms + 3_000),
+        _timed(_close_deal(deal_id=904, order_id=700, position_id=222,
+                           closed_volume=sl_closed), base_ms + 4_000),
+    ]
+    return _deal_res(*deals)
+
+
+def _netting_recovered_broker(tmp_path, history, *, positions=()):
+    broker = _ReconcileBroker(_recon(positions=list(positions)))
+    broker._wire = _VenueWire(deal_res=history, orders=[
+        _closing_order(600), _closing_order(700, order_type=_SLTP)])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    return broker, reports
+
+
+@pytest.mark.parametrize('full', [True, False])
+def __test_recovered_netting_close_of_only_foreign_exposure_is_not_reported__(tmp_path, full):
+    """Someone closed only the exposure they added; the venue SL closed the
+    bot's share. Exact replay from the opening, or bounds without it."""
+    broker, reports = _netting_recovered_broker(
+        tmp_path, _netting_history(foreign_closed=1000, sl_closed=2000, full=full))
+    _seed_position(broker, 'c3', position_id=222, qty=20.0,
+                   extras={'missing_pending_since': 0.0})
+    broker.store_ctx.add_ref('c3', 'order_id', '111')
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+    assert {903, 904} <= broker._judged_close_deals
+
+
+def __test_recovered_netting_close_below_the_share_is_reported__(tmp_path):
+    broker, reports = _netting_recovered_broker(
+        tmp_path, _netting_history(foreign_closed=2000, sl_closed=1000))
+    _seed_position(broker, 'c3', position_id=222, qty=20.0,
+                   extras={'missing_pending_since': 0.0})
+    broker.store_ctx.add_ref('c3', 'order_id', '111')
+
+    _recover(broker)
+
+    assert len(reports) == 1
+    context = reports[0][1]
+    assert context['deal_ids'] == [903]
+    assert context['booked_qty'] == pytest.approx(10.0)
+
+
+def _shrunk_position_broker(tmp_path, *, closing_order):
+    """Position 222 still open with 10 of the bot's 20: someone closed 10
+    while the stream was down."""
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _timed(_close_deal(deal_id=903, order_id=closing_order.orderId, position_id=222,
+                           closed_volume=1000), 1_700_000_003_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1000)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[closing_order])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=20.0)
+    broker.store_ctx.add_ref('c3', 'order_id', '111')
+    return broker, reports
+
+
+def _retired(broker, coid='c3') -> float:
+    return (broker.store_ctx.get_order(coid).extras or {}).get('journal_exposure_retired', 0.0)
+
+
+def __test_missed_partial_close_of_an_open_position_is_judged_and_retired__(tmp_path):
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+
+    _run(broker)
+    broker._flush_external_interventions()
+    assert reports == [] and _retired(broker) == 0.0, "one pass is not proof"
+
+    _run(broker)
+    broker._flush_external_interventions()
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [903]
+    assert reports[0][1]['booked_qty'] == pytest.approx(10.0)
+    assert _retired(broker) == pytest.approx(10.0)
+
+    _run(broker)
+    broker._flush_external_interventions()
+    assert len(reports) == 1
+
+
+def __test_missed_venue_partial_close_retires_without_a_report__(tmp_path):
+    broker, reports = _shrunk_position_broker(
+        tmp_path, closing_order=_closing_order(600, stop_out=True))
+
+    _run(broker)
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert _retired(broker) == pytest.approx(10.0)
+
+
+def __test_shrink_is_not_judged_while_an_event_waits_in_the_queue__(tmp_path):
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker._exec_events = asyncio.Queue()
+    broker._exec_events.put_nowait(object())
+
+    for _ in range(3):
+        _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == [] and _retired(broker) == 0.0
+
+
+def __test_shrink_a_restart_found_is_judged_against_the_share_before_it__(tmp_path):
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker._apply_adoption_baseline(broker._recon)
+    assert _retired(broker) == pytest.approx(10.0)
+    assert _startup_volumes(broker) == {222: pytest.approx(10.0)}
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert len(reports) == 1 and reports[0][1]['booked_qty'] == pytest.approx(10.0)
+    assert _retired(broker) == pytest.approx(10.0)
+    assert broker._startup_shrinks == {}
+
+
+def _masked_own_close_broker(tmp_path):
+    """NETTING position 222: the bot opened 10 (order 111), someone else added
+    5 (order 500), then the bot's own close of its 10 (order 888) executed but
+    its fill push was missed. The venue still holds the other party's 5."""
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=500, position_id=222, filled_volume=500),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=903, order_id=888, position_id=222, closed_volume=1000),
+               1_700_000_003_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=500)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=10.0)
+    broker.store_ctx.add_ref('c3', 'order_id', '111')
+    broker._settle_own_close(broker._open_own_close(222, 10.0), 888)
+    return broker, reports
+
+
+def _foreign_close_push(*, order_id, closed_cents, remaining_cents):
+    """Another client's MARKET close of position 222, as its fill push."""
+    order = _model.ProtoOAOrder(
+        orderId=order_id, orderType=_model.ProtoOAOrderType.MARKET,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, closingOrder=True,
+        positionId=222, executedVolume=closed_cents,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=closed_cents,
+                                          tradeSide=_model.ProtoOATradeSide.SELL))
+    status = (_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN if remaining_cents
+              else _model.ProtoOAPositionStatus.POSITION_STATUS_CLOSED)
+    return _oa.ProtoOAExecutionEvent(
+        executionType=_model.ProtoOAExecutionType.ORDER_FILLED, order=order,
+        deal=_model.ProtoOADeal(dealId=order_id + 1, orderId=order_id, positionId=222,
+                                filledVolume=closed_cents, executionPrice=1.1),
+        position=_model.ProtoOAPosition(
+            positionId=222, positionStatus=status,
+            tradeData=_model.ProtoOATradeData(symbolId=1, volume=remaining_cents,
+                                              tradeSide=_model.ProtoOATradeSide.BUY)))
+
+
+def __test_netting_shrink_retires_what_the_deals_took_not_the_shortfall__(tmp_path):
+    """The venue (5) is only 5 below the bot's journal share (10), but the
+    bot's own close took all 10: the journal keeps no phantom share, so the
+    other party closing its own 5 later is not taken for an intervention."""
+    broker, reports = _masked_own_close_broker(tmp_path)
+
+    for _ in range(2):
+        _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert broker._own_share(222) == pytest.approx(0.0)
+    assert broker._translate_exec_event(_foreign_close_push(
+        order_id=70900000, closed_cents=500, remaining_cents=0)) is None
+    broker._flush_external_interventions()
+    assert reports == []
+
+
+def __test_netting_own_close_found_in_the_deal_history_ends_its_uncertainty__(tmp_path):
+    """Bot 20 + other party 5; the bot's close of 10 (order 888) executed but
+    its fill push was missed (25 -> 15). Judging the shrink finds the close in
+    the deal history: the journal holds the bot's 10 and nothing of the close
+    runs unseen any more, so another party closing 7 later (15 -> 8) took 2
+    of the bot's 10."""
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=500, position_id=222, filled_volume=500),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=903, order_id=888, position_id=222, closed_volume=1000),
+               1_700_000_003_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1500)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=20.0)
+    broker.store_ctx.add_ref('c3', 'order_id', '111')
+    broker._settle_own_close(broker._open_own_close(222, 10.0), 888)
+    assert broker._unresolved_own_close(222) == pytest.approx(10.0)
+
+    for _ in range(2):
+        _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert broker._own_share(222) == pytest.approx(10.0)
+    assert broker._unresolved_own_close(222) == pytest.approx(0.0)
+    out = broker._translate_exec_event(_foreign_close_push(
+        order_id=70900000, closed_cents=700, remaining_cents=800))
+    broker._flush_external_interventions()
+    assert out is not None and out.fill_qty == pytest.approx(2.0)
+    assert len(reports) == 1 and reports[0][1]['booked_qty'] == pytest.approx(2.0)
+
+
+def __test_netting_shrink_a_restart_found_retires_what_the_deals_took__(tmp_path):
+    """The same, found by a restart: the startup baseline retires only the
+    shortfall (5); judging the deals retires the rest of the share they took."""
+    broker, reports = _masked_own_close_broker(tmp_path)
+    broker._apply_adoption_baseline(broker._recon)
+    assert _startup_volumes(broker) == {222: pytest.approx(5.0)}
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert broker._startup_shrinks == {}
+    assert broker._own_share(222) == pytest.approx(0.0)
+    assert broker._translate_exec_event(_foreign_close_push(
+        order_id=70900000, closed_cents=500, remaining_cents=0)) is None
+    broker._flush_external_interventions()
+    assert reports == []
+
+
+def _startup_volumes(broker) -> dict:
+    return {pid: pending.volume for pid, pending in broker._startup_shrinks.items()}
+
+
+def _next_process(broker) -> _ReconcileBroker:
+    """A new process of the same run: same journal, venue and quarantine sink."""
+    process = _ReconcileBroker(broker._recon)
+    process._wire = broker._wire
+    process.store_ctx = broker.store_ctx
+    process.quarantine_sink = broker.quarantine_sink
+    return process
+
+
+def __test_shrink_a_restart_found_is_judged_by_the_next_process_if_it_stopped_first__(
+        tmp_path):
+    """The process that found and retired the shrink stopped before judging it.
+    The next one finds the journal share already at the venue's and still
+    judges the pending shrink, once."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker._apply_adoption_baseline(broker._recon)
+    process = _next_process(broker)
+    process._apply_adoption_baseline(process._recon)
+    assert _startup_volumes(process) == {222: pytest.approx(10.0)}
+
+    _run(process)
+    process._flush_external_interventions()
+
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [903]
+    assert reports[0][1]['booked_qty'] == pytest.approx(10.0)
+    assert _retired(process) == pytest.approx(10.0)
+    later = _next_process(process)
+    later._apply_adoption_baseline(later._recon)
+    assert later._startup_shrinks == {}
+
+
+def _own_close_of_the_rest(broker) -> None:
+    """The bot closes the 10 units the venue still holds (order 888)."""
+    broker._settle_own_close(broker._open_own_close(222, 10.0), 888)
+    out = broker._translate_exec_event(_foreign_close_push(
+        order_id=888, closed_cents=1000, remaining_cents=0))
+    assert out is not None and out.fill_qty == pytest.approx(10.0)
+    assert 'c3' not in _live_coids(broker)
+    broker._wire._deal_res.deal.append(_timed(_close_deal(
+        deal_id=889, order_id=888, position_id=222, closed_volume=1000), 1_700_000_004_000))
+    broker._recon = _recon()
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def __test_shrink_a_restart_found_is_judged_after_the_bot_closed_the_position__(
+        tmp_path, restart):
+    """The bot closed the rest of the position before a settled pass judged the
+    shrink a restart found: the closed position's deal history judges it."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker._apply_adoption_baseline(broker._recon)
+    _own_close_of_the_rest(broker)
+    process = broker
+    if restart:
+        process = _next_process(broker)
+        process._apply_adoption_baseline(process._recon)
+
+    _run(process)
+    process._flush_external_interventions()
+
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [903]
+    assert reports[0][1]['booked_qty'] == pytest.approx(10.0)
+    assert process._startup_shrinks == {}
+
+
+def __test_pending_shrink_judgment_from_before_an_operator_resume_is_accepted__(tmp_path):
+    """A process found the shrink and stopped before judging it; the operator
+    then resumed the run: the resume accepted the venue as it stood."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker._apply_adoption_baseline(broker._recon)
+    accept_missing_before_resume(broker.store_ctx)
+    process = _next_process(broker)
+    process.operator_resume_ts_ms = int(epoch_time() * 1000)
+    process._apply_adoption_baseline(process._recon)
+
+    for _ in range(3):
+        _run(process)
+    process._flush_external_interventions()
+
+    assert reports == []
+    assert process._startup_shrinks == {}
+    assert len(_store_events(process, 'ctrader_close_accepted_by_resume')) == 1
+
+
+# === HEDGED: a fill taken for an own close of unknown outcome =============
+
+def _claim(order_id, *, fill_qty=10.0, booked=None, share_before=None, share_high=None,
+           venue_after=0.0):
+    """A closing fill of ``order_id`` taken for the bot's close of unknown outcome."""
+    return _ClaimedFill(
+        order_id=order_id, deal_id=order_id + 350, fill_qty=fill_qty,
+        order_type=int(_model.ProtoOAOrderType.MARKET), client_order_id='',
+        from_entry='long', terminal=True, executed_ms=int(epoch_time() * 1000),
+        share_before=share_before, share_high=share_high, venue_after=venue_after,
+        booked=fill_qty if booked is None else booked)
+
+
+def _ambiguous_claim_broker(tmp_path, *claims, orders):
+    """HEDGED position 222: the bot's close of it has an unknown outcome, and
+    ``claims`` were taken for it, each judged the bot's own by the stream;
+    ``orders`` describe every closing order the deal history holds."""
+    history = _deal_res(*(
+        _timed(_close_deal(deal_id=order.orderId + 350, order_id=order.orderId,
+                           position_id=222, closed_volume=1000),
+               int(epoch_time() * 1000) + index)
+        for index, order in enumerate(orders)))
+    broker = _ReconcileBroker(_recon())
+    broker._hedging_enabled = True
+    broker._wire = _VenueWire(deal_res=history, orders=orders)
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    record = broker._open_own_close(222, 10.0)
+    broker._settle_own_close(record, None)
+    for claim in claims:
+        broker._record_claim(record, claim)
+        broker._mark_close_judged([claim.deal_id], {claim.deal_id: CloseOrigin.OWN})
+    return broker, reports
+
+
+def __test_hedged_closes_of_other_clients_taken_for_an_own_close_are_reported__(tmp_path):
+    """Both orders carry another client's client-order-id: neither is the
+    bot's close, and on a position of one owner they took the bot's share."""
+    broker, reports = _ambiguous_claim_broker(
+        tmp_path, _claim(600), _claim(601), orders=[_closing_order(600), _closing_order(601)])
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert len(reports) == 1
+    assert reports[0][1]['candidate_order_ids'] == [600, 601]
+    assert broker._ambiguous_closes == {}
+
+
+def __test_hedged_close_of_another_client_taken_for_an_own_close_is_reported__(tmp_path):
+    """One close, but it carries another client's client-order-id: it is not
+    the bot's close, whatever happened to that one."""
+    broker, reports = _ambiguous_claim_broker(
+        tmp_path, _claim(600), orders=[_closing_order(600)])
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert len(reports) == 1 and reports[0][1]['order_id'] == 600
+
+
+def __test_hedged_one_close_for_one_own_unknown_close_stays_audited_only__(tmp_path):
+    """The one close without a client-order-id may be the bot's own."""
+    broker, reports = _ambiguous_claim_broker(
+        tmp_path, _claim(600), orders=[_closing_order(600, coid='')])
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert broker._ambiguous_closes == {}
+    assert len(list(broker.store_ctx.iter_events_by_kind_since(
+        'ctrader_close_claim_ambiguous', 0))) == 1
+
+
+@pytest.mark.parametrize('both_taken, reported', [(False, False), (True, True)])
+def __test_hedged_closes_without_a_client_order_id_count_only_when_taken_live__(
+        tmp_path, both_taken, reported):
+    """A closing order without a client-order-id may be a server-initiated
+    close; only its fill taken from the stream (no ``isServerEvent``) proves
+    it was a client's. Two such closes for one own close of unknown outcome:
+    one of them was someone else's."""
+    claims = (_claim(600), _claim(601)) if both_taken else (_claim(600),)
+    broker, reports = _ambiguous_claim_broker(
+        tmp_path, *claims,
+        orders=[_closing_order(600, coid=''), _closing_order(601, coid='')])
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert len(reports) == (1 if reported else 0)
+    assert broker._ambiguous_closes == {}
+
+
+@pytest.mark.parametrize('foreign_coid', ['', _FOREIGN_COID])
+def __test_hedged_close_of_only_merged_foreign_exposure_is_not_reported__(
+        tmp_path, foreign_coid):
+    """Another client added 5 to the bot's 10-unit leg. While the bot's close
+    of 10 has an unknown outcome, the other client closes its own 5
+    (15 -> 10), then the bot's close fills (10 -> 0); both fills were taken
+    for the bot's close. Whichever order was the bot's close, the other
+    client took none of the bot's 10 if the bot's close executed: the
+    evidence proves no intervention."""
+    broker, reports = _ambiguous_claim_broker(
+        tmp_path,
+        _claim(600, fill_qty=5.0, booked=5.0, share_before=10.0, share_high=10.0,
+               venue_after=10.0),
+        _claim(601, fill_qty=10.0, booked=5.0, share_before=5.0, share_high=5.0,
+               venue_after=0.0),
+        orders=[_closing_order(600, coid=foreign_coid), _closing_order(601, coid='')])
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert broker._ambiguous_closes == {}
+
+
+def __test_hedged_close_after_the_own_close_took_the_rest_of_the_share_is_reported__(
+        tmp_path):
+    """The bot's leg of 10 is its own. Its close of 5 fills (10 -> 5), then
+    another client closes the remaining 5 (5 -> 0): whichever order was the
+    bot's, someone else took 5 of the bot's share."""
+    broker, reports = _ambiguous_claim_broker(
+        tmp_path,
+        _claim(600, fill_qty=5.0, booked=5.0, share_before=10.0, share_high=10.0,
+               venue_after=5.0),
+        _claim(601, fill_qty=5.0, booked=0.0, share_before=5.0, share_high=5.0,
+               venue_after=0.0),
+        orders=[_closing_order(600, coid=''), _closing_order(601, coid='')])
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert len(reports) == 1
+    assert reports[0][1]['booked_qty'] == pytest.approx(5.0)
+
+
+# === A recovered close nothing proves someone else's =====================
+
+def _store_events(broker, kind) -> list:
+    return list(broker.store_ctx.iter_events_by_kind_since(kind, 0))
+
+
+def __test_recovered_close_without_a_client_order_id_is_audited_not_reported__(tmp_path):
+    """The deal history cannot tell another client's close from a server-initiated
+    one (the PUSH's ``isServerEvent`` is not part of the order): ERROR and an
+    audit event, the close booked, no report."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999, coid=''))
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert 900 in broker._seen_deal_ids
+    assert reports == []
+    audits = _store_events(broker, 'ctrader_close_unattributed')
+    assert len(audits) == 1 and audits[0]['deal_ids'] == [900]
+
+
+def __test_recovered_netting_unattributed_close_below_the_share_is_audited__(tmp_path):
+    broker, reports = _netting_recovered_broker(
+        tmp_path, _netting_history(foreign_closed=2000, sl_closed=1000))
+    broker._wire.orders[600] = _closing_order(600, coid='')
+    _seed_position(broker, 'c3', position_id=222, qty=20.0,
+                   extras={'missing_pending_since': 0.0})
+    broker.store_ctx.add_ref('c3', 'order_id', '111')
+
+    _recover(broker)
+
+    assert reports == []
+    audits = _store_events(broker, 'ctrader_close_unattributed')
+    assert len(audits) == 1 and audits[0]['booked_qty'] == pytest.approx(10.0)
+
+
+# === Closes before an operator resume are accepted =======================
+
+def __test_recovered_close_before_an_operator_resume_is_accepted__(tmp_path):
+    """The operator closed the position, then resumed: the resume accepted the
+    venue as it stands, so the close is never reported."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999))
+    accept_missing_before_resume(broker.store_ctx)
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+    assert len(_store_events(broker, 'ctrader_close_accepted_by_resume')) == 1
+
+
+def __test_shrink_a_restart_found_after_an_operator_resume_is_accepted__(tmp_path):
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    accept_missing_before_resume(broker.store_ctx)
+    broker._apply_adoption_baseline(broker._recon)
+    assert _retired(broker) == pytest.approx(10.0)
+
+    for _ in range(3):
+        _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert broker._startup_shrinks == {}
+    assert _retired(broker) == pytest.approx(10.0)
+    assert len(_store_events(broker, 'ctrader_close_accepted_by_resume')) == 1
+
+
+def __test_shrink_of_a_row_whose_resume_accepted_absence_ended_is_judged__(tmp_path):
+    """The resume accepted the absence stamped on the row, but the row came
+    back and its stamp was cleared: that acceptance is gone, so a shrink a
+    later restart finds is judged as usual."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    row = broker.store_ctx.get_order('c3')
+    broker.store_ctx.upsert_order('c3', extras={
+        **(row.extras or {}), MISSING_ACCEPTED_BY_RESUME_EXTRA: 1_700_000_000.0})
+    broker._apply_adoption_baseline(broker._recon)
+    assert _startup_volumes(broker) == {222: pytest.approx(10.0)}
+
+    _run(broker)
+    broker._flush_external_interventions()
+
+    assert len(reports) == 1 and reports[0][1]['booked_qty'] == pytest.approx(10.0)
+    assert _store_events(broker, 'ctrader_close_accepted_by_resume') == []
+
+
+def __test_pyramid_shrink_after_an_operator_resume_is_accepted__(tmp_path):
+    """Two entry rows share the shrunk position, so the startup baseline leaves
+    it alone; the first pass still accepts the operator's close."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker.store_ctx.upsert_order('c3', qty=10.0, filled_qty=10.0)
+    _seed_position(broker, 'c4', position_id=222, qty=10.0)
+    accept_missing_before_resume(broker.store_ctx)
+    broker._apply_adoption_baseline(broker._recon)
+    assert _retired(broker) == 0.0
+
+    for _ in range(3):
+        _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert _retired(broker) + _retired(broker, 'c4') == pytest.approx(10.0)
+    assert len(_store_events(broker, 'ctrader_close_accepted_by_resume')) == 1
+
+    # A shrink after that first pass is judged as usual.
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+    broker._wire._deal_res.deal.append(_timed(_close_deal(
+        deal_id=905, order_id=600, position_id=222, closed_volume=500), 1_700_000_005_000))
+    for _ in range(2):
+        _run(broker)
+    broker._flush_external_interventions()
+    assert len(reports) == 1
+
+
+# === Recovered closes: unknown share, HEDGED share, fired protection ======
+
+@pytest.mark.parametrize('hedged', [False, True])
+def __test_recovered_close_of_a_position_whose_bot_share_is_not_known__(tmp_path, hedged):
+    """No entry row of the run links the position. NETTING: nothing proves
+    another client's close took the bot's part, so ERROR + audit; a HEDGED
+    position has one owner, so it is reported."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(999), seed=False)
+    broker._hedging_enabled = hedged
+    deals = [_PositionDeal(deal_id=900, order_id=999, executed_ms=1_700_000_100_000,
+                           filled=2000, closed=2000)]
+
+    taken = asyncio.run(broker._judge_recovered_closes(222, deals, from_entry='long'))
+    broker._flush_external_interventions()
+
+    assert taken == pytest.approx(20.0)
+    audits = _store_events(broker, 'ctrader_close_share_unknown')
+    if hedged:
+        assert len(reports) == 1 and audits == []
+    else:
+        assert reports == []
+        assert len(audits) == 1 and audits[0]['recovered'] is True
+
+
+def __test_recovered_hedged_close_of_only_another_client_s_add_is_not_reported__(tmp_path):
+    """Another client's order added 10 to the bot's 20-unit leg and closed
+    exactly that 10 while the stream was down: the bot's share was intact."""
+    broker, reports = _netting_recovered_broker(
+        tmp_path, _netting_history(foreign_closed=1000, sl_closed=2000))
+    broker._hedging_enabled = True
+    _seed_position(broker, 'c3', position_id=222, qty=20.0,
+                   extras={'missing_pending_since': 0.0})
+    broker.store_ctx.add_ref('c3', 'order_id', '111')
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+
+
+_RULES = _SymbolRules(symbol_id=1, digits=5, min_volume=1000, step_volume=1000,
+                      max_volume=10_000_000)
+
+
+def _sltp_closing_order(order_id, *, stop=None, limit=None):
+    """Position 222's own SL / TP order that closed it, as the order details show it."""
+    order = _closing_order(order_id, order_type=_SLTP, coid='')
+    if stop is not None:
+        order.stopPrice = stop
+    if limit is not None:
+        order.limitPrice = limit
+    return order
+
+
+def _own_protection(broker, levels) -> None:
+    """The bot's confirmed protection of position 222, persisted on row ``c3``."""
+    guard = broker._protection_guard()
+    key = protection_key(222)
+    write = guard.expect(key, levels, row_coid='c3')
+    guard.settle(key, levels, write=write)
+
+
+@pytest.mark.parametrize('stop, limit, reported', [
+    (1.05, None, False), (None, 1.2, False), (1.2, 1.05, False),
+    (1.0, None, True), (1.05, 1.25, True),
+])
+def __test_recovered_protection_close_is_judged_against_the_bot_s_levels__(
+        tmp_path, stop, limit, reported):
+    """The position's SL / TP fired while the stream was down: venue mechanics,
+    unless it fired at a price the bot never set (either order field)."""
+    broker, reports = _recovered_close_broker(
+        tmp_path, _sltp_closing_order(999, stop=stop, limit=limit))
+    broker._symbol_rules = {'EURUSD': _RULES}
+    _own_protection(broker, ProtectionLevels(stop=1.05, limit=1.2))
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert len(reports) == (1 if reported else 0)
+    if reported:
+        context = reports[0][1]
+        assert context['recovered'] is True and context['fired_order_id'] == 999
+        assert context['booked_qty'] == pytest.approx(20.0)
+
+
+def __test_recovered_protection_close_without_levels_after_a_foreign_view_is_audited__(
+        tmp_path):
+    broker, reports = _recovered_close_broker(tmp_path, _sltp_closing_order(999))
+    _own_protection(broker, ProtectionLevels(stop=1.05, limit=1.2))
+    broker._last_venue_protection[protection_key(222)] = ProtectionLevels(stop=1.0, limit=1.2)
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+    assert len(_store_events(broker, 'ctrader_protection_fired_unconfirmed')) == 1
+
+
+def __test_recovered_protection_close_of_a_position_the_bot_left_bare_is_reported__(tmp_path):
+    """The bot left the position bare; a restarted process finds it closed by
+    an SL the bot never set."""
+    first, _ = _recovered_close_broker(tmp_path, _sltp_closing_order(999, stop=1.0))
+    first._mark_bare(222)
+    broker = _ReconcileBroker(_recon())
+    broker._wire = first._wire
+    broker.store_ctx = first.store_ctx
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert len(reports) == 1 and reports[0][1]['bare'] is True
+
+
+def _own_failsafe(broker, *, stop) -> None:
+    """A native fail-safe write of this process landed on position 222."""
+    async def landed(_req, **_kwargs):
+        return _oa.ProtoOAExecutionEvent(
+            executionType=_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+
+    broker._dispatch_order = landed
+    asyncio.run(broker._write_unguarded_protection(
+        _oa.ProtoOAAmendPositionSLTPReq(ctidTraderAccountId=999, positionId=222,
+                                        stopLoss=stop),
+        position_id=222, coid='c3', context="native fail-safe SL"))
+
+
+@pytest.mark.parametrize('stop, reported', [(1.05, False), (1.0, True)])
+def __test_recovered_native_failsafe_close_is_judged_against_its_levels__(
+        tmp_path, stop, reported):
+    """The native fail-safe stop of the position fired while the stream was
+    down: the bot's own, unless it fired at a level the bot never set."""
+    broker, reports = _recovered_close_broker(tmp_path, _sltp_closing_order(999, stop=stop))
+    broker._symbol_rules = {'EURUSD': _RULES}
+    _own_failsafe(broker, stop=1.05)
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert len(reports) == (1 if reported else 0)
+    if reported:
+        assert reports[0][1]['fired_stop'] == pytest.approx(1.0)
+
+
+def __test_recovered_protection_close_without_levels_after_an_own_view_is_the_venue_s__(
+        tmp_path):
+    broker, reports = _recovered_close_broker(tmp_path, _sltp_closing_order(999))
+    _own_protection(broker, ProtectionLevels(stop=1.05, limit=1.2))
+    broker._last_venue_protection[protection_key(222)] = ProtectionLevels(stop=1.05, limit=1.2)
+
+    _recover(broker)
+
+    assert 'c3' not in _live_coids(broker)
+    assert reports == []
+    assert _store_events(broker, 'ctrader_protection_fired_unconfirmed') == []

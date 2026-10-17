@@ -35,6 +35,7 @@ from ._base import _CTraderBase
 from .helpers import money_value, parse_protocol_id, round_price, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
+from .protection import _accepted_by_resume
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,10 @@ class _StateMixin(_CTraderBase, ABC):
         no-op here; the precise engine<->plugin coordination for that skip is the
         M3 startup-recovery (2.2) milestone's, where the diff core runs at
         ``connect`` under a single shared snapshot.
+
+        The same snapshot baselines the retired exposure of shrunk positions
+        (:meth:`_retire_shrunk_position_exposure`) and, after an operator
+        resume, the bare-protection marks (``_rebaseline_bare_marks``).
         """
         if self.store_ctx is None or self._adoption_baselined:
             return
@@ -208,6 +213,7 @@ class _StateMixin(_CTraderBase, ABC):
             if cumulative > row.filled_qty + 1e-9:
                 self.store_ctx.set_filled(row.client_order_id, cumulative)
         self._retire_shrunk_position_exposure(res)
+        self._rebaseline_bare_marks(res)
 
     def _retire_shrunk_position_exposure(
             self, res: OpenApiMessages.ProtoOAReconcileRes,
@@ -232,13 +238,26 @@ class _StateMixin(_CTraderBase, ABC):
         rows flagged ``adopted_startup`` (excluded from ownership anyway) or
         ``recovered_inconclusive`` (cursor not final) are skipped, and the
         counter only ever grows toward the venue truth — never shrinks.
+
+        Who closed the difference is judged later, once the stream runs, from
+        the position's deal history (``_ReconcileMixin._judge_position_shrinks``,
+        through :attr:`_startup_shrinks`); the finding is journalled until
+        then, and the ones an earlier process of the run never judged are
+        taken over here (``_ReconcileMixin._restore_startup_shrinks``). Right
+        after an operator resume the resume marked the rows: the operator
+        accepted the venue as it stands, so the shrink is accepted instead,
+        and a position several rows share is accepted on the first settled
+        reconcile pass (:attr:`_resume_accepted_positions`).
         """
         if self.store_ctx is None:
             return
-        open_volume_by_id = {
-            p.positionId: volume_to_units(p.tradeData.volume)
-            for p in res.position
+        open_by_id = {
+            p.positionId: p for p in res.position
             if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+        }
+        open_volume_by_id = {
+            position_id: volume_to_units(position.tradeData.volume)
+            for position_id, position in open_by_id.items()
         }
         rows_by_position: dict[int, list] = {}
         for row in self.store_ctx.iter_live_orders():
@@ -253,6 +272,9 @@ class _StateMixin(_CTraderBase, ABC):
             if position_id in open_volume_by_id:
                 rows_by_position.setdefault(position_id, []).append(row)
         for position_id, rows in rows_by_position.items():
+            accepted = any(_accepted_by_resume(row) for row in rows)
+            if accepted:
+                self._resume_accepted_positions.add(position_id)
             if len(rows) != 1:
                 continue
             row = rows[0]
@@ -267,6 +289,13 @@ class _StateMixin(_CTraderBase, ABC):
             retired = already + (journal_remaining - venue_remaining)
             extras[JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY] = retired
             self.store_ctx.upsert_order(row.client_order_id, extras=extras)
+            if accepted:
+                self._note_accepted_by_resume(
+                    position_id, client_order_id=row.client_order_id,
+                    volume=journal_remaining - venue_remaining)
+            else:
+                self._record_startup_shrink(
+                    open_by_id[position_id], row, journal_remaining - venue_remaining)
             self.store_ctx.log_event(
                 'journal_exposure_retired',
                 client_order_id=row.client_order_id,
@@ -275,6 +304,7 @@ class _StateMixin(_CTraderBase, ABC):
                          'total_retired': retired,
                          'source': 'adoption_baseline'},
             )
+        self._restore_startup_shrinks()
 
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None:
         """Resolve ``symbol`` to its numeric ``symbolId``, fetching if needed.

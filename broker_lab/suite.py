@@ -2,9 +2,11 @@
 
 import asyncio
 import inspect
+import tempfile
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -19,7 +21,7 @@ from pynecore.testing.broker_lab.reference import (
     VenueOrder,
 )
 from pynecore.types.ohlcv import OHLCV
-from pynecore_ctrader import CTrader, CTraderConfig, auth, helpers
+from pynecore_ctrader import CTrader, CTraderConfig, auth, helpers, session
 from pynecore_ctrader.exceptions import map_protocol_error
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as model
@@ -38,6 +40,11 @@ _RULES = _SymbolRules(
     step_volume=1000,
     max_volume=10_000_000,
 )
+
+#: The offline lab never touches the real workdir's OAuth session cache: the
+#: plugin loads it when built and takes a lock file beside it on a refresh.
+_SESSION_DIR = tempfile.TemporaryDirectory(prefix="ctrader-lab-session-")
+session._session_path = lambda: Path(_SESSION_DIR.name) / "ctrader.json"
 
 
 def _accepted_event(request, order_id: int) -> oa.ProtoOAExecutionEvent:
@@ -525,11 +532,24 @@ class CTraderProfile(ReferenceVenueProfile):
         self.position_keys: dict[int, tuple[str, str]] = {}
         self.dispatch_run: str | None = None
         self.brokers: dict[str, OfflineCTrader] = {}
+        self.quarantines: dict[str, list[tuple[str, dict]]] = {}
+        self.foreign_ids = 900_000
 
     def create_broker(self, run_name: str, store_ctx: Any) -> OfflineCTrader:
         broker = OfflineCTrader(self, run_name, store_ctx)
         self.brokers[run_name] = broker
         return broker
+
+    def _only_wire_position(self) -> model.ProtoOAPosition:
+        """The single open position a foreign-action step acts on."""
+        if len(self.wire.positions) != 1:
+            raise AssertionError("foreign cTrader action requires exactly one position")
+        return next(iter(self.wire.positions.values()))
+
+    def _foreign_id(self) -> int:
+        """A venue id for an order or position someone else created."""
+        self.foreign_ids += 1
+        return self.foreign_ids
 
     def broadcast_execution_event(self, event: Any) -> None:
         """Queue one account-wide PUSH for every active broker instance."""
@@ -635,6 +655,140 @@ class CTraderProfile(ReferenceVenueProfile):
                 remaining_qty=0.0,
                 average_fill_price=price,
             )
+            return True
+        if step.kind == "ctrader_spy_quarantine":
+            broker = runner.runs[step.run].broker
+            broker.on_unexpected_cancel = "stop"
+            reports = self.quarantines.setdefault(step.run, [])
+            broker.quarantine_sink = (
+                lambda reason, context, *, kind: reports.append((reason, context))
+            )
+            return True
+        if step.kind == "expect_ctrader_quarantine":
+            reports = self.quarantines.get(step.run, [])
+            expected = int(step.values["count"])
+            if len(reports) != expected:
+                raise AssertionError(
+                    f"expected {expected} cTrader intervention reports, got {reports}"
+                )
+            for key, value in step.values.get("context", {}).items():
+                actual = reports[-1][1].get(key)
+                if actual != value:
+                    raise AssertionError(
+                        f"cTrader intervention report {key}={actual!r}, expected {value!r}"
+                    )
+            return True
+        if step.kind == "ctrader_flush_reports":
+            runner.runs[step.run].broker._flush_external_interventions()
+            return True
+        if step.kind == "ctrader_foreign_protection_edit":
+            position = self._only_wire_position()
+            for field in ("stopLoss", "takeProfit"):
+                if field in step.values:
+                    value = step.values[field]
+                    if value is None:
+                        position.ClearField(field)
+                    else:
+                        setattr(position, field, float(value))
+            event = oa.ProtoOAExecutionEvent(
+                executionType=model.ProtoOAExecutionType.ORDER_REPLACED
+            )
+            event.order.CopyFrom(model.ProtoOAOrder(
+                orderId=self._foreign_id(),
+                orderType=model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+                orderStatus=model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED,
+                positionId=position.positionId,
+                tradeData=model.ProtoOATradeData(
+                    symbolId=1, volume=0, tradeSide=position.tradeData.tradeSide),
+            ))
+            event.position.CopyFrom(position)
+            self.broadcast_execution_event(event)
+            return True
+        if step.kind == "ctrader_foreign_open":
+            volume = int(round(float(step.values["qty"]) * 100))
+            position_id = self._foreign_id()
+            order_id = self._foreign_id()
+            position = model.ProtoOAPosition(
+                positionId=position_id,
+                positionStatus=model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                price=1.10,
+                tradeData=model.ProtoOATradeData(
+                    symbolId=1, volume=volume, tradeSide=model.ProtoOATradeSide.BUY),
+            )
+            self.wire.positions[position_id] = position
+            event = oa.ProtoOAExecutionEvent(
+                executionType=model.ProtoOAExecutionType.ORDER_FILLED
+            )
+            event.order.CopyFrom(model.ProtoOAOrder(
+                orderId=order_id,
+                orderType=model.ProtoOAOrderType.MARKET,
+                orderStatus=model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+                executedVolume=volume, executionPrice=1.10, positionId=position_id,
+                tradeData=model.ProtoOATradeData(
+                    symbolId=1, volume=volume, tradeSide=model.ProtoOATradeSide.BUY),
+            ))
+            event.position.CopyFrom(position)
+            deal = model.ProtoOADeal(
+                dealId=order_id + 10_000, orderId=order_id, positionId=position_id,
+                filledVolume=volume, executionPrice=1.10,
+                dealStatus=model.ProtoOADealStatus.FILLED, moneyDigits=2, commission=0,
+                executionTimestamp=1_700_000_002_000,
+            )
+            event.deal.CopyFrom(deal)
+            self.wire.deals.append(deal)
+            self.broadcast_execution_event(event)
+            return True
+        if step.kind in ("ctrader_foreign_close", "ctrader_foreign_stop_fires",
+                         "ctrader_protection_fires"):
+            # ``ctrader_protection_fires`` fires the position's protection as
+            # it stands; the fill push reports the given price in the given
+            # order field (the live shape of that push is not measured).
+            position = self._only_wire_position()
+            fires = step.kind != "ctrader_foreign_close"
+            if step.kind == "ctrader_foreign_stop_fires":
+                position.stopLoss = float(step.values["stopLoss"])
+            closed = (position.tradeData.volume if fires
+                      else int(round(float(step.values["qty"]) * 100)))
+            order_id = self._foreign_id()
+            order = model.ProtoOAOrder(
+                orderId=order_id,
+                orderType=(model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT if fires
+                           else model.ProtoOAOrderType.MARKET),
+                orderStatus=model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+                executedVolume=closed, executionPrice=1.09,
+                positionId=position.positionId, closingOrder=True,
+                tradeData=model.ProtoOATradeData(
+                    symbolId=1, volume=closed, tradeSide=model.ProtoOATradeSide.SELL),
+            )
+            if step.kind == "ctrader_foreign_stop_fires":
+                order.stopPrice = position.stopLoss
+            elif step.kind == "ctrader_protection_fires":
+                setattr(order, str(step.values["field"]), float(step.values["price"]))
+            event = oa.ProtoOAExecutionEvent(
+                executionType=model.ProtoOAExecutionType.ORDER_FILLED
+            )
+            event.order.CopyFrom(order)
+            event.deal.CopyFrom(model.ProtoOADeal(
+                dealId=order_id + 10_000, orderId=order_id,
+                positionId=position.positionId, filledVolume=closed,
+                executionPrice=1.09, dealStatus=model.ProtoOADealStatus.FILLED,
+                closePositionDetail=model.ProtoOAClosePositionDetail(closedVolume=closed),
+            ))
+            residual = position.tradeData.volume - closed
+            position.tradeData.volume = residual
+            if not residual:
+                position.positionStatus = model.ProtoOAPositionStatus.POSITION_STATUS_CLOSED
+                del self.wire.positions[position.positionId]
+            event.position.CopyFrom(position)
+            self.broadcast_execution_event(event)
+            leg_key = self.position_keys[position.positionId]
+            units = closed / 100.0
+            self.state.position_legs[leg_key] = (
+                self.state.position_legs.get(leg_key, 0.0) - units)
+            owner = leg_key[0]
+            self.state.position_owners[owner] = (
+                self.state.position_owners.get(owner, 0.0) - units)
+            self.state.position = sum(self.state.position_owners.values())
             return True
         if step.kind == "ctrader_queue_pending_push":
             events = self.pending_events.get(step.run, [])
@@ -1902,7 +2056,154 @@ def smoke_scenarios(seed: int = 0) -> list[Scenario]:
             expected_violation="ExchangeRateLimitError",
             steps=(Step("ctrader_multisymbol_rate_storm", run="eurusd"),),
         ),
+        Scenario(
+            name="ctrader-foreign-stop-loss-move-is-quarantined",
+            profile_factory=CTraderProfile,
+            seed=seed,
+            steps=(
+                *_protected_long_steps(),
+                Step("ctrader_foreign_protection_edit", values={"stopLoss": 1.0}),
+                Step("ctrader_deliver_pending_pushes", values={"emitted": 0}),
+                Step("ctrader_reconcile_once", values={"events": 0}),
+                Step("ctrader_reconcile_once", values={"events": 0}),
+                Step("expect_ctrader_quarantine", values={"count": 1}),
+                Step("expect", values={"position": 10.0, "engine_position": 10.0}),
+            ),
+        ),
+        Scenario(
+            name="ctrader-foreign-stop-loss-added-to-a-bare-position-is-quarantined",
+            profile_factory=CTraderProfile,
+            seed=seed,
+            steps=(
+                Step("entry", values={"id": "L", "side": "buy", "qty": 10.0}),
+                Step("sync", values={"last_price": 1.10}),
+                Step("ctrader_fill_entry", check_invariants=False),
+                Step("ctrader_queue_pending_push", check_invariants=False),
+                Step("pump_watch"),
+                Step("ctrader_spy_quarantine"),
+                Step("ctrader_reconcile_once", values={"events": 0}),
+                Step("expect_ctrader_quarantine", values={"count": 0}),
+                Step("ctrader_foreign_protection_edit", values={"stopLoss": 1.0}),
+                Step("ctrader_deliver_pending_pushes", values={"emitted": 0}),
+                Step("ctrader_reconcile_once", values={"events": 0}),
+                Step("ctrader_reconcile_once", values={"events": 0}),
+                Step(
+                    "expect_ctrader_quarantine",
+                    values={"count": 1, "context": {"expected": [None, None, False, None]}},
+                ),
+                Step("expect", values={"position": 10.0, "engine_position": 10.0}),
+            ),
+        ),
+        Scenario(
+            name="ctrader-foreign-same-direction-position-is-not-the-bots",
+            profile_factory=CTraderProfile,
+            seed=seed,
+            steps=(
+                *_protected_long_steps(),
+                Step("ctrader_foreign_open", values={"qty": 5.0}, check_invariants=False),
+                Step("ctrader_deliver_pending_pushes", values={"emitted": 0}),
+                Step("ctrader_reconcile_once", values={"events": 0}),
+                Step("ctrader_reconcile_once", values={"events": 0}),
+                Step("ctrader_flush_reports"),
+                Step("expect_ctrader_quarantine", values={"count": 0}),
+                Step("expect", values={"position": 10.0, "engine_position": 10.0}),
+            ),
+        ),
+        Scenario(
+            name="ctrader-foreign-partial-close-is-booked-and-quarantined",
+            profile_factory=CTraderProfile,
+            seed=seed,
+            steps=(
+                *_protected_long_steps(),
+                Step("ctrader_foreign_close", values={"qty": 4.0}, check_invariants=False),
+                Step("ctrader_deliver_pending_pushes", values={"emitted": 1}),
+                Step("expect_ctrader_quarantine", values={"count": 0}),
+                Step("ctrader_flush_reports"),
+                Step("expect_ctrader_quarantine", values={"count": 1}),
+                Step("expect", values={"position": 6.0, "engine_position": 6.0}),
+            ),
+        ),
+        Scenario(
+            name="ctrader-foreign-stop-loss-firing-at-once-is-quarantined",
+            profile_factory=CTraderProfile,
+            seed=seed,
+            steps=(
+                *_protected_long_steps(),
+                Step(
+                    "ctrader_foreign_stop_fires",
+                    values={"stopLoss": 1.09},
+                    check_invariants=False,
+                ),
+                Step("ctrader_deliver_pending_pushes", values={"emitted": 1}),
+                Step("ctrader_flush_reports"),
+                Step(
+                    "expect_ctrader_quarantine",
+                    values={"count": 1, "context": {"fired_stop": 1.09}},
+                ),
+                Step("expect", values={"position": 0.0, "engine_position": 0.0}),
+            ),
+        ),
+        *(
+            Scenario(
+                name=f"ctrader-own-{name}-fill-is-not-quarantined",
+                profile_factory=CTraderProfile,
+                seed=seed,
+                steps=(
+                    *_protected_long_steps(),
+                    Step(
+                        "ctrader_protection_fires",
+                        values={"field": field, "price": price},
+                        check_invariants=False,
+                    ),
+                    Step("ctrader_deliver_pending_pushes", values={"emitted": 1}),
+                    Step("ctrader_flush_reports"),
+                    Step("expect_ctrader_quarantine", values={"count": 0}),
+                    Step("expect", values={"position": 0.0, "engine_position": 0.0}),
+                ),
+            )
+            for name, field, price in (
+                ("stop-loss", "stopPrice", 1.05),
+                ("take-profit", "limitPrice", 1.20),
+                ("take-profit-reported-as-stop", "stopPrice", 1.20),
+            )
+        ),
+        *(
+            Scenario(
+                name=f"ctrader-foreign-{name}-removal-is-quarantined",
+                profile_factory=CTraderProfile,
+                seed=seed,
+                steps=(
+                    *_protected_long_steps(),
+                    Step("ctrader_foreign_protection_edit", values={field: None}),
+                    Step("ctrader_deliver_pending_pushes", values={"emitted": 0}),
+                    Step("ctrader_reconcile_once", values={"events": 0}),
+                    Step("ctrader_reconcile_once", values={"events": 0}),
+                    Step("expect_ctrader_quarantine", values={"count": 1}),
+                    Step("expect", values={"position": 10.0, "engine_position": 10.0}),
+                ),
+            )
+            for name, field in (("stop-loss", "stopLoss"), ("take-profit", "takeProfit"))
+        ),
     ]
+
+
+def _protected_long_steps() -> tuple[Step, ...]:
+    """A filled 10-unit long whose exit armed SL 1.05 / TP 1.20, with the
+    quarantine reports captured."""
+    return (
+        Step("entry", values={"id": "L", "side": "buy", "qty": 10.0}),
+        Step("sync", values={"last_price": 1.10}),
+        Step("ctrader_fill_entry", check_invariants=False),
+        Step("ctrader_queue_pending_push", check_invariants=False),
+        Step("pump_watch"),
+        Step(
+            "exit",
+            values={"id": "X", "from_entry": "L", "side": "sell", "qty": 10.0,
+                    "stop": 1.05, "limit": 1.20},
+        ),
+        Step("sync", values={"last_price": 1.10}),
+        Step("ctrader_spy_quarantine"),
+    )
 
 
 def extended_scenarios(seed: int = 0) -> list[Scenario]:

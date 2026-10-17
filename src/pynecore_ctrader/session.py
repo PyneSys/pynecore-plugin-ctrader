@@ -9,14 +9,33 @@ that the program never rewrites.
 
 Demo and live tokens are kept under separate keys in one ``ctrader.json`` file
 (the access tokens are environment-specific), so authenticating one environment
-never clobbers the other. The file is written ``0600`` and atomically (temp file
-+ replace) because it holds bearer secrets.
+never clobbers the other. The file is written ``0600`` and atomically (a temp
+file unique to the writer, then a replace) because it holds bearer secrets.
+
+Several processes can share the file — a live bot, a ``pyne data`` download, a
+second bot on another account of the same grant. A ``ProtoOARefreshTokenReq``
+rotates the refresh token, so a process refreshing with a pair another process
+already rotated would lose the grant. :func:`acquire_session_lock` serializes
+the read-check-refresh-save sequence across processes with an advisory lock on
+a sidecar file (POSIX ``flock``; on a platform without it the lock is
+process-local only).
 """
 import json
 import os
+import threading
+import uuid
 from pathlib import Path
 
 from .auth import TokenSet
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platform
+    fcntl = None
+
+#: Serializes the session lock inside one process; ``flock`` is per open file
+#: description, so two threads of one process would not exclude each other.
+_LOCAL_LOCK = threading.Lock()
 
 
 def _session_path() -> Path:
@@ -64,7 +83,9 @@ def save_session(tokens: TokenSet, *, demo: bool) -> None:
     """Persist the token set for the demo or live environment.
 
     Reads-modifies-writes the one session file so the other environment's tokens
-    are preserved, then writes atomically with ``0600`` permissions.
+    are preserved, then writes atomically with ``0600`` permissions. The temp
+    file name is unique to the call, so two writers never write into each
+    other's temp file.
 
     :param tokens: The token set to store.
     :param demo: Whether these are demo-environment tokens.
@@ -83,7 +104,65 @@ def save_session(tokens: TokenSet, *, demo: bool) -> None:
         "token_type": tokens.token_type,
         "expires_in": tokens.expires_in,
     }
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(raw, indent=2) + "\n")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(raw, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+class SessionLock:
+    """The held cross-process session lock; :meth:`release` exactly once.
+
+    Acquired by :func:`acquire_session_lock`. Every token refresh runs under
+    it: re-read the file, refresh only when no other process rotated the pair
+    meanwhile, save. The holder may release it from another thread than the
+    one that acquired it.
+    """
+
+    def __init__(self, descriptor: int | None) -> None:
+        self._descriptor = descriptor
+        self._released = False
+
+    def release(self) -> None:
+        """Release the lock; a second call is a no-op."""
+        if self._released:
+            return
+        self._released = True
+        descriptor = self._descriptor
+        try:
+            if descriptor is not None and fcntl is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+        finally:
+            _LOCAL_LOCK.release()
+
+
+def acquire_session_lock() -> SessionLock:
+    """Block until this process holds the session lock.
+
+    Blocks the calling thread, so async callers run it in a worker thread.
+
+    :return: The held lock.
+    """
+    path = _session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _LOCAL_LOCK.acquire()
+    if fcntl is None:
+        return SessionLock(None)
+    try:
+        descriptor = os.open(path.with_name(f"{path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    except BaseException:
+        _LOCAL_LOCK.release()
+        raise
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(descriptor)
+        _LOCAL_LOCK.release()
+        raise
+    return SessionLock(descriptor)
