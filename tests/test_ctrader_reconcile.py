@@ -1750,7 +1750,8 @@ def __test_recovered_manual_close_is_reported__(tmp_path):
 
 
 @pytest.mark.parametrize('policy', ['ignore', 're_place'])
-def __test_recovered_manual_close_after_a_handled_report_is_reported_again__(tmp_path, policy):
+def __test_recovered_manual_close_after_a_handled_report_is_reported_again__(
+        tmp_path, policy, monkeypatch):
     """The run trades on after a report the policy let pass: a later manual
     close of the same position is judged and reported on its own."""
     broker, _reports = _recovered_close_broker(
@@ -1768,6 +1769,10 @@ def __test_recovered_manual_close_after_a_handled_report_is_reported_again__(tmp
     broker._wire._deal_res = _deal_res(
         _close_deal(deal_id=900, order_id=999, position_id=222, closed_volume=2000),
         _close_deal(deal_id=901, order_id=998, position_id=222, closed_volume=2000))
+    # The deal walk reads on only once the clock passed its last read: a
+    # second pass in the same millisecond would see the first pass's deals
+    later = ctrader_reconcile.epoch_time() + 1.0
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: later)
     _recover(broker)
 
     assert 'c4' not in _live_coids(broker)
