@@ -438,6 +438,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self._shrink_watch: dict[int, tuple[tuple[int, int], int]] = {}
         #: ``(position_id, (venue_cents, share_cents))`` shrinks already judged.
         self._shrink_judged: set[tuple[int, tuple[int, int]]] = set()
+        #: Open positions of the latest reconcile snapshot by ``positionId``
+        #: (``None`` before the first), the venue view the engine's position
+        #: check read. See ``_ReconcileMixin.fill_recovery_pending``.
+        self._snapshot_open_positions: (
+            'dict[int, OpenApiModelMessages.ProtoOAPosition] | None') = None
         #: Venue time (ms) up to which a reconcile pass retired a position's
         #: closes from the journal without an event of theirs, per position: a
         #: closing-fill push executed earlier is a late copy of one of them.

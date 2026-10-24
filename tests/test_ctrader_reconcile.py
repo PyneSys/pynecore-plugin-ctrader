@@ -15,11 +15,14 @@ from pynecore.core.broker.disappearance import (
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REJECTED,
     VENUE_DRIVEN_CANCEL_REASONS,
+    LegType,
+    OrderStatus,
     QuarantineKind,
 )
 from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from pynecore_ctrader import CTrader, CTraderConfig
 from pynecore_ctrader import events as ctrader_events
@@ -163,12 +166,14 @@ def _deal(*, deal_id, order_id, position_id, filled_volume, price=1.1,
     )
 
 
-def _close_deal(*, deal_id, order_id, position_id, closed_volume, price=1.1):
-    """A FILLED closing deal carrying ``closePositionDetail.closedVolume``."""
+def _close_deal(*, deal_id, order_id, position_id, closed_volume, price=1.1,
+                side=_model.ProtoOATradeSide.SELL, commission=0):
+    """A FILLED closing deal carrying ``closePositionDetail.closedVolume``; by
+    default the SELL that closes a long."""
     return _model.ProtoOADeal(
         dealId=deal_id, orderId=order_id, positionId=position_id,
-        filledVolume=closed_volume, executionPrice=price,
-        dealStatus=_model.ProtoOADealStatus.FILLED, moneyDigits=2, commission=0,
+        filledVolume=closed_volume, executionPrice=price, tradeSide=side,
+        dealStatus=_model.ProtoOADealStatus.FILLED, moneyDigits=2, commission=commission,
         executionTimestamp=1_700_000_100_000,
         closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=closed_volume),
     )
@@ -923,8 +928,8 @@ def __test_reconcile_filled_then_closed_retires_instead_of_phantom__(tmp_path):
     # down. The OPEN-filtered snapshot no longer carries the position, but the
     # deal history does — both the opening deal (orderId match) and a closing
     # deal carrying closePositionDetail.closedVolume on the same position. The
-    # row is retired through the terminal-close path, NOT promoted to a phantom
-    # open position, and no fill is emitted.
+    # row is retired through the terminal-close path, NOT promoted to an open
+    # position; the whole trade is delivered: the entry fill, then its close.
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(
         _recon(positions=[]),  # position 222 fully closed -> gone
@@ -939,7 +944,13 @@ def __test_reconcile_filled_then_closed_retires_instead_of_phantom__(tmp_path):
 
     events = _run(broker)
 
-    assert events == []  # no phantom ENTRY fill
+    assert [(e.leg_type, e.event_type, e.fill_qty, e.fill_price) for e in events] == [
+        (LegType.ENTRY, 'filled', pytest.approx(qty), pytest.approx(1.1)),
+        (LegType.CLOSE, 'filled', pytest.approx(qty), pytest.approx(1.1)),
+    ]
+    assert events[0].pine_id == 'long' and events[0].order.side == 'buy'
+    assert events[1].from_entry == 'long' and events[1].order.side == 'sell'
+    assert events[1].fill_id == '906'
     row = broker.store_ctx.get_order('c14')
     assert row is not None
     assert row.state == 'closed'
@@ -951,6 +962,52 @@ def __test_reconcile_filled_then_closed_retires_instead_of_phantom__(tmp_path):
     # order, 999) are on the de-dup channel: the retire was concluded from
     # them, so a late PUSH replay of either must not re-book.
     assert {905, 906} <= broker._seen_deal_ids
+
+
+def _filled_then_closed_broker(tmp_path, *, entry_commission=0):
+    """Working order 111 filled (deal 905) and its position 222 was closed by its
+    SL (deal 906, order 999) while the stream was down."""
+    entry = _deal(deal_id=905, order_id=111, position_id=222, filled_volume=2000, price=1.2)
+    entry.commission = entry_commission
+    broker = _ReconcileBroker(_recon(positions=[]), deal_res=_deal_res(
+        entry,
+        _close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=2000,
+                    price=1.15, commission=300)))
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c14', order_id=111, qty=volume_to_units(2000))
+    return broker
+
+
+def __test_filled_then_closed_trade_is_delivered_with_its_terms__(tmp_path):
+    """Entry and close carry their own deal's price and commission."""
+    broker = _filled_then_closed_broker(tmp_path, entry_commission=150)
+
+    entry, close = _run(broker)
+
+    assert entry.leg_type is LegType.ENTRY and entry.pine_id == 'long'
+    assert entry.fill_price == pytest.approx(1.2) and entry.fee == pytest.approx(1.5)
+    assert entry.timestamp == pytest.approx(1_700_000_000.0)
+    assert close.leg_type is LegType.CLOSE and close.from_entry == 'long'
+    assert close.fill_price == pytest.approx(1.15) and close.fee == pytest.approx(3.0)
+    assert close.timestamp == pytest.approx(1_700_000_100.0)
+
+
+def __test_filled_then_closed_deals_the_push_delivered_are_not_delivered_again__(tmp_path):
+    """A deal the push stream already delivered is not delivered by the recovery."""
+    broker = _filled_then_closed_broker(tmp_path)
+    broker._seen_deal_ids.update({905, 906})
+
+    assert _run(broker) == []
+    assert 'c14' not in _live_coids(broker)
+
+
+def __test_filled_then_closed_close_the_push_delivered_leaves_the_entry_fill__(tmp_path):
+    broker = _filled_then_closed_broker(tmp_path)
+    broker._seen_deal_ids.add(906)
+
+    events = _run(broker)
+
+    assert [e.leg_type for e in events] == [LegType.ENTRY]
 
 
 def __test_bridge_excludes_zero_volume_close_detail_ids__(tmp_path):
@@ -1144,7 +1201,7 @@ def __test_grace_expired_natural_close_booked_as_close_not_cancel__(tmp_path):
     # A native TP/SL (or external) close fired while the stream was down: the
     # grace-expired position's final deal-history re-check shows closedVolume>0,
     # so it is booked as a terminal CLOSE, never a synthetic unexpected_cancel —
-    # no cancel event, no halt. Supersedes the old (never-written) natural_close_at.
+    # no cancel event, no halt; the close itself is delivered as a fill.
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(
         _recon(),
@@ -1157,7 +1214,7 @@ def __test_grace_expired_natural_close_booked_as_close_not_cancel__(tmp_path):
 
     events, err = _drive_tracker(broker)
 
-    assert events == []                       # no synthetic cancel emitted
+    assert [(e.event_type, e.fill_id) for e in events] == [('filled', '900')]
     assert err is None                        # no halt
     assert 'c3' not in _live_coids(broker)    # retired as a close
     assert 900 in broker._seen_deal_ids       # close deal recorded on the de-dup channel
@@ -1383,7 +1440,7 @@ def __test_grace_expired_position_close_wins_over_cancel_aged_fill__(tmp_path):
 
     events, err = _drive_tracker(broker)
 
-    assert events == []
+    assert [(e.event_type, e.fill_id) for e in events] == [('filled', '901')]
     assert err is None
     assert 'c8' not in _live_coids(broker)
     # The closing deal belongs to a DIFFERENT order (999, not the entry's
@@ -1719,11 +1776,15 @@ def _details_requests(broker) -> list:
     return [r for r in broker._wire.requests if isinstance(r, _oa.ProtoOAOrderDetailsReq)]
 
 
-def _recover(broker) -> None:
-    """One grace-expiry pass, then the report flush ``watch_orders`` runs after it."""
+def _recover(broker) -> list:
+    """One grace-expiry pass, then the report flush ``watch_orders`` runs after it.
+
+    :return: The events the pass delivered: the recovered close fills.
+    """
     events, err = _drive_tracker(broker)
-    assert events == [] and err is None
+    assert err is None
     broker._flush_external_interventions()
+    return events
 
 
 def __test_recovered_manual_close_is_reported__(tmp_path):
@@ -1789,6 +1850,86 @@ def __test_recovered_venue_bracket_close_is_not_reported__(tmp_path):
     assert reports == []
 
 
+def __test_recovered_venue_bracket_close_is_delivered_as_the_entry_s_exit__(tmp_path):
+    """The position's SL / TP fired while the wire was stalled and its push was
+    lost (measured live: ctrader cycle 297, position 58811674). The recovered
+    closing deal reaches the engine as the entry's close fill, exactly as the
+    push would have, so the engine books the exit instead of finding an
+    unexplained flat venue."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(
+        999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT))
+    wire = broker._wire
+    assert wire is not None
+    deal = wire._deal_res.deal[0]
+    deal.executionPrice = 1.0995
+    deal.commission = 250
+
+    events = _recover(broker)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == 'filled'
+    assert event.leg_type is LegType.CLOSE
+    assert event.from_entry == 'long' and event.pine_id is None
+    assert event.order.side == 'sell' and event.order.reduce_only
+    assert event.order.id == '999'
+    assert event.order.status is OrderStatus.FILLED
+    assert event.fill_qty == pytest.approx(volume_to_units(2000))
+    assert event.fill_price == pytest.approx(1.0995)
+    assert event.fee == pytest.approx(2.5)
+    assert event.fill_id == '900'
+    assert event.timestamp == pytest.approx(1_700_000_100.0)
+    assert reports == []
+    assert 'c3' not in _live_coids(broker)
+    assert 900 in broker._seen_deal_ids
+
+
+def __test_recovered_venue_close_of_a_startup_adopted_position_is_delivered_in_full__(
+        tmp_path):
+    """No entry row of the run carries a share of the position (a startup-adopted
+    one): the venue's close is delivered as the venue shows it."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(
+        999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT), seed=False)
+    _seed_position(broker, 'c3', position_id=222, qty=volume_to_units(2000),
+                   extras={'missing_pending_since': 0.0, ADOPTED_STARTUP_EXTRA_KEY: True})
+    assert broker._own_share(222) is None
+
+    events = _recover(broker)
+
+    assert [(e.fill_id, e.fill_qty) for e in events] == [
+        ('900', pytest.approx(volume_to_units(2000)))]
+    assert reports == []
+
+
+def __test_recovered_close_the_push_stream_delivered_is_not_delivered_again__(tmp_path):
+    """A closing deal the push stream already delivered (its deal id is on the
+    de-dup channel) retires the row without a second close fill."""
+    broker, _reports = _recovered_close_broker(tmp_path, _closing_order(
+        999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT))
+    broker._seen_deal_ids.add(900)
+
+    events = _recover(broker)
+
+    assert events == []
+    assert 'c3' not in _live_coids(broker)
+
+
+def __test_recovered_close_accepted_by_an_operator_resume_delivers_no_fill__(tmp_path):
+    """The operator resumed the run accepting the venue as it stands: the close
+    is accepted, not delivered."""
+    broker, reports = _recovered_close_broker(tmp_path, _closing_order(
+        999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT), seed=False)
+    _seed_position(broker, 'c3', position_id=222, qty=volume_to_units(2000),
+                   extras={'missing_pending_since': 0.0,
+                           MISSING_ACCEPTED_BY_RESUME_EXTRA: 0.0})
+
+    events = _recover(broker)
+
+    assert events == []
+    assert reports == []
+    assert 'c3' not in _live_coids(broker)
+
+
 def __test_recovered_stop_out_is_not_reported__(tmp_path):
     broker, reports = _recovered_close_broker(tmp_path, _closing_order(999, stop_out=True))
 
@@ -1852,7 +1993,7 @@ def __test_recovered_close_by_an_entry_order_of_a_closed_row_needs_no_lookup__(t
     """A closing deal of an entry order whose row is closed is the bot's own."""
     broker, reports = _recovered_close_broker(tmp_path, _closing_order(999))
     deals = [_PositionDeal(deal_id=900, order_id=999, executed_ms=1_700_000_100_000,
-                           filled=2000, closed=2000)]
+                           filled=2000, closed=2000, side='sell', price=1.1, fee=0.0)]
 
     taken = asyncio.run(broker._judge_recovered_closes(
         222, deals, from_entry='long', own_orders=(999,)))
@@ -2034,7 +2175,7 @@ def __test_recovered_report_a_dead_process_never_delivered_is_replayed__(tmp_pat
     """The close was judged and journalled, but the process died before the report."""
     first, first_reports = _recovered_close_broker(tmp_path, _closing_order(999))
     events, err = _drive_tracker(first)
-    assert events == [] and err is None
+    assert [e.fill_id for e in events] == ['900'] and err is None
     assert 900 in first._judged_close_deals and first_reports == []
     first.store_ctx.close()
 
@@ -2112,9 +2253,12 @@ def __test_recovered_manual_close_of_a_working_order_position_is_reported__(tmp_
     _open(tmp_path, broker)
     _seed_working(broker, 'c14', order_id=111, qty=volume_to_units(2000))
 
-    assert _run(broker) == []
+    events = _run(broker)
     broker._flush_external_interventions()
 
+    # The trade is the bot's though its close was not: both fills are booked.
+    assert [(e.leg_type, e.fill_id) for e in events] == [
+        (LegType.ENTRY, None), (LegType.CLOSE, '906')]
     assert broker.store_ctx.get_order('c14').state == 'closed'
     assert {905, 906} <= broker._seen_deal_ids
     assert len(reports) == 1
@@ -2208,26 +2352,35 @@ def __test_recovered_netting_close_of_only_foreign_exposure_is_not_reported__(tm
                    extras={'missing_pending_since': 0.0})
     broker.store_ctx.add_ref('c3', 'order_id', '111')
 
-    _recover(broker)
+    events = _recover(broker)
 
     assert 'c3' not in _live_coids(broker)
     assert reports == []
     assert {903, 904} <= broker._judged_close_deals
+    # Only the SL's close took the bot's share: it alone is the bot's exit.
+    assert [(e.fill_id, e.fill_qty) for e in events] == [('904', pytest.approx(20.0))]
 
 
 def __test_recovered_netting_close_below_the_share_is_reported__(tmp_path):
-    broker, reports = _netting_recovered_broker(
-        tmp_path, _netting_history(foreign_closed=2000, sl_closed=1000))
+    history = _netting_history(foreign_closed=2000, sl_closed=1000)
+    sl_deal = next(deal for deal in history.deal if deal.dealId == 903)
+    sl_deal.commission = 400
+    broker, reports = _netting_recovered_broker(tmp_path, history)
     _seed_position(broker, 'c3', position_id=222, qty=20.0,
                    extras={'missing_pending_since': 0.0})
     broker.store_ctx.add_ref('c3', 'order_id', '111')
 
-    _recover(broker)
+    events = _recover(broker)
 
     assert len(reports) == 1
     context = reports[0][1]
     assert context['deal_ids'] == [903]
     assert context['booked_qty'] == pytest.approx(10.0)
+    # Each close is delivered for the part of the bot's share it took, with
+    # its commission prorated to that part.
+    assert [(e.fill_id, e.fill_qty) for e in events] == [
+        ('903', pytest.approx(10.0)), ('904', pytest.approx(10.0))]
+    assert events[0].fee == pytest.approx(2.0)
 
 
 def _shrunk_position_broker(tmp_path, *, closing_order):
@@ -2256,18 +2409,21 @@ def _retired(broker, coid='c3') -> float:
 def __test_missed_partial_close_of_an_open_position_is_judged_and_retired__(tmp_path):
     broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
 
-    _run(broker)
+    assert _run(broker) == []
     broker._flush_external_interventions()
     assert reports == [] and _retired(broker) == 0.0, "one pass is not proof"
 
-    _run(broker)
+    events = _run(broker)
     broker._flush_external_interventions()
     assert len(reports) == 1
     assert reports[0][1]['deal_ids'] == [903]
     assert reports[0][1]['booked_qty'] == pytest.approx(10.0)
     assert _retired(broker) == pytest.approx(10.0)
+    # The close is booked as the live push would book it, report or not.
+    assert [(e.leg_type, e.from_entry, e.order.side, e.fill_id, e.fill_qty)
+            for e in events] == [(LegType.CLOSE, 'long', 'sell', '903', pytest.approx(10.0))]
 
-    _run(broker)
+    assert _run(broker) == []
     broker._flush_external_interventions()
     assert len(reports) == 1
 
@@ -2277,11 +2433,93 @@ def __test_missed_venue_partial_close_retires_without_a_report__(tmp_path):
         tmp_path, closing_order=_closing_order(600, stop_out=True))
 
     _run(broker)
-    _run(broker)
+    events = _run(broker)
     broker._flush_external_interventions()
 
     assert reports == []
     assert _retired(broker) == pytest.approx(10.0)
+    assert [(e.fill_id, e.fill_qty) for e in events] == [('903', pytest.approx(10.0))]
+    assert 903 in broker._seen_deal_ids
+
+
+def __test_missed_partial_close_the_push_delivered_is_not_delivered_again__(tmp_path):
+    """The close's push was booked but its deal is judged again by the shrink pass."""
+    broker, _reports = _shrunk_position_broker(
+        tmp_path, closing_order=_closing_order(600, stop_out=True))
+    broker._seen_deal_ids.add(903)
+
+    _run(broker)
+    events = _run(broker)
+
+    assert events == []
+    assert _retired(broker) == pytest.approx(10.0)
+
+
+# === Fill recovery pending: holds the engine's external-change verdict =======
+
+def __test_fill_recovery_is_pending_while_a_gone_position_s_row_is_live__(tmp_path):
+    """From the moment the snapshot no longer lists the position until the pass
+    retires its row, the engine's flatten verdict waits for the recovery."""
+    broker, _reports = _recovered_close_broker(tmp_path, _closing_order(
+        999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT), seed=False)
+    _seed_position(broker, 'c3', position_id=222, qty=volume_to_units(2000))
+    assert broker.fill_recovery_pending({'long'}) is False, "no snapshot read yet"
+
+    broker._snapshot_open_positions = {}
+    assert broker.fill_recovery_pending({'long'}) is True
+    assert broker.fill_recovery_pending({'short'}) is False
+    broker._external_close_reported.add(222)
+    assert broker.fill_recovery_pending({'long'}) is False
+    broker._external_close_reported.discard(222)
+
+    store = broker.store_ctx
+    assert store is not None
+    store.upsert_order('c3', extras={'order_id': '111', 'position_id': 222,
+                                     'missing_pending_since': 0.0})
+    events = _recover(broker)
+    assert [e.fill_id for e in events] == ['900']
+    assert broker.fill_recovery_pending({'long'}) is False
+
+
+def __test_fill_recovery_is_pending_while_a_shrink_is_not_judged__(tmp_path):
+    broker, _reports = _shrunk_position_broker(
+        tmp_path, closing_order=_closing_order(600, stop_out=True))
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=2000)}
+    assert broker.fill_recovery_pending({'long'}) is False
+
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=1000)}
+    assert broker.fill_recovery_pending({'long'}) is True
+    _run(broker)
+    assert broker.fill_recovery_pending({'long'}) is True, "one pass is not proof"
+    _run(broker)
+    assert broker.fill_recovery_pending({'long'}) is False
+
+
+def __test_fill_recovery_is_pending_while_the_tracker_holds_a_stamp__(tmp_path):
+    broker = _ReconcileBroker(_recon())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c1', order_id=111, qty=20.0,
+                  extras={'missing_pending_since': 0.0})
+    broker._snapshot_open_positions = {}
+
+    assert broker.fill_recovery_pending({'long'}) is True
+
+
+def __test_reconcile_read_keeps_the_snapshot_s_open_positions__(tmp_path, monkeypatch):
+    broker = _ReconcileBroker(_recon())
+    _open(tmp_path, broker)
+    closed = _position(position_id=333, volume=1000)
+    closed.positionStatus = _model.ProtoOAPositionStatus.POSITION_STATUS_CLOSED
+    res = _recon(positions=[_position(position_id=222, volume=2000), closed])
+
+    async def answer(_req):
+        return res
+
+    monkeypatch.setattr(broker, '_account_request', answer)
+    asyncio.run(CTrader._reconcile(broker))
+
+    assert broker._snapshot_open_positions is not None
+    assert set(broker._snapshot_open_positions) == {222}
 
 
 def __test_late_push_of_a_close_a_shrink_pass_retired_is_not_booked_again__(tmp_path):
@@ -2809,7 +3047,7 @@ def __test_recovered_close_of_a_position_whose_bot_share_is_not_known__(tmp_path
     broker, reports = _recovered_close_broker(tmp_path, _closing_order(999), seed=False)
     broker._hedging_enabled = hedged
     deals = [_PositionDeal(deal_id=900, order_id=999, executed_ms=1_700_000_100_000,
-                           filled=2000, closed=2000)]
+                           filled=2000, closed=2000, side='sell', price=1.1, fee=0.0)]
 
     taken = asyncio.run(broker._judge_recovered_closes(222, deals, from_entry='long'))
     broker._flush_external_interventions()

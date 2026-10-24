@@ -114,12 +114,17 @@ class _StateMixin(_CTraderBase, ABC):
         # Route through ``_account_request`` so a mid-session account de-auth is
         # transparently re-authorized and the (idempotent) snapshot retried,
         # rather than raising a raw protocol error that crashes the dispatch.
-        return cast(OpenApiMessages.ProtoOAReconcileRes, await self._account_request(
+        res = cast(OpenApiMessages.ProtoOAReconcileRes, await self._account_request(
             OpenApiMessages.ProtoOAReconcileReq(
                 ctidTraderAccountId=self._live_account_id,
                 returnProtectionOrders=return_protection_orders,
             )
         ))
+        self._snapshot_open_positions = {
+            position.positionId: position for position in res.position
+            if position.positionStatus
+            == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN}
+        return res
 
     def _apply_adoption_baseline(self, res: OpenApiMessages.ProtoOAReconcileRes) -> None:
         """Silently baseline live rows' ``filled_qty`` to the adoption snapshot.

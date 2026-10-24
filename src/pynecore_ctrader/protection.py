@@ -141,7 +141,11 @@ client's or a server-initiated one — is *unattributed*: booked with an ERROR
 and an audit event, never reported. When the bot's share is known the deals
 are replayed in execution order (:func:`_replay_share_closes`) and only the
 deals that took the venue below the bot's share count; what the deals took of
-the share is what a shrunk position's journal retires. The run's own closes and
+the share is what a shrunk position's journal retires. When the reconcile pass
+finds a run-owned position gone, each deal that took part of the share reaches
+the engine as a close fill of the entry for that part, whatever its origin — the
+fill the PUSH stream would have delivered — so the engine books the exit instead
+of reading the flat venue as an unexplained flatten. The run's own closes and
 the closing deals already judged, with their origin, are journalled, so a
 restarted process judges with the evidence of the earlier ones. A lookup that
 failed for now defers the verdict to the next pass; an order the venue reports
@@ -682,12 +686,18 @@ class _PositionDeal:
     :ivar executed_ms: Execution time (venue clock, ms).
     :ivar filled: Executed volume (cents).
     :ivar closed: Part of it that closed position volume (cents).
+    :ivar side: The deal's trade side (``'buy'`` / ``'sell'``).
+    :ivar price: The deal's execution price.
+    :ivar fee: The deal's commission, in account currency.
     """
     deal_id: int
     order_id: int
     executed_ms: int
     filled: int
     closed: int
+    side: str
+    price: float
+    fee: float
 
     @property
     def opened(self) -> int:
@@ -707,10 +717,14 @@ class _ShareReplay:
         part taken.
     :ivar taken: The part of the share (cents) the judged deals of any origin
         provably took.
+    :ivar booked: ``(deal, cents)`` of every judged deal of any origin that
+        provably took part of the share, with that part, in execution order:
+        the closes of the bot's position the deals stand for.
     """
     reported: list[tuple[_PositionDeal, int]] = field(default_factory=list)
     ambiguous: list[tuple[_PositionDeal, int, int]] = field(default_factory=list)
     taken: int = 0
+    booked: list[tuple[_PositionDeal, int]] = field(default_factory=list)
 
 
 def _replay_share_closes(
@@ -768,6 +782,8 @@ def _replay_share_closes(
                 share -= taken
                 if deal.deal_id in pending:
                     replay.taken += taken
+                    if taken > 0:
+                        replay.booked.append((deal, taken))
                     if origin in _FOREIGN_ORIGINS and taken > 0:
                         replay.reported.append((deal, taken))
             if deal.opened > 0 and own_opening(deal):
@@ -798,6 +814,8 @@ def _replay_share_closes(
         taken_high += high_take
         taken_low += low_take
         replay.taken += low_take
+        if low_take > 0:
+            replay.booked.append((deal, low_take))
         if origin in _FOREIGN_ORIGINS:
             if low_take > 0:
                 replay.reported.append((deal, low_take))
@@ -3088,14 +3106,37 @@ class _ProtectionMixin(_CTraderBase, ABC):
             now: nothing was judged, and the caller must not retire the
             position this pass.
         """
+        replay = await self._judge_recovered_close_deals(
+            position_id, deals, from_entry=from_entry, venue_now=venue_now,
+            share_now=share_now, counted=counted, own_orders=own_orders)
+        return None if replay is None else volume_to_units(replay.taken)
+
+    async def _judge_recovered_close_deals(
+            self, position_id: int, deals: Sequence[_PositionDeal], *,
+            from_entry: str | None, venue_now: float = 0.0,
+            share_now: float | None = None, counted: Iterable[int] = (),
+            own_orders: Container[int] = (),
+    ) -> _ShareReplay | None:
+        """Judge closes the PUSH stream missed, keeping the verdict per deal.
+
+        Applies the policy of :meth:`_judge_recovered_closes`, which takes the
+        same parameters.
+
+        :return: The verdict: :attr:`_ShareReplay.booked` names the closes of
+            the bot's share the deals judged now stand for, and
+            :attr:`_ShareReplay.taken` their sum. Empty when nothing was left
+            to judge (the deals were judged earlier, or the position's
+            external close was reported already). ``None`` when an order
+            lookup failed for now: nothing was judged.
+        """
         if position_id in self._external_close_reported:
-            return 0.0
+            return _ShareReplay()
         self._load_close_evidence()
         deals = sorted(deals, key=lambda deal: (deal.executed_ms, deal.deal_id))
         pending = [deal for deal in deals
                    if deal.closed > 0 and deal.deal_id not in self._judged_close_deals]
         if not pending:
-            return 0.0
+            return _ShareReplay()
         origins: dict[int, CloseOrigin] = {}
         by_order: dict[int, CloseOrigin] = {}
         for deal in pending:
@@ -3112,7 +3153,8 @@ class _ProtectionMixin(_CTraderBase, ABC):
             replay = _ShareReplay(
                 reported=[(deal, deal.closed) for deal in pending
                           if origins[deal.deal_id] in _FOREIGN_ORIGINS],
-                taken=sum(deal.closed for deal in pending))
+                taken=sum(deal.closed for deal in pending),
+                booked=[(deal, deal.closed) for deal in pending])
         else:
             replay = _replay_share_closes(
                 deals, pending=origins, judged=self._judged_close_origins,
@@ -3168,7 +3210,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 if owner is not None:
                     owner.count_executed(deal.deal_id, volume_to_units(deal.closed))
         self._mark_close_judged([deal.deal_id for deal in pending], origins)
-        return volume_to_units(replay.taken)
+        return replay
 
     def _note_unattributed_close(
             self, position_id: int, deals: Sequence[tuple[_PositionDeal, int]], *,
