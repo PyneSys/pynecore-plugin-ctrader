@@ -2023,7 +2023,9 @@ def __test_recovered_close_lookup_failure_defers_the_retire__(tmp_path):
 
 def __test_recovered_close_rate_limited_lookup_is_retried__(tmp_path, monkeypatch):
     """A throttled lookup waits only within the pass budget, then defers."""
-    monkeypatch.setattr(ctrader_events, '_RECONCILE_PASS_BUDGET_S', 0.05)
+    # Short, yet well above the journal commits the pass makes before its
+    # lookup: a commit is a real fsync on Linux (~15 ms each).
+    monkeypatch.setattr(ctrader_events, '_RECONCILE_PASS_BUDGET_S', 0.5)
     broker, reports = _recovered_close_broker(
         tmp_path, _closing_order(999),
         details_error=CTraderProtocolError('BLOCKED_PAYLOAD_TYPE', 'slow down'))
