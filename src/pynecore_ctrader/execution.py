@@ -184,7 +184,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             return position.positionId
         return None
 
-    def _find_working_order_id(self, symbol: str, pine_id: str) -> int | None:
+    def _find_working_order_id(self, pine_id: str) -> int | None:
         """Find the live working-order id for a Pine entry id (BrokerStore).
 
         Returns the broker ``orderId`` the entry was persisted under, or
@@ -193,7 +193,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         """
         if self.store_ctx is None:
             return None
-        for row in self.store_ctx.iter_live_orders(symbol=symbol):
+        for row in self.store_ctx.iter_live_orders():
             if row.pine_entry_id != pine_id:
                 continue
             order_id = (row.extras or {}).get('order_id')
@@ -838,7 +838,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         if self.store_ctx is None or context.from_entry is None:
             return []
         refs: list[str] = []
-        for row in self.store_ctx.iter_live_orders(symbol=context.symbol):
+        for row in self.store_ctx.iter_live_orders():
             if row.pine_entry_id != context.from_entry:
                 continue
             extras = row.extras or {}
@@ -1378,7 +1378,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         # first or it would cancel the entry order and leave the bracket live.
         if intent.from_entry is not None:
             return await self._clear_exit_bracket(intent, envelope)
-        order_id = self._find_working_order_id(intent.symbol, intent.pine_id)
+        order_id = self._find_working_order_id(intent.pine_id)
         if order_id is None:
             return True
         try:
@@ -1443,7 +1443,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         """
         intent = envelope.intent
         assert isinstance(intent, CancelIntent)
-        order_id = self._find_working_order_id(intent.symbol, intent.pine_id)
+        order_id = self._find_working_order_id(intent.pine_id)
         if order_id is None:
             return CancelDispositionOutcome.UNKNOWN
         try:
@@ -1493,7 +1493,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         """
         intent = new.intent
         assert isinstance(intent, EntryIntent)
-        order_id = self._find_working_order_id(intent.symbol, intent.pine_id)
+        order_id = self._find_working_order_id(intent.pine_id)
         if order_id is None:
             return await super().modify_entry(old, new)
         rules = await self._get_symbol_rules(intent.symbol)
