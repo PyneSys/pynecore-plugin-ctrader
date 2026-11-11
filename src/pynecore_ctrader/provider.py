@@ -32,7 +32,7 @@ from pynecore.core.syminfo import (
     SymInfo, SymInfoInterval, SymInfoScheduleVariant, SymInfoSession,
 )
 from pynecore.lib.timeframe import in_seconds
-from pynecore.types.ohlcv import OHLCV
+from pynecore.types.ohlcv import OHLCV, AskOHLC
 
 from . import auth
 from ._base import (
@@ -588,9 +588,10 @@ class _ProviderMixin(_CTraderBase, ABC):
         """Download historical OHLCV via paged ``ProtoOAGetTrendbarsReq``.
 
         When ``with_extra`` is set, the ask side is additionally reconstructed
-        from paged ``ProtoOAGetTickDataReq`` (``ASK``) and written to the
-        ``.extra.csv`` sidecar; this roughly multiplies the request count, so it
-        is opt-in.
+        from paged ``ProtoOAGetTickDataReq`` (``ASK``) and stored with each bar.
+        It is opt-in because the venue has no ask trendbars: the cost follows the
+        length of the history, about seven tick requests per trading day of
+        EURUSD, against one trendbar request per two thousand bars.
         """
         assert self.symbol is not None
         period_seconds = max(1, int(in_seconds(self.timeframe))) if self.timeframe else 60
@@ -833,22 +834,14 @@ class _ProviderMixin(_CTraderBase, ABC):
     def _attach_ask(
             candle: OHLCV, ask: tuple[float, float, float, float] | None
     ) -> OHLCV:
-        """Attach ask O/H/L/C and ``spread`` to a bid candle, if ask is known.
+        """Attach the ask O/H/L/C to a bid candle, if ask is known.
 
-        ``spread`` is ``ask_close - close`` (close is the bid close), matching the
-        live path. When no ask ticks covered the bar the candle is returned
-        unchanged (bid-only), so a download never stalls on sparse tick history.
+        When no ask ticks covered the bar the candle is returned unchanged
+        (bid-only), so a download never stalls on sparse tick history.
         """
         if ask is None:
             return candle
-        ask_open, ask_high, ask_low, ask_close = ask
-        return candle._replace(extra_fields={
-            'ask_open': ask_open,
-            'ask_high': ask_high,
-            'ask_low': ask_low,
-            'ask_close': ask_close,
-            'spread': ask_close - candle.close,
-        })
+        return candle._replace(ask=AskOHLC(*ask))
 
     async def _resolve_symbol_id(self, wire, account_id: int) -> int:
         """Resolve ``self.symbol`` to its numeric ``symbolId`` (cached)."""
@@ -1899,8 +1892,8 @@ class _ProviderMixin(_CTraderBase, ABC):
 
         The live trendbar's close lags the spot stream, so the authoritative
         close is the last spot ``bid`` of the bar; high/low are widened to keep
-        the close inside the range. Ask O/H/L/C and ``spread`` (= ask_close -
-        close) are attached from the spot ``ask`` stream when available.
+        the close inside the range. The ask O/H/L/C is attached from the spot
+        ``ask`` stream when available.
         """
         high, low, close = candle.high, candle.low, candle.close
         if self._last_bid is not None:
@@ -1910,11 +1903,4 @@ class _ProviderMixin(_CTraderBase, ABC):
         candle = candle._replace(high=high, low=low, close=close, is_closed=is_closed)
         if self._ask_bar is None:
             return candle
-        ask_open, ask_high, ask_low, ask_close = self._ask_bar
-        return candle._replace(extra_fields={
-            'ask_open': ask_open,
-            'ask_high': ask_high,
-            'ask_low': ask_low,
-            'ask_close': ask_close,
-            'spread': ask_close - close,
-        })
+        return candle._replace(ask=AskOHLC(*self._ask_bar))

@@ -501,9 +501,9 @@ def __test_reconnect_history_deduplicates_overlapping_live_snapshot_and_quotes__
     assert closed_bar.timestamp == next_ts * 1000
     assert closed_bar.is_closed is True
     assert closed_bar.close == 1.2
-    assert closed_bar.extra_fields is not None
-    assert closed_bar.extra_fields["ask_close"] == 1.21
-    assert abs(closed_bar.extra_fields["spread"] - 0.01) < 1e-12
+    assert closed_bar.ask is not None
+    assert closed_bar.ask.close == 1.21
+    assert abs(closed_bar.ask.close - closed_bar.close - 0.01) < 1e-12
     assert provider._last_live_closed_bar is closed_bar
     assert all(bar.timestamp != history_ts * 1000 for bar in provider._pending_bars)
 
@@ -562,9 +562,9 @@ def __test_live_event_normalizes_period_order_and_current_quotes__():
     assert forming_bar.timestamp == current_ts * 1000
     assert forming_bar.is_closed is False
     assert forming_bar.close == 1.2
-    assert forming_bar.extra_fields is not None
-    assert forming_bar.extra_fields["ask_close"] == 1.21
-    assert abs(forming_bar.extra_fields["spread"] - 0.01) < 1e-12
+    assert forming_bar.ask is not None
+    assert forming_bar.ask.close == 1.21
+    assert abs(forming_bar.ask.close - forming_bar.close - 0.01) < 1e-12
     assert provider._current_bar_ts == current_ts * 1000
 
 

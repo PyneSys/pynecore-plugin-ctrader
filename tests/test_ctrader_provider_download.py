@@ -165,8 +165,8 @@ def __test_capped_page_does_not_bucket_foreign_ticks_into_its_last_bar__():
 
     second = provider.saved[1]  # type: ignore[attr-defined]
     assert second.timestamp == base_ms + 60_000
-    assert second.extra_fields is not None
-    assert second.extra_fields['ask_high'] == 1.142
+    assert second.ask is not None
+    assert second.ask.high == 1.142
 
 
 def __test_oldest_first_cap_below_the_first_opening_is_not_called_covered__():
@@ -196,8 +196,8 @@ def __test_oldest_first_cap_below_the_first_opening_is_not_called_covered__():
 
     second = provider.saved[1]  # type: ignore[attr-defined]
     assert second.timestamp == base_ms + 60_000
-    assert second.extra_fields is not None
-    assert second.extra_fields['ask_high'] == 1.142
+    assert second.ask is not None
+    assert second.ask.high == 1.142
 
 
 def __test_monthly_ask_ticks_bucket_into_the_venue_bars__():
@@ -217,9 +217,9 @@ def __test_monthly_ask_ticks_bucket_into_the_venue_bars__():
 
     candle = provider.saved[0]  # type: ignore[attr-defined]
     assert candle.timestamp == july_ms
-    assert candle.extra_fields is not None
-    assert candle.extra_fields['ask_high'] == 1.145
-    assert candle.extra_fields['ask_low'] == 1.142
+    assert candle.ask is not None
+    assert candle.ask.high == 1.145
+    assert candle.ask.low == 1.142
 
 
 class _ThrottledHistoryWire(_HistoryWire):
