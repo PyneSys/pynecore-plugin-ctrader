@@ -27,7 +27,7 @@ from enum import Enum
 from typing import Callable, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pynecore.core.plugin import override, Broker
+from pynecore.core.plugin import override, Broker, ExtraData
 from pynecore.core.syminfo import (
     SymInfo, SymInfoInterval, SymInfoScheduleVariant, SymInfoSession,
 )
@@ -140,6 +140,14 @@ class _LiveHistoryCollection:
 
 class _ProviderMixin(_CTraderBase, ABC):
     """Provider mix-in: timeframe maps, listings, symbol info and OHLCV."""
+
+    extra_data = ExtraData(
+        label="Ask side (bid/ask)",
+        help="Rebuilds the ask side of every bar from tick history. The venue has no "
+             "ask bars, so this takes several extra requests per trading day (about "
+             "seven for EURUSD): a long history downloads much slower than the bid "
+             "bars alone.",
+    )
 
     _live_history_settle_attempts = _LIVE_HISTORY_SETTLE_ATTEMPTS
     _live_history_settle_delay_seconds = _LIVE_HISTORY_SETTLE_DELAY_SECONDS
