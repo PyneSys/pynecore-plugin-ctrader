@@ -1,8 +1,11 @@
 """
 @pyne
 
-Deterministic fault injection for the cTrader live feed: every closed bar of
-an outage window must reach the runner, in order and exactly once.
+Deterministic fault injection for the cTrader live feed: with the runner's
+history recovery driven the way PyneCore drives it (reconnect, then
+:meth:`CTrader.backfill_closed_bars` after the newest close it holds), every closed bar
+of an outage window must reach the runner, in order and exactly once, and the
+stream itself must never hand on a stale or pre-outage close.
 """
 import asyncio
 from datetime import datetime, time, timezone
@@ -63,7 +66,7 @@ class _FeedWire:
 
     ``history_faults`` are raised (and consumed) one per history request;
     ``missing`` openings are withheld from every response, which is how a
-    venue that has not yet published a slot looks.
+    venue that has not yet published a slot, or a slot without a tick, looks.
     """
 
     def __init__(self, venue: '_Venue'):
@@ -119,7 +122,6 @@ class _Venue(CTrader):
         self._symbols_by_name = {"EURUSD": 1}
         self._live_subscription = ("EURUSD", "1")
         self._watch_symbol_id = 1
-        self._live_history_settle_delay_seconds = 0
         #: Openings the venue holds in its trendbar history.
         self.book: set[int] = set()
         self.missing: set[int] = set()
@@ -173,10 +175,11 @@ class _Venue(CTrader):
 # === Runner-side simulation =================================================
 
 class _Runner:
-    """Mimics the core live loop's consumption of the provider stream.
+    """Mimics the core live loop's closed-bar cursor.
 
-    ``dropped`` collects the closed bars the core monotonicity guard had to
-    throw away — a non-empty list means the PLUGIN re-served settled history.
+    History bars and socket closes pass through the same cursor; a close at or
+    behind it is dropped (``dropped``), which is how the core settles a slot
+    that both the history and the socket delivered.
     """
 
     def __init__(self):
@@ -202,14 +205,18 @@ def _spot(*openings: int) -> _oa.ProtoOASpotEvent:
     )
 
 
-async def _take(provider: _Venue, runner: _Runner, count: int) -> None:
+async def _take(provider: _Venue, runner: _Runner, count: int) -> list[OHLCV]:
     """Consume exactly ``count`` updates already queued on the provider."""
+    updates = []
     for _ in range(count):
-        runner.feed(await provider.watch_ohlcv("EURUSD", "1"))
+        update = await provider.watch_ohlcv("EURUSD", "1")
+        updates.append(update)
+        runner.feed(update)
+    return updates
 
 
 async def _push(provider: _Venue, runner: _Runner, opening: int,
-                *, expect: int) -> None:
+                *, expect: int) -> list[OHLCV]:
     """Deliver one spot event and consume the ``expect`` updates it yields.
 
     A rollover yields two: the close of the previous bar and the opening
@@ -218,16 +225,25 @@ async def _push(provider: _Venue, runner: _Runner, opening: int,
     """
     assert provider._spot_events is not None
     provider._spot_events.put_nowait(_spot(opening))
-    await _take(provider, runner, expect)
+    updates = await _take(provider, runner, expect)
+    assert not provider._pending_bars
+    return updates
+
+
+async def _fill(provider: _Venue, runner: _Runner) -> None:
+    """The core's gap fill: the closed history bars after its newest close."""
+    assert runner.last_confirmed is not None
+    for bar in await provider.backfill_closed_bars("EURUSD", "1", runner.last_confirmed):
+        runner.feed(bar)
 
 
 async def _reconnect(provider: _Venue, runner: _Runner,
                      *, attempts: int = 8) -> int:
-    """Replay the live runner's reconnect loop verbatim.
+    """Replay the core's reconnect round.
 
-    ``disconnect`` -> ``connect`` -> ``on_reconnect``, retried on any
-    exception; the runner never reads the update stream between a failed
-    attempt and the next ``disconnect()``.
+    ``disconnect`` -> ``connect`` -> ``on_reconnect`` -> gap fill, the whole
+    round retried on any exception: a failed fill is no answer, so the stream
+    does not go on over the gap.
 
     :return: The number of attempts the reconnect took.
     """
@@ -240,9 +256,10 @@ async def _reconnect(provider: _Venue, runner: _Runner,
         try:
             await provider.connect()
             await provider.on_reconnect()
+            await _fill(provider, runner)
         except Exception:  # noqa: BLE001 - "Reconnect failed", next attempt
             continue
-        await _take(provider, runner, len(provider._pending_bars))
+        assert not provider._pending_bars
         return attempt
     raise AssertionError("reconnect never succeeded")
 
@@ -276,7 +293,7 @@ async def _start_live(provider: _Venue, runner: _Runner) -> None:
     assert runner.closed == [_bar(0)]
 
 
-# === (a) Outage bars arrive via backfill, seam stays clean ==================
+# === (a) Outage bars arrive via the gap fill, seam stays clean ===============
 
 def __test_ctrader_outage_bars_backfilled_in_order__(monkeypatch):
     """Bars that close during an outage are delivered once, in order."""
@@ -301,13 +318,13 @@ def __test_ctrader_outage_bars_backfilled_in_order__(monkeypatch):
     _run(scenario, monkeypatch)
 
 
-# === (b) Reconnect backfill re-serving pre-outage bars ======================
+# === (b) History re-serving pre-outage bars ==================================
 
 def __test_ctrader_backfill_overlap_not_re_emitted__(monkeypatch):
     """Bars the venue re-serves from before the outage never leave the plugin.
 
-    The history window is filtered at the accepted cursor inside the plugin,
-    so the core monotonicity guard never has to fire.
+    The answer is filtered at ``since_ms`` inside the plugin, so the core
+    cursor never has to drop one.
     """
 
     async def scenario(provider, runner):
@@ -320,17 +337,17 @@ def __test_ctrader_backfill_overlap_not_re_emitted__(monkeypatch):
 
         assert runner.closed == [_bar(k) for k in range(4)]
         assert runner.dropped == []
-        # Nothing at or before the accepted anchor was even requested.
         assert all(start > _bar(0) for start, _end in provider.wire.history_requests)
 
     _run(scenario, monkeypatch)
 
 
-def __test_ctrader_seam_bar_emitted_exactly_once__(monkeypatch):
-    """The bar spanning the reconnect boundary is neither lost nor doubled.
+def __test_ctrader_seam_bar_closed_once__(monkeypatch):
+    """The bar spanning the reconnect boundary reaches the strategy once.
 
-    The restored subscription replays the same opening the backfill just
-    recovered; the live path drops it against the accepted cursor.
+    The restored subscription replays the opening the gap fill just
+    recovered; the plugin, which never handed that close on, closes it from
+    the socket too, and the core cursor drops the second close of the slot.
     """
 
     async def scenario(provider, runner):
@@ -340,13 +357,11 @@ def __test_ctrader_seam_bar_emitted_exactly_once__(monkeypatch):
         await _reconnect(provider, runner)
         assert runner.closed == [_bar(k) for k in range(3)]
 
-        # Fresh subscription replays bar 2 (already backfilled) and then the
-        # forming bar 3: only the latter may produce anything.
-        await _push(provider, runner, _bar(2), expect=0)
-        await _push(provider, runner, _bar(3), expect=1)
+        await _push(provider, runner, _bar(2), expect=1)
+        await _push(provider, runner, _bar(3), expect=2)
 
         assert runner.closed == [_bar(k) for k in range(3)]
-        assert runner.dropped == []
+        assert runner.dropped == [_bar(2)]
 
     _run(scenario, monkeypatch)
 
@@ -364,51 +379,9 @@ def __test_ctrader_no_bar_lost_across_failed_reconnects__(monkeypatch):
             CTraderConnectionError("connection refused"),
             CTraderConnectionError("connection refused"),
         ]
-        # Enough faults to exhaust the in-collection settle retries, so the
-        # third reconnect attempt fails on the backfill itself.
-        provider.history_faults = [
-            CTraderTimeoutError("history read timed out")
-            for _ in range(provider._live_history_settle_attempts)
-        ]
+        provider.history_faults = [CTraderTimeoutError("history read timed out")]
 
         assert await _reconnect(provider, runner) == 4
-        assert runner.closed == [_bar(k) for k in range(5)]
-        assert runner.dropped == []
-
-    _run(scenario, monkeypatch)
-
-
-def __test_ctrader_partial_history_coverage_retries_whole_gap__(monkeypatch):
-    """A venue that has not published every gap slot yet loses nothing.
-
-    Committing the pages that did arrive would step the cursor over the
-    still-missing slot, so the incomplete collection is discarded whole and
-    the retried backfill re-reads the entire window.
-    """
-
-    async def scenario(provider, runner):
-        await _start_live(provider, runner)
-        provider.advance_to(5)
-        provider.fill_book(6)
-        provider.missing = {_bar(3)}
-
-        async def _publish_after_first_attempt() -> None:
-            provider.missing = set()
-
-        # First attempt sees a hole, the second sees the published bar.
-        original = provider._collect_live_gap_history
-        attempts: list[int] = []
-
-        async def _counting(*args, **kwargs):
-            attempts.append(1)
-            result = await original(*args, **kwargs)
-            if len(attempts) == 1:
-                await _publish_after_first_attempt()
-            return result
-
-        monkeypatch.setattr(provider, '_collect_live_gap_history', _counting)
-
-        assert await _reconnect(provider, runner) == 2
         assert runner.closed == [_bar(k) for k in range(5)]
         assert runner.dropped == []
 
@@ -421,8 +394,8 @@ def __test_ctrader_drop_at_bar_boundary_delivers_once__(monkeypatch):
     """A bar closing at the very moment of the drop arrives exactly once.
 
     Two variants of the same instant: the rollover trendbar arrives just
-    before the link dies (so the bar is delivered live and the backfill must
-    not repeat it), and it does not (so the backfill must supply it).
+    before the link dies (so the bar is delivered live and the gap fill must
+    not repeat it), and it does not (so the gap fill must supply it).
     """
 
     async def rollover_arrived(provider, runner):
@@ -453,26 +426,70 @@ def __test_ctrader_drop_at_bar_boundary_delivers_once__(monkeypatch):
     _run(rollover_lost, monkeypatch)
 
 
+# === (e) The pre-outage partial bar ==========================================
+
+def __test_ctrader_pre_outage_partial_is_never_a_close__(monkeypatch):
+    """The bar forming when the link died is not closed from its stale state.
+
+    After the reconnect the first trendbar is a later opening: without the
+    reset in ``connect()`` it would finalize the pre-outage partial bar 1 as a
+    closed bar. Bar 1 comes from the history instead.
+    """
+
+    async def scenario(provider, runner):
+        await _start_live(provider, runner)
+        provider.advance_to(3)
+        provider.fill_book(3)
+        provider.missing = {_bar(1), _bar(2)}
+        await _reconnect(provider, runner)
+        assert runner.closed == [_bar(0)]
+
+        updates = await _push(provider, runner, _bar(3), expect=1)
+
+        assert [(bar.timestamp, bar.is_closed) for bar in updates] == [(_bar(3), False)]
+
+    _run(scenario, monkeypatch)
+
+
+def __test_ctrader_replayed_close_behind_the_stream_is_dropped__(monkeypatch):
+    """A replayed snapshot of a bar the stream already closed yields nothing."""
+
+    async def scenario(provider, runner):
+        await _start_live(provider, runner)
+        provider.advance_to(2, offset_ms=40_000)
+        provider.fill_book(2)
+        await _reconnect(provider, runner)
+
+        # The fresh subscription replays bar 0, which the stream closed.
+        assert provider._spot_events is not None
+        provider._spot_events.put_nowait(_spot(_bar(0)))
+        provider._spot_events.put_nowait(_spot(_bar(2)))
+        updates = await _take(provider, runner, 1)
+
+        assert [(bar.timestamp, bar.is_closed) for bar in updates] == [(_bar(2), False)]
+        assert runner.dropped == []
+
+    _run(scenario, monkeypatch)
+
+
 # === Drop before the stream's first close ===================================
 
 def __test_ctrader_gap_after_startup_backfill_only__(monkeypatch):
-    """A drop before the first live close still backfills the gap.
+    """A drop before the first live close still fills the gap.
 
     The startup-gap query hands the runner everything up to its newest bar;
-    that — not "nothing" — is where the reconnect backfill resumes from.
+    the runner's cursor, not a plugin one, is where the reconnect fill
+    resumes from.
     """
 
     async def scenario(provider, runner):
         provider.advance_to(2)
         await provider.connect()
         provider.fill_book(2)
-        # Framework startup gap: the warmup history ended at bar 0.
-        recovered = await provider.backfill_closed_bars("EURUSD", "1", _bar(0))
-        assert [bar.timestamp for bar in recovered] == [_bar(1)]
         runner.feed(OHLCV(timestamp=_bar(0), open=1.14, high=1.14, low=1.14,
                           close=1.14, volume=1.0, is_closed=True))
-        for bar in recovered:
-            runner.feed(bar)
+        await _fill(provider, runner)
+        assert runner.closed == [_bar(0), _bar(1)]
 
         # The link dies without the stream ever delivering a bar.
         provider.advance_to(5)
@@ -486,12 +503,7 @@ def __test_ctrader_gap_after_startup_backfill_only__(monkeypatch):
 
 
 def __test_ctrader_gap_with_only_a_forming_bar_seen__(monkeypatch):
-    """A drop after only a forming bar still backfills the gap.
-
-    Nothing has closed on the stream, so there is no accepted anchor; the
-    bar seen forming is the first one that can close while offline, and
-    everything before it came from the warmup history.
-    """
+    """A drop after only a forming bar still fills the gap."""
 
     async def scenario(provider, runner):
         provider.advance_to(1)
@@ -513,17 +525,19 @@ def __test_ctrader_gap_with_only_a_forming_bar_seen__(monkeypatch):
 
 # === Sanity: no reconnect, no history reads =================================
 
-def __test_ctrader_clean_stream_never_backfills__(monkeypatch):
-    """Without a drop the subscription serves everything — no history reads."""
+def __test_ctrader_clean_stream_never_reads_history__(monkeypatch):
+    """The stream itself never reads the history, whatever it skips."""
 
     async def scenario(provider, runner):
         await _start_live(provider, runner)
         for k in (2, 3, 4):
             provider.advance_to(k + 1)
             await _push(provider, runner, _bar(k), expect=2)
+        # The socket skips bar 5: its close goes on as the venue sent it.
+        provider.advance_to(7)
+        await _push(provider, runner, _bar(6), expect=2)
 
-        assert runner.closed == [_bar(k) for k in range(4)]
-        assert runner.dropped == []
+        assert runner.closed == [_bar(k) for k in range(5)]
         assert provider.wire.history_requests == []
 
     _run(scenario, monkeypatch)

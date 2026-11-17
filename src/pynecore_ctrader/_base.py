@@ -223,16 +223,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self._current_bar: OHLCV | None = None
         self._current_bar_ts: int | None = None
         # Last closed live bar handed to PyneCore. Unlike connection-scoped
-        # accumulators this survives reconnect so the provider can query the
-        # venue for closed trendbars missed while the socket was down.
+        # accumulators this survives reconnect, so the stream never hands on a
+        # close at or behind it, whatever the fresh subscription replays.
         self._last_live_closed_bar: OHLCV | None = None
-        # Opening of the first bar a reconnect backfill must recover while no
-        # closed bar has been delivered yet — everything before it came from
-        # the warmup history / the startup-gap query. Survives reconnect for
-        # the same reason ``_last_live_closed_bar`` does; without it an outage
-        # that starts before the stream's first close has nothing to resume
-        # from and its bars are lost.
-        self._live_gap_cursor_ts: int | None = None
         # Latest spot ``bid`` of the bar in progress. The live trendbar's close
         # lags the spot stream (it is not refreshed on every tick), so the spot
         # bid is the authoritative close. Reset on each rollover.

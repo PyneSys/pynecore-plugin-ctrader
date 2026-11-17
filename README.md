@@ -98,10 +98,12 @@ translation table in the config.
   client id and secret; the end user grants account access in the browser and
   the plugin stores the refreshable access token.
 - **Market data**: historical trendbars and live spot/trendbar subscriptions.
-  After a live reconnect, the provider replays every fully closed trendbar since
-  the last delivered close from cTrader history before resuming queued live
-  updates. The still-forming current slot is excluded, and duplicate boundary
-  bars returned by inclusive history bounds are filtered locally.
+  The live stream hands on what the venue sends; closed bars it missed (at
+  startup, during an outage, or a slot the socket never closed) are recovered
+  by PyneCore through `backfill_closed_bars`, a plain history query for the
+  closed trendbars after a given bar. cTrader publishes a closed M1 trendbar in
+  its history up to about a minute after the close, and a minute without a
+  tick gets no trendbar at all; the provider declares both to PyneCore.
 - **Order model**: position-based with server-side stop-loss / take-profit /
   trailing stop as position attributes. Netting (one-way) accounts use the
   direct execution path; hedging accounts run through PyneCore's one-way
