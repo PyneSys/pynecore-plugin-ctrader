@@ -110,6 +110,12 @@ _RATE_LIMIT_BACKOFF_CAP_SECONDS = 120.0
 #: is skipped instead of stalling its loop.
 _RATE_LIMIT_HISTORY_ATTEMPTS = 12
 _RATE_LIMIT_HISTORY_BUDGET_SECONDS = 900.0
+#: The closed-bar history query of a running live stream: the stream reads nothing
+#: from the socket while it waits for the answer, and it asks again on its own
+#: schedule after a failure. A throttle is therefore ridden out for the venue's
+#: per-request pacing only; a drained quota fails the query within seconds.
+_RATE_LIMIT_LIVE_HISTORY_ATTEMPTS = 3
+_RATE_LIMIT_LIVE_HISTORY_BUDGET_SECONDS = 10.0
 
 #: Worker the blocking cross-process session-lock acquire runs on, so the
 #: event loop never blocks while another process refreshes the token pair.

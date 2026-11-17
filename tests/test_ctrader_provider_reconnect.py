@@ -510,6 +510,61 @@ def __test_backfill_raises_on_a_wire_error__(monkeypatch):
         assert _stream_state(provider) == before
 
 
+def __test_backfill_fails_fast_on_a_drained_rate_limit_quota__(monkeypatch):
+    """A venue that keeps throttling fails the live query after a few attempts
+
+    The stream does not read its socket while the query runs, so the query must not
+    sit out a drained quota like a blocking history download does.
+    """
+    since_ts = 1_800_000_000
+    throttle = [
+        CTraderProtocolError("BLOCKED_PAYLOAD_TYPE", "You are being rate limited")
+        for _ in range(20)
+    ]
+    wire = _HistoryWire([_trendbar(since_ts + 60, 114_010)], history_faults=throttle)
+    provider = _provider(wire)
+    _freeze(monkeypatch, datetime.fromtimestamp(since_ts + 122, timezone.utc))
+
+    raised = _expect_raise(provider, since_ts * 1000, CTraderProtocolError)
+
+    assert isinstance(raised, CTraderProtocolError)
+    assert raised.error_code == "BLOCKED_PAYLOAD_TYPE"
+    assert len(_history_requests(wire)) == 3
+
+
+def __test_backfill_does_not_wait_for_a_long_retry_after__(monkeypatch):
+    """A retry hint longer than the live query's wait budget raises at once"""
+    since_ts = 1_800_000_000
+    wire = _HistoryWire(
+        [_trendbar(since_ts + 60, 114_010)],
+        history_faults=[CTraderProtocolError(
+            "BLOCKED_PAYLOAD_TYPE", "You are being rate limited", retry_after=60.0)],
+    )
+    provider = _provider(wire)
+    _freeze(monkeypatch, datetime.fromtimestamp(since_ts + 122, timezone.utc))
+
+    _expect_raise(provider, since_ts * 1000, CTraderProtocolError)
+
+    assert len(_history_requests(wire)) == 1
+
+
+def __test_backfill_rides_out_one_throttled_request__(monkeypatch):
+    """A single throttled request is retried on the same session"""
+    since_ts = 1_800_000_000
+    wire = _HistoryWire(
+        [_trendbar(since_ts + 60, 114_010)],
+        history_faults=[CTraderProtocolError(
+            "BLOCKED_PAYLOAD_TYPE", "You are being rate limited", retry_after=1.0)],
+    )
+    provider = _provider(wire)
+    _freeze(monkeypatch, datetime.fromtimestamp(since_ts + 122, timezone.utc))
+
+    bars = _backfill(provider, since_ts * 1000)
+
+    assert [bar.timestamp for bar in bars] == [(since_ts + 60) * 1000]
+    assert len(_history_requests(wire)) == 2
+
+
 def __test_backfill_raises_on_an_incomplete_answer__(monkeypatch):
     """A capped page whose rest cannot be read raises instead of a partial list."""
     since_ts = 1_800_000_000

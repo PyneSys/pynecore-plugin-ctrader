@@ -37,6 +37,8 @@ from ._base import (
     _CTraderBase,
     _RATE_LIMIT_HISTORY_ATTEMPTS,
     _RATE_LIMIT_HISTORY_BUDGET_SECONDS,
+    _RATE_LIMIT_LIVE_HISTORY_ATTEMPTS,
+    _RATE_LIMIT_LIVE_HISTORY_BUDGET_SECONDS,
 )
 from .config import CTraderConfig
 from .helpers import VOLUME_SCALE
@@ -642,7 +644,9 @@ class _ProviderMixin(_CTraderBase, ABC):
 
     async def _fetch_trendbar_window(
             self, wire, account_id: int, symbol_id: int, period: str,
-            from_ms: int, to_ms: int,
+            from_ms: int, to_ms: int, *,
+            rate_limit_attempts: int = _RATE_LIMIT_HISTORY_ATTEMPTS,
+            rate_limit_budget: float = _RATE_LIMIT_HISTORY_BUDGET_SECONDS,
     ) -> tuple[dict[int, ProtoOATrendbar], bool]:
         """Read the trendbars the venue holds in ``[from_ms, to_ms]``.
 
@@ -657,6 +661,10 @@ class _ProviderMixin(_CTraderBase, ABC):
 
         :param from_ms: Window start in epoch milliseconds.
         :param to_ms: Window end in epoch milliseconds.
+        :param rate_limit_attempts: Bound on the attempts of one throttled request.
+            The default sits out a drained rolling quota, as a blocking history
+            download has to.
+        :param rate_limit_budget: Bound on the seconds one throttled request waits.
         :return: The trendbars keyed by their opening (epoch milliseconds), and
             whether they are known to cover the whole window.
         """
@@ -676,8 +684,8 @@ class _ProviderMixin(_CTraderBase, ABC):
                 await self._retry_rate_limited(
                     lambda: wire.send_request(request),
                     context="trendbar history read",
-                    attempts=_RATE_LIMIT_HISTORY_ATTEMPTS,
-                    budget_seconds=_RATE_LIMIT_HISTORY_BUDGET_SECONDS,
+                    attempts=rate_limit_attempts,
+                    budget_seconds=rate_limit_budget,
                 ),
             )
             oldest = upper
@@ -954,6 +962,10 @@ class _ProviderMixin(_CTraderBase, ABC):
         absent. The framework owns the publication lag
         (:attr:`~_ProviderMixin.history_publish_lag`) and the hole decision.
 
+        A request the venue throttles is retried for a few seconds only: the
+        stream reads nothing from the socket while this query runs, so a drained
+        quota raises and the framework asks again later.
+
         The bar the venue serves for an inclusive lower bound, the still-forming
         bar and duplicate openings are left out. A fixed-length period is closed
         once its full length has passed since its opening, whatever grid phase
@@ -986,6 +998,8 @@ class _ProviderMixin(_CTraderBase, ABC):
             window_end = min(window_start + window_ms, now_ms)
             window_bars, covered = await self._fetch_trendbar_window(
                 wire, account_id, symbol_id, exchange_period, window_start, window_end,
+                rate_limit_attempts=_RATE_LIMIT_LIVE_HISTORY_ATTEMPTS,
+                rate_limit_budget=_RATE_LIMIT_LIVE_HISTORY_BUDGET_SECONDS,
             )
             if not covered:
                 raise CTraderWireError(
