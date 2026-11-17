@@ -115,8 +115,9 @@ class _ProviderMixin(_CTraderBase, ABC):
     )
 
     # Measured live: Pepperstone BTCUSD M1 served a just-closed trendbar in the
-    # history 50-73 s after its close.
-    history_publish_lag = 90.0
+    # history 50-73 s after its close. Kept under 90 s: a one-minute bar handed
+    # on later than that after its close is a catch-up bar, which does not trade.
+    history_publish_lag = 85.0
     # Measured live: a session-open minute without a tick (Pepperstone BTCUSD,
     # Saturday) never gets a trendbar in the history.
     history_has_idle_bars = False

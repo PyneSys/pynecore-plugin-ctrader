@@ -398,7 +398,7 @@ def _expect_raise(provider: _TestCTrader, since_ms: int, error: type[Exception])
 def __test_provider_declares_its_history__():
     """The framework owns the recovery, waiting out the measured publication lag."""
     assert CTrader.history_has_idle_bars is False
-    assert CTrader.history_publish_lag == 90.0
+    assert CTrader.history_publish_lag == 85.0
 
 
 # --- backfill_closed_bars: a pure history query ---------------------------------
