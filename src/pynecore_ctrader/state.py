@@ -13,7 +13,8 @@ NETTING accounts hold at most one open position per symbol, so
 """
 import logging
 from abc import ABC
-from typing import cast
+from time import time as epoch_time
+from typing import TYPE_CHECKING, cast
 
 from pynecore.core.broker.emulator import aggregate_positions
 from pynecore.core.broker.exceptions import ExchangeConnectionError
@@ -26,6 +27,7 @@ from pynecore.core.broker.models import (
     OrderType,
     PositionLeg,
 )
+from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_WORKING
 from pynecore.types.strategy import (
     ADOPTED_STARTUP_EXTRA_KEY,
     JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY,
@@ -37,7 +39,19 @@ from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .protection import _accepted_by_resume
 
+if TYPE_CHECKING:
+    from pynecore.core.broker.storage import OrderRow
+
 logger = logging.getLogger(__name__)
+
+#: Audit event: a position grew between the startup recovery's snapshot and
+#: the one the engine adopted; its ``recovered_own_leg`` row was raised to it.
+_OWN_LEG_GROWN_EVENT = 'ctrader_own_leg_grown'
+#: Audit event: such a growth could not be attributed to the row, which kept
+#: its size.
+_OWN_LEG_GROWTH_UNATTRIBUTED_EVENT = 'ctrader_own_leg_growth_unattributed'
+#: ``extras['kind']`` of the entry rows that can hold exposure in a position.
+_ENTRY_KINDS = frozenset({ENTRY_KIND_POSITION, ENTRY_KIND_WORKING})
 
 #: ``ProtoOAOrderType`` -> PyneCore order type. Only the order kinds the broker
 #: layer places are mapped; anything else (STOP_LOSS_TAKE_PROFIT protection
@@ -163,18 +177,27 @@ class _StateMixin(_CTraderBase, ABC):
         M3 startup-recovery (2.2) milestone's, where the diff core runs at
         ``connect`` under a single shared snapshot.
 
-        The same snapshot baselines the retired exposure of shrunk positions
+        The same snapshot raises a startup-adopted own leg to a position that
+        grew since the startup recovery (:meth:`_grow_recovered_own_legs`),
+        baselines the retired exposure of shrunk positions
         (:meth:`_retire_shrunk_position_exposure`) and, after an operator
-        resume, the bare-protection marks (``_rebaseline_bare_marks``).
+        resume, the bare-protection marks (``_rebaseline_bare_marks``). It also
+        records how far each open position's deals are in the adopted size
+        (:attr:`~_CTraderBase._adoption_position_ts`): the position's last
+        venue change, or the local time of the read when the venue sent none.
         """
         if self.store_ctx is None or self._adoption_baselined:
             return
         self._adoption_baselined = True
         executed_by_order_id = {o.orderId: o.executedVolume for o in res.order}
-        open_position_ids = {
-            p.positionId for p in res.position
+        open_positions = [
+            p for p in res.position
             if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
-        }
+        ]
+        open_position_ids = {p.positionId for p in open_positions}
+        read_ms = int(epoch_time() * 1000)
+        self._adoption_position_ts = {
+            p.positionId: p.utcLastUpdateTimestamp or read_ms for p in open_positions}
         for row in list(self.store_ctx.iter_live_orders()):
             extras = row.extras or {}
             order_id_raw = extras.get('order_id')
@@ -217,8 +240,105 @@ class _StateMixin(_CTraderBase, ABC):
             cumulative = min(row.qty, max(row.filled_qty, baseline))
             if cumulative > row.filled_qty + 1e-9:
                 self.store_ctx.set_filled(row.client_order_id, cumulative)
+        self._grow_recovered_own_legs(res)
         self._retire_shrunk_position_exposure(res)
         self._rebaseline_bare_marks(res)
+
+    def _grow_recovered_own_legs(self, res: OpenApiMessages.ProtoOAReconcileRes) -> None:
+        """Raise a startup-adopted own leg to the size the engine adopts.
+
+        The startup recovery journals an untracked open position of the bot's
+        as a ``recovered_own_leg`` row sized from ITS snapshot
+        (``_RecoveryMixin._adopt_own_leg``). The engine adopts the position
+        from a later one, this snapshot, so a deal that grew the position in
+        between (an earlier process's send whose order neither venue view
+        listed yet) is in the engine's book but in no row's exposure. The row
+        is raised to the position's adopted size, so the journal holds what
+        the engine adopted, and an inherited send that later takes the leg
+        over (``_RecoveryMixin._take_over_adopted_leg``) finds every adopted
+        deal of its order in it.
+
+        Conservative by construction, like
+        :meth:`_retire_shrunk_position_exposure`: the row is raised only while
+        it is the position's sole owner, on the position's side, and no other
+        entry row of the run can hold exposure on the symbol (one linked to
+        the position, or one carrying an order, a position link or a fill).
+        With any such row the venue snapshot cannot tell which row the growth
+        belongs to: the row keeps its size, and the growth is reported as
+        unattributed. A takeover then finds the leg short of the order's
+        adopted deals and holds the inherited dispatch instead. Never lowers
+        a row: a shrink is :meth:`_retire_shrunk_position_exposure`'s.
+        """
+        store = self.store_ctx
+        if store is None:
+            return
+        open_by_id = {
+            p.positionId: p for p in res.position
+            if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+        }
+        live = list(store.iter_live_orders())
+        for donor in live:
+            donor_extras = donor.extras or {}
+            if not donor_extras.get('recovered_own_leg'):
+                continue
+            position_id = parse_protocol_id(donor_extras.get('position_id'), field='position_id')
+            position = open_by_id.get(position_id)
+            if position is None:
+                continue
+            grown = volume_to_units(position.tradeData.volume) - self._row_exposure(donor)
+            if grown <= 1e-9:
+                continue
+            side = ('buy' if position.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
+                    else 'sell')
+            sharer = next((row.client_order_id for row in live
+                           if row.client_order_id != donor.client_order_id
+                           and self._may_share_own_leg(row, donor, position_id)), None)
+            if side != donor.side or sharer is not None:
+                reason = 'side_changed' if side != donor.side else f'shared_with:{sharer}'
+                logger.warning(
+                    "cTrader startup: position %d grew by %s units after the startup recovery "
+                    "adopted it as row %s, and the growth cannot be attributed (%s); the row "
+                    "keeps its size", position_id, grown, donor.client_order_id, reason)
+                store.log_event(
+                    _OWN_LEG_GROWTH_UNATTRIBUTED_EVENT, client_order_id=donor.client_order_id,
+                    exchange_order_id=str(position_id),
+                    payload={'position_id': position_id, 'grown': grown, 'reason': reason})
+                continue
+            store.upsert_order(donor.client_order_id, qty=donor.qty + grown,
+                               filled_qty=donor.filled_qty + grown)
+            logger.warning(
+                "cTrader startup: position %d grew by %s units after the startup recovery "
+                "adopted it as row %s; the row holds the adopted size", position_id, grown,
+                donor.client_order_id)
+            store.log_event(
+                _OWN_LEG_GROWN_EVENT, client_order_id=donor.client_order_id,
+                exchange_order_id=str(position_id),
+                payload={'position_id': position_id, 'grown': grown})
+
+    @staticmethod
+    def _may_share_own_leg(row: 'OrderRow', donor: 'OrderRow', position_id: int) -> bool:
+        """Whether an entry row may hold part of an own leg's position.
+
+        A row linked to the position may, and so may any row on the leg's
+        symbol that carries an order, a position link or a fill. A bare
+        pending dispatch (none of them) holds nothing yet.
+
+        :param row: A live row of the run other than ``donor``.
+        :param donor: The ``recovered_own_leg`` row.
+        :param position_id: The leg's position id.
+        :return: Whether the row may share the position.
+        """
+        extras = row.extras or {}
+        if extras.get('kind') not in _ENTRY_KINDS:
+            return False
+        linked_raw = extras.get('position_id')
+        if ((linked_raw is not None
+             and parse_protocol_id(linked_raw, field='position_id') == position_id)
+                or row.exchange_order_id == str(position_id)):
+            return True
+        return row.symbol == donor.symbol and bool(
+            extras.get('order_id') is not None or linked_raw is not None
+            or row.exchange_order_id or row.filled_qty > 0.0)
 
     def _retire_shrunk_position_exposure(
             self, res: OpenApiMessages.ProtoOAReconcileRes,

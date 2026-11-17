@@ -38,7 +38,12 @@ Resolution rules:
   (``recovered_abandoned_unknown``) only when the elapsed time passed a
   minutes-scale TTL AND the order-history read was complete (paginated to
   exhaustion, no transport error) and carried no match. A truncated / failed
-  read is non-evidence → the row stays pending for the next reconcile re-entry.
+  read is non-evidence → the row stays pending. A running bot applies the same
+  rule to a dispatch parked with an unknown disposition and to every row this
+  pass left pending (:meth:`_RecoveryMixin._resolve_parked_dispatches`); the
+  engine holds the entry such a row belongs to until it is resolved, because
+  cTrader would execute a second send under the same ``clientOrderId`` as a
+  second order.
 * **``confirmed`` ≠ live exposure.** A filled-then-closed row lands ``confirmed``
   but is retired (``close_row``) — the engine's own startup adoption owns the
   position size; recovery never re-opens a closed position.
@@ -58,9 +63,15 @@ from typing import cast
 
 from pynecore.core.broker.exceptions import BrokerError
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
-from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, find_pending_dispatch
+from pynecore.core.broker.parked_dispatch import ParkedOutcome, ParkedVerdict
+from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
+    PENDING_DISPATCH_STATES,
+    find_pending_dispatch,
+)
 from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
 
+from ._base import _UNKNOWN_DISPATCH_TTL_S
 from .helpers import REQUEST_TIMEOUT, parse_protocol_id, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
@@ -70,18 +81,20 @@ from .wire import CTraderWireError
 
 logger = logging.getLogger(__name__)
 
-#: Minutes-scale liveness escape for a ``still_unknown`` pending row. A crash
-#: after the persist-first row write but before the wire send leaves a row the
-#: broker never saw; without a TTL it would block the strategy forever. The TTL
-#: must exceed the worst-case send-latency + broker-processing + history-indexing
-#: lag + reconnect-jitter + clock-skew, and stay below the guaranteed history
-#: depth. Minutes, NOT the 25s ``pending_missing_grace`` (that is the everyday
-#: reconcile-noise window — a different policy).
-_ABANDON_TTL_S = 600.0
+#: Liveness escape for a ``still_unknown`` pending row at startup.
+_ABANDON_TTL_S = _UNKNOWN_DISPATCH_TTL_S
 
 #: Audit event: an open position carrying the run's label that no journal row
 #: of the run tracked was adopted as the bot's own.
 _OWN_LEG_RECOVERED_EVENT = 'ctrader_own_leg_recovered'
+#: Audit event: a dispatch the startup recovery left pending was found filled
+#: into a position startup had adopted as an untracked own leg; the dispatch
+#: row took that position over.
+_ADOPTED_LEG_TAKEN_OVER_EVENT = 'ctrader_adopted_leg_taken_over'
+#: Audit event, once per dispatch: such a dispatch's order filled into the
+#: adopted position, but the evidence does not prove which part of it the
+#: adopted row holds; the dispatch stays parked and its entry held.
+_ADOPTED_LEG_TAKEOVER_HELD_EVENT = 'ctrader_adopted_leg_takeover_held'
 #: Audit event: a working order carrying the run's label or client-order-id
 #: prefix that no journal row of the run tracked was cancelled (or could not be).
 _OWN_ORDER_DEBRIS_EVENT = 'ctrader_own_order_debris'
@@ -512,7 +525,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         extras = dict(row.extras or {})
         extras['order_id'] = str(order_id)
         extras['position_id'] = position_id or None
-        extras['submitted_at_ms'] = submitted_at_ms
+        extras['submitted_at_ms'] = self._recovered_since_anchor_ms(row, submitted_at_ms)
         if partial_terminal:
             # The order is terminal and filled less than ``row.qty``: the
             # adoption baseline must NOT raise this row to ``row.qty`` on the
@@ -540,7 +553,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
 
     def _record_recovered_refs(
             self, row, *, order_id: int, position_id: int | None,
-            submitted_at_ms: int,
+            submitted_at_ms: int, before_adoption: bool = True,
     ) -> None:
         """Mirror the broker refs onto a still-pending coid-matched row.
 
@@ -569,7 +582,8 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         seeded into the shared de-dup — defeating the very "kept ``filled_qty``
         unadvanced so the PUSH stream applies that fill exactly once" guarantee
         above. The runtime reconcile re-entry owns the advance once the deal
-        history reads conclusively.
+        history reads conclusively. A running bot has its adoption baseline
+        behind it (``before_adoption=False``), so its rows get no marker.
         """
         if self.store_ctx is None:
             return
@@ -577,8 +591,9 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         extras = dict(row.extras or {})
         extras['order_id'] = str(order_id)
         extras['position_id'] = position_id or None
-        extras['submitted_at_ms'] = submitted_at_ms
-        extras['recovered_inconclusive'] = True
+        extras['submitted_at_ms'] = self._recovered_since_anchor_ms(row, submitted_at_ms)
+        if before_adoption:
+            extras['recovered_inconclusive'] = True
         self.store_ctx.upsert_order(coid, extras=extras)
         self.store_ctx.add_ref(coid, 'order_id', str(order_id))
         if position_id:
@@ -603,6 +618,248 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         )
         self._clear_intent_anchor(row)
 
+    async def _resolve_parked_dispatches(self) -> None:
+        """Resolve the dispatches parked with an unknown disposition in-run.
+
+        An order send that timed out or lost its connection after the send
+        leaves its persist-first row in ``disposition_unknown`` and the
+        engine's dispatch parked. A row the startup recovery could not
+        resolve is in the same position, in any pending state: an earlier
+        process sent it, and the engine holds its intent back until it is
+        resolved. The core rule
+        (:class:`~pynecore.core.broker.parked_dispatch.ParkedDispatchResolver`)
+        releases the ones the venue never accepted; this pass runs it at the
+        reconcile cadence and answers its question from the two sources the
+        startup recovery reads, by the ``clientOrderId`` echo:
+
+        * a row that already carries its ``order_id`` — landed.
+        * the order is in the live ``order[]`` snapshot, or the order history
+          has it working, filled or partly filled — landed. Its broker refs
+          are recorded on the row, so the reconcile snapshot takes it over
+          and recovers a fill the PUSH stream missed.
+        * the order history has it rejected, cancelled or expired with
+          nothing executed — the venue refused it.
+        * a complete order-history read without the coid — absent.
+        * a failed or truncated read — inconclusive.
+
+        The live snapshot is read once per pass, and only when a parked row
+        is due for a lookup. Never raises for a venue failure.
+        """
+        store = self.store_ctx
+        if store is None or self._wire is None or self._live_account_id is None:
+            return
+        live_orders: dict[str, OpenApiModelMessages.ProtoOAOrder] | None = None
+
+        async def lookup(row) -> ParkedVerdict:
+            nonlocal live_orders
+            if (row.extras or {}).get('order_id') is not None:
+                return ParkedVerdict(ParkedOutcome.LANDED)
+            coid = row.client_order_id
+            try:
+                async with asyncio.timeout_at(self._reconcile_pass_deadline):
+                    if live_orders is None:
+                        res = await self._reconcile()
+                        live_orders = {o.clientOrderId: o for o in res.order if o.clientOrderId}
+                    order = live_orders.get(coid)
+                    if order is None:
+                        found = await self._find_order_by_coid(
+                            coid, self._recovery_lower_bound_ms(row))
+                        if found.order is None:
+                            return ParkedVerdict(ParkedOutcome.ABSENT if found.conclusive
+                                                 else ParkedOutcome.INCONCLUSIVE)
+                        order = found.order
+            except Exception as exc:  # noqa: BLE001 - read failure is inconclusive evidence
+                logger.warning(
+                    "cTrader parked dispatch lookup for coid %s failed: %s", coid, exc)
+                return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+            status = OpenApiModelMessages.ProtoOAOrderStatus.Name(order.orderStatus)
+            if order.orderStatus in _TERMINAL_ORDER_STATUSES and not order.executedVolume:
+                return ParkedVerdict(
+                    ParkedOutcome.REFUSED, order_id=str(order.orderId), status=status)
+            # Only an earlier process's send can have filled before the
+            # adoption; a send of this process went out after it.
+            assert store is not None
+            adopted = (self._adopted_leg_of(order.positionId)
+                       if store.is_inherited_dispatch(coid) else None)
+            if adopted is not None:
+                taken = await self._take_over_adopted_leg(row, order, adopted)
+                if taken is False:
+                    return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
+                if taken:
+                    return ParkedVerdict(
+                        ParkedOutcome.LANDED, order_id=str(order.orderId), status=status)
+            self._record_recovered_refs(
+                row, order_id=order.orderId, position_id=order.positionId or None,
+                submitted_at_ms=order.utcLastUpdateTimestamp or int(epoch_time() * 1000),
+                before_adoption=False,
+            )
+            return ParkedVerdict(ParkedOutcome.LANDED, order_id=str(order.orderId), status=status)
+
+        await self._parked_resolver.resolve(self.store_ctx, lookup)
+
+    def _adopted_leg_of(self, position_id: int):
+        """The live row startup adopted for an untracked position of the run, if any.
+
+        :param position_id: A venue position id; ``0`` names none.
+        :return: The ``recovered_own_leg`` row tracking that position, or ``None``.
+        """
+        if self.store_ctx is None or not position_id:
+            return None
+        for other in self.store_ctx.iter_live_orders():
+            extras = other.extras or {}
+            if (extras.get('recovered_own_leg')
+                    and str(extras.get('position_id')) == str(position_id)):
+                return other
+        return None
+
+    async def _take_over_adopted_leg(self, row, order, adopted) -> bool | None:
+        """Hand the part of an adopted own leg an inherited send filled to that send's row.
+
+        The send of ``row`` (an earlier process's) landed and filled before
+        the restart, but neither venue view listed the order at startup, so
+        the open position, which carries the run's label, was adopted as an
+        own leg of its own (:meth:`_adopt_own_leg`) and the engine's startup
+        adoption booked it. Recording the refs and letting the reconcile
+        snapshot recover the fill would book the same volume a second time
+        and leave two rows owning one position. Instead the row is confirmed
+        from the order's own deals, as the startup recovery would have
+        confirmed it (no fill event, those deals seeded into the de-dup), and
+        the adopted leg gives up exactly that volume: it is closed when
+        nothing of it is left. One position, one owner, booked once.
+
+        Only the order's deals the adoption booked are taken over: those
+        executed no later than the position's last change in the adoption
+        snapshot (:attr:`~_CTraderBase._adoption_position_ts`). The row's
+        cursor stands at their volume, so the reconcile snapshot recovers and
+        books every later deal of the order as a fill.
+
+        The transfer moves exposure between two rows and never creates or
+        retires any, so it runs only when the evidence proves the adopted leg
+        holds the order's adopted deals: the leg is on the order's side and
+        holds at least their volume. Otherwise (part of the fill was closed
+        before the restart, or the position grew by a volume the adoption
+        could not attribute to the leg, see
+        ``_StateMixin._grow_recovered_own_legs``) which deals the leg covers
+        is not known, and the dispatch is held: it stays parked, the engine
+        holds its entry, and a WARNING with an audit event says why, once.
+
+        The deal history is read before the store is touched; both rows are
+        then read again and the donor's reduction, the row's confirmation and
+        the audit event commit in one transaction. The de-dup is seeded only
+        after that commit, so a failed transfer suppresses no fill and is
+        repeated whole by a later lookup.
+
+        :param row: The inherited dispatch row the venue order belongs to.
+        :param order: The venue order, filled at least in part.
+        :param adopted: The ``recovered_own_leg`` row of the order's position.
+        :return: ``True`` when the row took its part over. ``None`` when no
+            deal of the order is in the adopted size: nothing is changed and
+            the order is recovered like any other. ``False`` when the startup
+            adoption has not run yet, the order's deal history could not be
+            read completely, a row changed while it was read, the transfer is
+            held, or the store write failed: nothing is changed and the lookup
+            is repeated later.
+        """
+        store = self.store_ctx
+        assert store is not None
+        if not self._adoption_baselined:
+            return False
+        adopted_through_ms = self._adoption_position_ts.get(order.positionId)
+        if adopted_through_ms is None:
+            return None
+        bridge = await self._find_fill_deal(
+            order.orderId, self._recovery_lower_bound_ms(row),
+            deadline=self._reconcile_pass_deadline)
+        if not bridge.conclusive or not bridge.filled_cents:
+            return False
+        booked = [fill for fill in bridge.fills if fill[0] <= adopted_through_ms]
+        booked_cents = sum(fill[2] for fill in booked)
+        if not booked_cents:
+            return None
+        booked_price = sum(fill[3] * fill[2] for fill in booked) / booked_cents
+        filled = 0.0
+        held: str | None = None
+        try:
+            with store.transaction():
+                current = store.get_order(row.client_order_id)
+                donor = store.get_order(adopted.client_order_id)
+                if (current is None or current.closed_ts_ms is not None
+                        or current.state not in PENDING_DISPATCH_STATES
+                        or current.exchange_order_id
+                        or donor is None or donor.closed_ts_ms is not None
+                        or not (donor.extras or {}).get('recovered_own_leg')):
+                    return False
+                filled = min(current.qty, volume_to_units(booked_cents))
+                donor_exposure = self._row_exposure(donor)
+                if current.side != donor.side:
+                    held = f"the adopted row is a {donor.side} leg, the order a {current.side}"
+                elif filled - donor_exposure > 1e-9:
+                    held = (f"the adopted row holds {donor_exposure} units, less than the "
+                            f"{filled} the order filled before the adoption")
+                if held is None:
+                    if donor_exposure - filled > 1e-9:
+                        store.upsert_order(
+                            donor.client_order_id, qty=donor.filled_qty - filled,
+                            filled_qty=donor.filled_qty - filled)
+                    else:
+                        store.close_order(donor.client_order_id)
+                    self._confirm_recovered_entry(
+                        current, order_id=order.orderId, position_id=order.positionId,
+                        filled=filled, avg_price=booked_price,
+                        submitted_at_ms=order.utcLastUpdateTimestamp or int(epoch_time() * 1000),
+                        source='adopted_leg',
+                    )
+                    store.log_event(
+                        _ADOPTED_LEG_TAKEN_OVER_EVENT, client_order_id=current.client_order_id,
+                        exchange_order_id=str(order.orderId), intent_key=current.intent_key,
+                        payload={'position_id': order.positionId,
+                                 'adopted_coid': donor.client_order_id,
+                                 'qty': filled,
+                                 'adopted_remaining': max(0.0, donor_exposure - filled),
+                                 'adopted_through_ms': adopted_through_ms})
+        except Exception as exc:  # noqa: BLE001 - a rolled-back transfer is retried whole
+            logger.error(
+                "cTrader dispatch %s: taking over adopted row %s failed, nothing changed: %s",
+                row.client_order_id, adopted.client_order_id, exc)
+            return False
+        if held is not None:
+            self._note_takeover_held(row, order, adopted, held)
+            return False
+        self._seen_deal_ids.update(fill[1] for fill in booked)
+        logger.warning(
+            "cTrader dispatch %s: its order %d filled %s units before the restart into "
+            "position %d, which startup adopted as row %s; the dispatch takes them over",
+            row.client_order_id, order.orderId, filled, order.positionId,
+            adopted.client_order_id)
+        return True
+
+    def _note_takeover_held(self, row, order, adopted, reason: str) -> None:
+        """Report, once per dispatch, an adopted-leg takeover the evidence does not prove.
+
+        :param row: The inherited dispatch row, which stays parked.
+        :param order: Its venue order.
+        :param adopted: The ``recovered_own_leg`` row of the order's position.
+        :param reason: Why the transfer is not proven.
+        """
+        store = self.store_ctx
+        assert store is not None
+        coid = row.client_order_id
+        if any(event_coid == coid for _intent, event_coid, _xoid, _payload
+               in store.iter_events_by_kind_for_run_id(_ADOPTED_LEG_TAKEOVER_HELD_EVENT)):
+            return
+        logger.warning(
+            "cTrader dispatch %s (intent %s): its order %d filled into position %d before the "
+            "adoption, which startup adopted as row %s, but %s; which deals that row covers "
+            "is not proven, so the dispatch stays parked and its entry is held. Check the "
+            "position on the venue",
+            coid, row.intent_key, order.orderId, order.positionId, adopted.client_order_id,
+            reason)
+        store.log_event(
+            _ADOPTED_LEG_TAKEOVER_HELD_EVENT, client_order_id=coid,
+            exchange_order_id=str(order.orderId), intent_key=row.intent_key,
+            payload={'position_id': order.positionId, 'adopted_coid': adopted.client_order_id,
+                     'reason': reason})
+
     def _maybe_abandon_unknown(self, row) -> None:
         """Retire a still-unknown row once past the evidence-gated TTL.
 
@@ -618,7 +875,12 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             return
         age_s = epoch_time() - (row.created_ts_ms / 1000.0)
         if age_s < _ABANDON_TTL_S:
-            return  # too young — the next runtime reconcile re-entry rechecks it
+            # Too young: the row stays pending, in whatever pending state. It
+            # was left by an earlier process, so the running bot looks it up
+            # again at the reconcile cadence (:meth:`_resolve_parked_dispatches`)
+            # and the engine holds the intent back until that lookup resolves
+            # it (:func:`~pynecore.core.broker.parked_dispatch.inherited_dispatch_in_flight`).
+            return
         DispatchJournal(self.store_ctx).apply_reconcile_outcome(
             row.client_order_id,
             ReconcileOutcome(
@@ -666,17 +928,38 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             ))
         return min(candidates) - _SINCE_ANCHOR_SKEW_MS
 
+    @classmethod
+    def _recovered_since_anchor_ms(cls, row, broker_ts_ms: int) -> int:
+        """The ``submitted_at_ms`` since-anchor to record for a recovered order.
+
+        A recovered order carries only its ``utcLastUpdateTimestamp``, the time
+        of its LAST change: an order filled in several executions, or one that
+        filled and was then cancelled, changed last well after its first fill.
+        Anchored there, the deal-history window of the reconcile pass would
+        start past the earlier fills and recover only part of them. The row's
+        own dispatch start (and any anchor it already carries) precedes every
+        execution, so the earliest of them is the anchor.
+
+        :param row: The recovered persist-first row.
+        :param broker_ts_ms: The order's broker-clock timestamp.
+        :return: The anchor in ms.
+        """
+        return min(broker_ts_ms, cls._recovery_lower_bound_ms(row) + _SINCE_ANCHOR_SKEW_MS)
+
     async def _find_order_by_coid(
             self, coid: str, from_ms: int,
     ) -> '_OrderLookupResult':
         """Page the order history for the ``ProtoOAOrder`` echoing ``coid``.
 
         Walks ``[from_ms, now]`` paging on ``hasMore`` (``ProtoOAOrderListReq``
-        carries no ``maxRows``; the window is narrowed by the oldest page
-        timestamp). ``conclusive`` is ``True`` only when the whole window was
-        consumed without a transport error, so a not-found result is
-        deterministic absence — the caller never abandons a row from a truncated
-        read.
+        carries no ``maxRows``; the window is narrowed to the oldest page
+        timestamp, inclusive, so the orders sharing that timestamp that the page
+        cut off are read by the next page). ``conclusive`` is ``True`` only when
+        the whole window was consumed without a transport error, so a not-found
+        result is deterministic absence — the caller never abandons a row from a
+        truncated read. A page that announces more but cannot narrow the window
+        (empty, without timestamps, entirely at the window's upper bound, or
+        already at its lower bound) leaves the rest unread: inconclusive.
         """
         wire = self._wire
         if wire is None or self._live_account_id is None:
@@ -693,13 +976,16 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                 for order in res.order:
                     if order.clientOrderId == coid:
                         return _OrderLookupResult(order, True)
-                if not res.hasMore or not res.order:
+                if not res.hasMore:
                     break
                 oldest = min((o.utcLastUpdateTimestamp for o in res.order
                               if o.utcLastUpdateTimestamp), default=0)
-                if not oldest or oldest <= from_ms:
-                    break
-                to_ms = oldest - 1
+                if not oldest or oldest <= from_ms or oldest >= to_ms:
+                    logger.warning(
+                        "cTrader order-history recovery for coid %s cannot page past %d: "
+                        "the window stays unread", coid, to_ms)
+                    return _OrderLookupResult(None, False)
+                to_ms = oldest
         except Exception as exc:  # noqa: BLE001 - read failure is inconclusive evidence
             logger.warning(
                 "cTrader order-history recovery for coid %s failed: %s", coid, exc)

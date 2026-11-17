@@ -1719,7 +1719,12 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         ``True`` only when the whole window was consumed without a transport
         error — a failed or truncated read returns an empty, non-conclusive
         result so the caller never concludes a cancel (or a closure) from
-        missing evidence.
+        missing evidence. A truncated page narrows its sub-window to the oldest
+        deal timestamp, inclusive, so the deals sharing that timestamp that the
+        page cut off are read by the next page (a re-read deal replaces its
+        copy by ``dealId``). A page that announces more but cannot narrow the
+        sub-window (empty, without timestamps, or already at either bound of
+        it) leaves the rest unread: inconclusive, and the sub-window stays owed.
 
         The evidence is kept per order in :attr:`_deal_walks` across calls, so
         an unfinished walk resumes from its last page and a finished one reads
@@ -1785,15 +1790,17 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 ))
                 for deal in res.deal:
                     walk.ingest(deal, order_id)
-                if not res.hasMore or not res.deal:
+                if not res.hasMore:
                     walk.segments.pop(0)
                     continue
-                oldest = min((d.executionTimestamp or d.createTimestamp)
-                             for d in res.deal)
-                if oldest <= segment[0]:
-                    walk.segments.pop(0)
-                    continue
-                segment[1] = oldest - 1
+                oldest = min(((d.executionTimestamp or d.createTimestamp)
+                              for d in res.deal), default=0)
+                if not oldest or oldest <= segment[0] or oldest >= segment[1]:
+                    logger.warning(
+                        "cTrader deal-history bridge for order %d cannot page past %d: "
+                        "the window stays unread", order_id, segment[1])
+                    return _DealBridgeResult(None, 0, None, False)
+                segment[1] = oldest
         except Exception as exc:  # noqa: BLE001 - read failure is inconclusive evidence
             if deadline is not None and loop.time() >= deadline:
                 logger.debug(

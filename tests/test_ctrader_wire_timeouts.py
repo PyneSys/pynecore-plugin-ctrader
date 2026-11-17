@@ -27,7 +27,13 @@ import pytest
 from pynecore.core.plugin import is_retryable_provider_error
 
 from pynecore_ctrader import helpers
-from pynecore_ctrader.wire import CTraderConnectionError, WireClient
+from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
+from pynecore_ctrader.wire import (
+    ORDER_WRITE_REQUESTS,
+    CTraderConnectionError,
+    CTraderWireError,
+    WireClient,
+)
 
 
 class _StallingTcpServer:
@@ -152,3 +158,47 @@ def __test_disconnect_drain_is_bounded_on_a_dead_peer__(monkeypatch):
     # than hang the suite; the fix returns promptly within the drain bound.
     elapsed = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
     assert elapsed < 3.0
+
+
+# === Venue-write gate ======================================================
+
+@pytest.mark.parametrize('request_type', ORDER_WRITE_REQUESTS)
+def __test_order_write_without_the_venue_write_gate_is_refused__(request_type):
+    # A request that changes an order or a position cannot leave around the
+    # quarantine gate: the wire refuses it before anything is written.
+    wire = WireClient("127.0.0.1", 1)
+
+    async def _send():
+        await wire.send_request(request_type())
+
+    with pytest.raises(CTraderWireError, match="venue-write gate"):
+        asyncio.run(_send())
+    assert wire._pending == {}
+
+
+#: The requests of the Open API that change no order and no position.
+_NON_ORDER_REQUESTS = frozenset({
+    'ProtoOAAccountAuthReq', 'ProtoOAAccountLogoutReq', 'ProtoOAApplicationAuthReq',
+    'ProtoOAAssetClassListReq', 'ProtoOAAssetListReq', 'ProtoOACashFlowHistoryListReq',
+    'ProtoOADealListByPositionIdReq', 'ProtoOADealListReq', 'ProtoOADealOffsetListReq',
+    'ProtoOAExpectedMarginReq', 'ProtoOAGetAccountListByAccessTokenReq',
+    'ProtoOAGetCtidProfileByTokenReq', 'ProtoOAGetDynamicLeverageByIDReq',
+    'ProtoOAGetPositionUnrealizedPnLReq', 'ProtoOAGetTickDataReq', 'ProtoOAGetTrendbarsReq',
+    'ProtoOAMarginCallListReq', 'ProtoOAMarginCallUpdateReq', 'ProtoOAOrderDetailsReq',
+    'ProtoOAOrderListByPositionIdReq', 'ProtoOAOrderListReq', 'ProtoOAReconcileReq',
+    'ProtoOARefreshTokenReq', 'ProtoOASubscribeDepthQuotesReq',
+    'ProtoOASubscribeLiveTrendbarReq', 'ProtoOASubscribeSpotsReq', 'ProtoOASymbolByIdReq',
+    'ProtoOASymbolCategoryListReq', 'ProtoOASymbolsForConversionReq', 'ProtoOASymbolsListReq',
+    'ProtoOATraderReq', 'ProtoOAUnsubscribeDepthQuotesReq',
+    'ProtoOAUnsubscribeLiveTrendbarReq', 'ProtoOAUnsubscribeSpotsReq', 'ProtoOAVersionReq',
+})
+
+
+def __test_every_request_of_the_api_is_classified_for_the_gate__():
+    # Every request type of the schema is either an order write the wire gates
+    # or listed above as changing nothing: a request a schema update adds
+    # fails here until someone decides which it is.
+    writes = {t.DESCRIPTOR.name for t in ORDER_WRITE_REQUESTS}
+    requests = {name for name in _oa.DESCRIPTOR.message_types_by_name if name.endswith('Req')}
+    assert not writes & _NON_ORDER_REQUESTS
+    assert requests == writes | _NON_ORDER_REQUESTS

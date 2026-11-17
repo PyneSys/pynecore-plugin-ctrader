@@ -635,7 +635,7 @@ def __test_deal_bridge_resumes_a_cut_walk_then_reads_only_new_deals__(tmp_path, 
     assert second.filled_cents == 2000
     assert second.avg_price == 1.5
     assert (wire.requests[2].fromTimestamp, wire.requests[2].toTimestamp) == (
-        from_ms, newer.executionTimestamp - 1)
+        from_ms, newer.executionTimestamp)
     assert (wire.requests[3].fromTimestamp, wire.requests[3].toTimestamp) == (
         1_700_000_040_000, 1_700_000_150_000)
     assert third.conclusive
@@ -682,6 +682,54 @@ def __test_deal_bridge_widens_an_unread_tail_instead_of_chasing_the_present__(
     assert len(wire.requests) == 5
     assert (wire.requests[4].fromTimestamp, wire.requests[4].toTimestamp) == (
         1_700_000_040_000, 1_700_000_200_000)
+
+
+def __test_deal_bridge_reads_the_deals_a_page_cut_at_its_oldest_timestamp__(
+        tmp_path, monkeypatch):
+    # Two fills of the order share one timestamp and the page cut between them:
+    # the next page keeps that timestamp in its window, so the cut-off fill is
+    # read, and the fill both pages carry is counted once.
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: 1_700_000_100.0)
+    first = _deal(deal_id=970, order_id=111, position_id=222, filled_volume=1000)
+    second = _deal(deal_id=971, order_id=111, position_id=222, filled_volume=1000)
+    broker = _ReconcileBroker(_recon())
+    wire = _ScriptedWire(_deal_res(first, has_more=True), _deal_res(first, second))
+    broker._wire = wire
+    _open(tmp_path, broker)
+
+    bridge = asyncio.run(broker._find_fill_deal(111, 1_699_999_000_000))
+
+    assert bridge.conclusive
+    assert bridge.filled_cents == 2000
+    assert wire.requests[1].toTimestamp == first.executionTimestamp
+
+
+def __test_deal_bridge_page_that_cannot_narrow_is_inconclusive__(tmp_path, monkeypatch):
+    # A page announcing more deals that is empty, or whose deals all sit at the
+    # window's lower bound, leaves the rest of the window unread: no evidence of
+    # a complete read, and the window is read again by the next call.
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: 1_700_000_100.0)
+    at_lower = _deal(deal_id=980, order_id=111, position_id=222, filled_volume=1000)
+    broker = _ReconcileBroker(_recon())
+    wire = _ScriptedWire(_deal_res(has_more=True),
+                         _deal_res(at_lower, has_more=True),
+                         _deal_res(at_lower))
+    broker._wire = wire
+    _open(tmp_path, broker)
+    from_ms = at_lower.executionTimestamp
+
+    async def probe():
+        return (await broker._find_fill_deal(111, from_ms),
+                await broker._find_fill_deal(111, from_ms),
+                await broker._find_fill_deal(111, from_ms))
+
+    empty, at_bound, complete = asyncio.run(probe())
+
+    assert not empty.conclusive
+    assert not at_bound.conclusive
+    assert complete.conclusive
+    assert complete.filled_cents == 1000
+    assert [r.fromTimestamp for r in wire.requests] == [from_ms] * 3
 
 
 def __test_reconcile_reads_an_unfinished_walk_first_and_prunes_dead_ones__(tmp_path):

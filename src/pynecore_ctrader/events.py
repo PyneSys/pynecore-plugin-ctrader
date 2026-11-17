@@ -183,7 +183,8 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
     async def _run_reconcile_pass(self) -> AsyncIterator[OrderEvent]:
         """Run one reconcile-snapshot pass, isolating transient failures.
 
-        Steps in order: :meth:`_reconcile_snapshot` (gap-fill missed fills,
+        Steps in order: :meth:`_resolve_parked_dispatches` (release the
+        dispatches the venue never accepted), :meth:`_reconcile_snapshot` (gap-fill missed fills,
         stamp / clear ``missing_pending_since``), then
         :meth:`_emit_unexpected_cancellations` (retire rows missing past the
         grace window). A recoverable reconcile error — a transport hiccup on
@@ -214,6 +215,7 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         self._reconcile_pass_deadline = (
                 asyncio.get_running_loop().time() + _RECONCILE_PASS_BUDGET_S)
         try:
+            await self._resolve_parked_dispatches()
             async for event in self._reconcile_snapshot():
                 yield event
             async for event in self._emit_unexpected_cancellations():

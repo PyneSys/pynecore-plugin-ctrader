@@ -210,9 +210,10 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         """Send an order request and return its acknowledging execution event.
 
         Every order-mutating request (new / cancel / amend order, amend position
-        SL/TP, close position) leaves the client only through here, so this is
-        the venue-write gate: while an external-intervention quarantine is
-        latched, :meth:`ensure_venue_writes_allowed` refuses the request with
+        SL/TP, close position) leaves the client through here, and the wire
+        refuses one sent around the venue-write gate. While an
+        external-intervention quarantine is latched,
+        :meth:`ensure_venue_writes_allowed` refuses the request with
         :class:`VenueWritesQuarantinedError` (an :class:`ExchangeConnectionError`:
         nothing was sent, the caller keeps its state and retries after resume).
         :meth:`_account_request_raw` runs the gate inside the wire's send lock
@@ -259,8 +260,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             # reaches the disposition-unknown classifiers below unconverted —
             # the converting ``_account_request`` would mask the post-write
             # ambiguity and risk the engine duplicating an accepted order.
-            message = await self._account_request_raw(
-                req, venue_write=f"cTrader {type(req).__name__}")
+            message = await self._account_request_raw(req)
         except CTraderProtocolError as exc:
             mapped = map_protocol_error(exc)
             if isinstance(mapped, ExchangeRateLimitError):

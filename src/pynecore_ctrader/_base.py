@@ -37,6 +37,7 @@ from pynecore.core.broker.exceptions import (
     ExchangeConnectionError,
     ExchangeRateLimitError,
 )
+from pynecore.core.broker.parked_dispatch import ParkedDispatchResolver
 from pynecore.core.plugin.broker import BrokerPlugin
 from pynecore.types.ohlcv import OHLCV
 
@@ -52,6 +53,7 @@ from .exceptions import (
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .wire import (
+    ORDER_WRITE_REQUESTS,
     CTraderConnectionError,
     CTraderProtocolError,
     CTraderTimeoutError,
@@ -116,6 +118,23 @@ _RATE_LIMIT_HISTORY_BUDGET_SECONDS = 900.0
 #: per-request pacing only; a drained quota fails the query within seconds.
 _RATE_LIMIT_LIVE_HISTORY_ATTEMPTS = 3
 _RATE_LIMIT_LIVE_HISTORY_BUDGET_SECONDS = 10.0
+
+#: Age of a persist-first row before a dispatch parked with an unknown
+#: disposition is first looked up on the venue. Covers a write that did land
+#: moments before its reply was lost.
+_PARKED_DISPATCH_GRACE_S = 30.0
+#: Shortest time between two venue lookups of one parked dispatch: each costs
+#: an order-history request of the rolling quota.
+_PARKED_DISPATCH_LOOKUP_INTERVAL_S = 30.0
+#: Age at which a dispatch row the venue conclusively does not know is given
+#: up, at startup and in a running bot alike. A crash after the persist-first
+#: row write but before the wire send, or a send the venue never processed,
+#: leaves a row the broker never saw; without a limit it would block the
+#: strategy forever. The limit must exceed the worst-case send latency, broker
+#: processing, history-indexing lag, reconnect jitter and clock skew together,
+#: and stay below the guaranteed history depth: minutes, not the 25 s
+#: ``pending_missing_grace`` of everyday reconcile noise.
+_UNKNOWN_DISPATCH_TTL_S = 600.0
 
 #: Worker the blocking cross-process session-lock acquire runs on, so the
 #: event loop never blocks while another process refreshes the token pair.
@@ -284,6 +303,16 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: how many passes the outage cost. See
         #: ``_EventStreamMixin._run_reconcile_pass``.
         self._reconcile_fail_streak: int = 0
+        #: The core rule releasing a parked ``disposition_unknown`` dispatch
+        #: the venue never accepted. A conclusive absence rejects only past
+        #: the abandon TTL: the order history indexes an order late. See
+        #: ``_RecoveryMixin._resolve_parked_dispatches``.
+        self._parked_resolver = ParkedDispatchResolver(
+            venue="cTrader", log=logger,
+            grace_s=_PARKED_DISPATCH_GRACE_S,
+            absent_after_s=_UNKNOWN_DISPATCH_TTL_S,
+            lookup_interval_s=_PARKED_DISPATCH_LOOKUP_INTERVAL_S,
+        )
         #: Event-loop deadline of the reconcile pass in progress, or ``None``
         #: between passes. The snapshot read and the deal-history reads of the
         #: pass are bounded by it, so the pass never holds the ``watch_orders``
@@ -476,6 +505,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: is never re-emitted on top of the adopted size. See
         #: ``_StateMixin._apply_adoption_baseline``.
         self._adoption_baselined: bool = False
+        #: Venue time (ms) of the last change of every open position in the
+        #: snapshot the engine's startup adoption booked, by ``positionId``: a
+        #: deal on the position executed no later than that is part of the
+        #: adopted size. See ``_RecoveryMixin._take_over_adopted_leg``.
+        self._adoption_position_ts: dict[int, int] = {}
         #: Serializes mid-session account re-authorization. cTrader can drop
         #: this channel's account session while the socket stays up (another
         #: connection claimed the account, a server-side recycle). Every
@@ -978,9 +1012,7 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         except (CTraderConnectionError, CTraderTimeoutError) as exc:
             raise ExchangeConnectionError(str(exc) or "connection lost") from exc
 
-    async def _account_request_raw(
-            self, req: Message, *, venue_write: str | None = None,
-    ) -> Message:
+    async def _account_request_raw(self, req: Message) -> Message:
         """Send an account-scoped request, recovering from a mid-session de-auth.
 
         On an "account not authorized" error the socket is still up (only this
@@ -1003,25 +1035,27 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         definitive server *rejection* (an error response proves nothing
         executed, so re-sending the same ``client_order_id`` cannot duplicate).
 
-        An order write passes ``venue_write``: the venue-write gate
+        A request that changes an order or a position
+        (:data:`~pynecore_ctrader.wire.ORDER_WRITE_REQUESTS`) is gated by its
+        type, not by its caller: the venue-write gate
         (:meth:`ensure_venue_writes_allowed`) runs inside the wire's send lock,
         right before EVERY physical write, the re-send included, because an
         external-intervention quarantine can latch while the request waits for
         the send lock or for the session recovery.
 
         :param req: The request message; re-sent unchanged on retry.
-        :param venue_write: Description of an order-mutating request for the
-            venue-write gate, or ``None`` for a read.
         :return: The successful response.
         :raises ExchangeConnectionError: If the session could not be re-won.
-        :raises VenueWritesQuarantinedError: When ``venue_write`` is set and the
-            venue-write quarantine is latched before a send; that send is not made.
+        :raises VenueWritesQuarantinedError: When the request is an order write
+            and the venue-write quarantine is latched before a send; that send
+            is not made.
         """
         wire = self._wire
         if wire is None:
             raise CTraderConnectionError("live connection not established")
-        write_gate = (None if venue_write is None
-                      else functools.partial(self.ensure_venue_writes_allowed, venue_write))
+        write_gate = (
+            functools.partial(self.ensure_venue_writes_allowed, f"cTrader {type(req).__name__}")
+            if isinstance(req, ORDER_WRITE_REQUESTS) else None)
         # Capture the re-auth generation BEFORE issuing the request: if this send
         # loses the session and its rejection arrives late — after a concurrent
         # caller already re-won the session and bumped the generation — recovery
@@ -1775,6 +1809,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     async def _recover_in_flight_submissions(self) -> None: ...
 
     @abstractmethod
+    async def _resolve_parked_dispatches(self) -> None: ...
+
+    @abstractmethod
     def _note_accepted_by_resume(
             self, position_id: int, *, client_order_id: str | None, volume: float | None,
             deal_ids: Iterable[int] = (),
@@ -1791,6 +1828,10 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
     @abstractmethod
     def _restore_startup_shrinks(self) -> None: ...
+
+    @staticmethod
+    @abstractmethod
+    def _row_exposure(row: 'OrderRow') -> float: ...
 
     @abstractmethod
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...

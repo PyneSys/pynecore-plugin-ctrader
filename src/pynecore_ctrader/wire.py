@@ -41,6 +41,18 @@ from .messages import OpenApiMessages_pb2 as OpenApiMessages
 logger = logging.getLogger(__name__)
 
 
+#: The requests that change an order or a position on the venue. Each of them
+#: must pass the venue-write gate: :meth:`WireClient.send_request` refuses one
+#: that comes without it, so no code path can write around a quarantine.
+ORDER_WRITE_REQUESTS = (
+    OpenApiMessages.ProtoOANewOrderReq,
+    OpenApiMessages.ProtoOACancelOrderReq,
+    OpenApiMessages.ProtoOAAmendOrderReq,
+    OpenApiMessages.ProtoOAAmendPositionSLTPReq,
+    OpenApiMessages.ProtoOAClosePositionReq,
+)
+
+
 class CTraderWireError(ProviderError):
     """Base class for wire-level errors.
 
@@ -332,7 +344,15 @@ class WireClient:
         :raises CTraderRequestSentConnectionError: If the connection drops after
             the request bytes were (or may have been) written — disposition
             unknown.
+        :raises CTraderWireError: If ``message`` is one of
+            :data:`ORDER_WRITE_REQUESTS` and no ``write_gate`` came with it;
+            nothing is written.
         """
+        if write_gate is None and isinstance(message, ORDER_WRITE_REQUESTS):
+            raise CTraderWireError(
+                f"{type(message).__name__} changes an order or a position and must "
+                "be sent through the venue-write gate"
+            )
         loop = asyncio.get_running_loop()
         self._msg_id += 1
         client_msg_id = str(self._msg_id)
