@@ -38,7 +38,7 @@ from pynecore.core.broker.idempotency import (
     KIND_CANCEL,
     KIND_CLOSE,
     KIND_ENTRY,
-    KIND_ENTRY_STOP,
+    KIND_ENTRY_TRIGGERED,
     KIND_EXIT_SL,
     KIND_EXIT_TP,
     KIND_MODIFY_ENTRY,
@@ -377,7 +377,8 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         """Open a position (MARKET) or place a working order (LIMIT / STOP).
 
         The sync engine only ever dispatches plain MARKET / LIMIT / STOP here
-        (a both-set Pine entry is split into OCO legs upstream). Size below
+        (a Pine stop-limit order is watched upstream and arrives as its LIMIT
+        once triggered). Size below
         ``minVolume`` or above ``maxVolume`` is declined with
         :class:`OrderSkippedByPlugin` (never silently clamped) so a single
         out-of-range order cannot halt the bot. A protective bracket is NOT
@@ -430,7 +431,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
     ) -> list[ExchangeOrder]:
         """Place one MARKET / LIMIT / STOP order of ``qty`` for ``intent``."""
         coid = envelope.client_order_id(
-            KIND_ENTRY_STOP if intent.stop_fired_market else KIND_ENTRY,
+            KIND_ENTRY_TRIGGERED if intent.triggered_entry else KIND_ENTRY,
         )
         self._reject_out_of_range_entry(intent, rules, qty)
         volume = quantize_volume(qty, rules.step_volume)
@@ -1472,8 +1473,8 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         # guarantee that ``TOO_LATE_TO_CANCEL`` encodes, so the working order
         # may still be live or may have filled. Reporting it as
         # ``TOO_LATE_TO_CANCEL`` (treated like a confirmed no-fill cancel) would
-        # let the both-set entry-stop resolver fire its stop-market leg against
-        # a LIMIT that is still live and can double-open. Map it to ``UNKNOWN``
+        # let a resolver that sends a replacement order once the cancel landed
+        # act on a LIMIT that is still live and can double-open. Map it to ``UNKNOWN``
         # so the cancel-tentative stays armed and a later fill / cancel signal
         # resolves the disposition.
         return CancelDispositionOutcome.UNKNOWN

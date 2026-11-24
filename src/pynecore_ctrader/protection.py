@@ -358,7 +358,7 @@ _GOOD_TILL_CANCEL = OpenApiModelMessages.ProtoOATimeInForce.GOOD_TILL_CANCEL
 _DEFAULT_ORDER_ATTRS: list[float | int] = [0.0, 0.0, 0, 0, 0, int(_GOOD_TILL_CANCEL)]
 
 #: ``orders.state`` values of a real ENTRY dispatch row (as opposed to the
-#: book-keeping markers — bracket ownership, close legs, entry-stop watches —
+#: book-keeping markers — bracket ownership, close legs, stop-limit watches —
 #: that carry no exchange order).
 _ENTRY_ROW_STATES = frozenset({
     STATE_CONFIRMED,

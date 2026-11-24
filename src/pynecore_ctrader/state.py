@@ -101,6 +101,14 @@ class _StateMixin(_CTraderBase, ABC):
             # CFD venue: a SELL on a flat or smaller-long book opens/flips
             # to a short position natively.
             short_selling=CapabilityLevel.NATIVE,
+            # ``STOP_LIMIT`` takes no limit price, only a slippage range on
+            # the marketable side of the stop (``slippageInPoints``), and a
+            # triggered order that cannot fill within it is cancelled, never
+            # left resting (measured on the demo, 2026-11-23, ETHUSD). A Pine
+            # stop-limit whose limit lies on the other side of the stop, or
+            # that must rest at its limit, has no counterpart: the engine
+            # watches the stop and sends the LIMIT itself.
+            stop_limit_order=CapabilityLevel.SOFTWARE,
         )
 
     async def _reconcile(
