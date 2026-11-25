@@ -131,7 +131,8 @@ process was down) surfaces only as deal-history evidence. Each closing deal no
 process of the run attributed or judged yet is judged by
 :meth:`_ProtectionMixin._judge_recovered_closes`: *own* when its order is a
 close the run sent (by order id, or by position and time while the close's
-outcome is unknown) or one of this run's orders; *venue* when the order
+outcome is unknown and the order lookup attributes the order to no one) or one
+of this run's orders; *venue* when the order
 (``ProtoOAOrderDetailsReq``) is the position's ``STOP_LOSS_TAKE_PROFIT`` order
 or a stop-out, unless that protection order fired at a price the bot never set
 or on a position it left bare (*external*, as on the live path); *external*
@@ -442,6 +443,11 @@ class _ClaimedFill:
     :ivar settles_share: The fill left the position open, so the bot's share
         is checked once the event is delivered (a share it no longer holds
         vacates the position).
+    :ivar retired: The journal debits the fill's booking took, as
+        ``(client_order_id, volume)`` in the order taken
+        (:meth:`_ProtectionMixin._retire_partial_close_exposure`).
+    :ivar settle_entry: The Pine entry those debits were taken for first
+        (:meth:`_ProtectionMixin._settlement_entry`).
     """
     order_id: int
     deal_id: int | None
@@ -458,6 +464,8 @@ class _ClaimedFill:
     venue: bool = False
     event: OrderEvent | None = None
     settles_share: bool = False
+    retired: list[tuple[str, float]] = field(default_factory=list)
+    settle_entry: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,6 +498,9 @@ class _OwnClose:
         known (a close an earlier process sent).
     :ivar from_entry: The Pine entry the close serves, so its own fills are
         attributed even after the journal closed the position's rows.
+    :ivar settle_entry: The Pine entry the core settles the close's fills
+        against, so its fills retire that entry's journal rows even after a
+        later close of the same position was dispatched.
     :ivar executed: Volume (units) of the close's own fills seen by its order
         id: delivered by the event stream, carried by its answer, or found in
         the deal history.
@@ -506,6 +517,7 @@ class _OwnClose:
     claims: list[_ClaimedFill] = field(default_factory=list)
     volume: float | None = None
     from_entry: str | None = None
+    settle_entry: str | None = None
     executed: float = 0.0
     executed_deals: set[int] = field(default_factory=set)
     complete: bool = False
@@ -940,6 +952,21 @@ def _write_refused(exc: BaseException) -> bool:
             and isinstance(exc.__cause__, CTraderProtocolError))
 
 
+def _nothing_to_amend(exc: BaseException) -> bool:
+    """Whether a protection write failed only because the venue already carries it.
+
+    cTrader answers an amend that would leave the position's protection as it
+    is with ``INVALID_REQUEST: Nothing to amend.`` (measured live on a clear of
+    a position without protection). Only that answer counts: any other
+    ``INVALID_REQUEST`` is a real reject.
+    """
+    cause = exc.__cause__
+    return (isinstance(exc, ExchangeOrderRejectedError)
+            and isinstance(cause, CTraderProtocolError)
+            and cause.error_code == 'INVALID_REQUEST'
+            and 'nothing to amend' in str(cause).lower())
+
+
 class _ProtectionMixin(_CTraderBase, ABC):
     """Moved / removed SL-TP, foreign order edits and manual-close detection."""
 
@@ -1041,13 +1068,16 @@ class _ProtectionMixin(_CTraderBase, ABC):
             self, req: OpenApiMessages.ProtoOAAmendPositionSLTPReq, *,
             position_id: int, row_coid: str | None, coid: str, context: str,
             predecessor_cancel_ids: tuple[str, ...] | None = None,
-    ) -> OpenApiMessages.ProtoOAExecutionEvent:
+            nothing_to_amend_lands: bool = True,
+    ) -> OpenApiMessages.ProtoOAExecutionEvent | None:
         """Send one SL/TP amend, recording its levels as the bot's own.
 
         The levels are expected before the send and settled once the venue
         answered, naming the write :meth:`ProtectionLevelGuard.expect` returned,
         so overlapping writes of the same levels answered out of order each
-        close their own: confirmed on success; rejected when the venue provably did
+        close their own: confirmed on success, and on a ``Nothing to amend``
+        answer (:func:`_nothing_to_amend`), which says the position already
+        carries exactly the requested protection; rejected when the venue provably did
         not apply them (:func:`_write_refused`), so they stop being acceptable
         at once; unknown (``None``) on any other failure, so a write that may
         have landed stays acceptable next to the levels it would have replaced
@@ -1064,6 +1094,12 @@ class _ProtectionMixin(_CTraderBase, ABC):
         Any write makes the position no longer one the bot left bare; a write
         whose result cannot be predicted leaves it unguarded, and bare again
         only when the venue refused it (:meth:`_write_unguarded_protection`).
+
+        :param nothing_to_amend_lands: ``False`` makes a ``Nothing to amend``
+            answer a reject like any other, for a caller that judges what the
+            venue carries itself (the clear of a guarded position:
+            :meth:`~_ExecutionMixin._clear_position_bracket`).
+        :return: The venue's answer, or ``None`` when it had nothing to amend.
         """
         key = protection_key(position_id)
         guard = self._protection_guard()
@@ -1088,6 +1124,10 @@ class _ProtectionMixin(_CTraderBase, ABC):
         except BaseException as exc:
             self._protection_written_at[position_id] = epoch_time()
             self._end_protection_write(key)
+            if nothing_to_amend_lands and _nothing_to_amend(exc):
+                guard.settle(key, levels, write=write)
+                self._protection_baselined.add(key)
+                return None
             if _write_refused(exc):
                 guard.settle(key, None, rejected=levels, write=write)
             else:
@@ -1105,7 +1145,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
             self, req: OpenApiMessages.ProtoOAAmendPositionSLTPReq, *,
             position_id: int, coid: str, context: str,
             predecessor_cancel_ids: tuple[str, ...] | None = None,
-    ) -> OpenApiMessages.ProtoOAExecutionEvent:
+    ) -> OpenApiMessages.ProtoOAExecutionEvent | None:
         """Send one SL/TP amend the level guard does not judge.
 
         The native fail-safe (whose levels the core fail-safe manager judges)
@@ -1124,6 +1164,10 @@ class _ProtectionMixin(_CTraderBase, ABC):
         so the position is judged the same way then; without such knowledge
         nothing is judged. A refused write left the venue as it was: the
         position is guarded (or bare) as before (:meth:`_unguarded_write_refused`).
+        A ``Nothing to amend`` answer (:func:`_nothing_to_amend`) says the venue
+        already carries the protection sent: the write counts as landed.
+
+        :return: The venue's answer, or ``None`` when it had nothing to amend.
         """
         key = protection_key(position_id)
         guard = self._protection_guard()
@@ -1147,6 +1191,10 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 predecessor_cancel_ids=predecessor_cancel_ids)
         except BaseException as exc:
             self._end_unguarded_write(position_id)
+            if _nothing_to_amend(exc):
+                self._release_protection(position_id)
+                self._unguarded_baseline.add(position_id)
+                return None
             if _write_refused(exc):
                 self._unguarded_write_refused(
                     position_id, levels if new_levels else None, was_bare=was_bare,
@@ -1969,6 +2017,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
         self._protection_written_at.pop(position_id, None)
         self._fill_views_deferred.discard(position_id)
         self._close_dispatch_pine_by_position.pop(position_id, None)
+        self._close_settle_entry_by_position.pop(position_id, None)
         self._shrink_watch.pop(position_id, None)
 
     def _record_share_effect(
@@ -2206,8 +2255,8 @@ class _ProtectionMixin(_CTraderBase, ABC):
 
     def _retire_partial_close_exposure(
             self, position_id: int, closed_qty: float, *,
-            source: str = 'partial_close_fill',
-    ) -> None:
+            source: str = 'partial_close_fill', entry_id: str | None = None,
+    ) -> list[tuple[str, float]]:
         """Book a run-owned partial close's quantity as retired entry exposure.
 
         A cTrader close executes under the venue's own close ``orderId`` and is
@@ -2233,21 +2282,37 @@ class _ProtectionMixin(_CTraderBase, ABC):
         its net absorb, and at most the share: retiring a row of the bot's own
         opposite entry would grow the net instead of shrinking it.
 
+        A close the event names an entry for is settled by the core against
+        that entry's bindings first, and only the rest against the other
+        entries oldest first. The rows of that entry therefore absorb first,
+        in journal order, and the other rows take the remainder, so the
+        per-entry exposure a restart rebuilds from the journal is the one the
+        engine held.
+
         :param position_id: The netted ``positionId`` the close reduced.
         :param closed_qty: The quantity of the bot's share the close took.
         :param source: The audit event's ``source``.
+        :param entry_id: The Pine entry the core settles the close against
+            (:meth:`_settlement_entry`), or ``None`` for an unbound close.
+        :return: The ``(client_order_id, volume)`` debits, in the order they
+            were taken, so a fill found later not to be the bot's close gives
+            back exactly its own (:meth:`_restore_retired_exposure`).
         """
+        debits: list[tuple[str, float]] = []
         if self.store_ctx is None or not position_id or closed_qty <= 0.0:
-            return
+            return debits
         pid_str = str(position_id)
         remaining = closed_qty
         net = self._signed_share(position_id)
         side = _net_side(net)
         if net is not None:
             if side is None:
-                return
+                return debits
             remaining = min(remaining, abs(net))
-        for row in list(self.store_ctx.iter_live_orders()):
+        rows = list(self.store_ctx.iter_live_orders())
+        if entry_id is not None:
+            rows.sort(key=lambda r: r.pine_entry_id != entry_id)
+        for row in rows:
             if remaining <= 1e-9:
                 break
             if side is not None and row.side != side:
@@ -2275,7 +2340,40 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 payload={'retired': take, 'total_retired': already + take,
                          'source': source},
             )
+            debits.append((row.client_order_id, take))
             remaining -= take
+        return debits
+
+    def _settlement_entry(
+            self, position_id: int, order_id: int, from_entry: str | None, *,
+            venue: bool,
+    ) -> str | None:
+        """The Pine entry the core settles a run-owned close fill against.
+
+        A fill of a close this run sent carries that close's label as
+        ``from_entry``; for an engine-made close that label is the synthetic
+        intent id, and the core settles the entry the close targets instead.
+        A fill of a close the venue already named by its order id settles the
+        entry recorded with that close (:attr:`_OwnClose.settle_entry`), even
+        when a later close of the same position was dispatched since. A fill
+        a close whose order id is not known yet took settles the entry
+        recorded with that close; the venue's own close never is one. Any
+        other ``from_entry`` is already an entry id (the owner of the position
+        a fill no own close claims reduced), or ``None``.
+
+        :param position_id: The position the fill closed volume of.
+        :param order_id: The venue's ``orderId`` of the fill.
+        :param from_entry: The fill event's ``from_entry``.
+        :param venue: Whether the fill is the venue's own close
+            (:meth:`_is_venue_close`).
+        """
+        record = self._own_close_of_order(order_id, position_id)
+        if record is not None:
+            return record.settle_entry
+        pending = None if venue else self._own_close_wildcard(position_id)
+        if pending is not None and pending.from_entry == from_entry:
+            return pending.settle_entry
+        return from_entry
 
     @staticmethod
     def _venue_after(
@@ -2411,7 +2509,8 @@ class _ProtectionMixin(_CTraderBase, ABC):
         """
         record = _OwnClose(position_id=position_id, sent_ms=int(epoch_time() * 1000),
                            volume=volume,
-                           from_entry=self._close_dispatch_pine_by_position.get(position_id))
+                           from_entry=self._close_dispatch_pine_by_position.get(position_id),
+                           settle_entry=self._close_settle_entry_by_position.get(position_id))
         self._own_closes.append(record)
         self._own_close_history.append(record)
         self._journal_own_close(record)
@@ -2553,7 +2652,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
 
     def _release_held_claims(
             self, record: _OwnClose, claims: Sequence[_ClaimedFill],
-            cuts: Sequence[tuple[_ClaimedFill, float]] = (),
+            cuts: Sequence[tuple[_ClaimedFill, float]] | None = None,
     ) -> None:
         """Deliver the events of the fills an own close took while it was in flight.
 
@@ -2567,13 +2666,29 @@ class _ProtectionMixin(_CTraderBase, ABC):
         WARNING and an audit event, never a report. The share check a held
         partial close skipped runs once its event is delivered.
 
+        A fill the close took as its own carries the close's label and
+        settlement entry only provisionally. When the answer (or the refusal)
+        shows it to be another order's, it is attributed as if no own close
+        had been pending (:meth:`_reattributed_identity`): its event gets that
+        label, and what it still debits from the journal moves to the rows of
+        that settlement entry. A fill of a close whose outcome stays unknown
+        keeps the close's identity. Once any released fill's quantity or
+        settlement entry changed, the journal debits of all of them are taken
+        again in release order (:meth:`_replay_claim_debits`), as the engine
+        settles their events.
+
         :param claims: The fills the close took, as they were before judging.
-        :param cuts: The volume to take off each claim's event.
+        :param cuts: The volume to take off each claim's event, once the
+            close's fills are judged (:meth:`_rejudge_claims`); ``None`` when
+            the close's outcome is unknown.
         """
-        cut_of = {id(claim): cut for claim, cut in cuts}
+        cut_of = {id(claim): cut for claim, cut in cuts or ()}
         total_cut = 0.0
+        restored = 0.0
         released = False
         settle_share = False
+        replay = False
+        delivered: list[tuple[_ClaimedFill, OrderEvent]] = []
         for claim in claims:
             event = claim.event
             if event is None:
@@ -2584,11 +2699,24 @@ class _ProtectionMixin(_CTraderBase, ABC):
             booked = event.fill_qty or 0.0
             cut = min(cut_of.get(id(claim), 0.0), booked)
             total_cut += cut
+            if cut > _VOLUME_TOL:
+                restored += self._restore_retired_exposure(record.position_id, claim, cut)
+                replay = True
+            disproved = (cuts is not None and not claim.venue
+                         and not any(own is claim for own in record.claims))
+            if disproved:
+                from_entry, settle_entry = self._reattributed_identity(record.position_id, claim)
+                replay = replay or (settle_entry != claim.settle_entry and bool(claim.retired))
+                claim.settle_entry = settle_entry
+                claim.from_entry = from_entry
+                event = replace(event, from_entry=from_entry)
             if booked - cut > _VOLUME_TOL:
-                self._released_close_events.append(
-                    replace(event, fill_qty=booked - cut) if cut > 0.0 else event)
+                event = replace(event, fill_qty=booked - cut) if cut > 0.0 else event
+                delivered.append((claim, event))
+        if replay:
+            self._replay_claim_debits([claim for claim, _event in delivered], record.position_id)
+        self._released_close_events.extend(event for _claim, event in delivered)
         if total_cut > _VOLUME_TOL:
-            restored = self._restore_retired_exposure(record.position_id, total_cut)
             logger.warning(
                 "cTrader: %s units booked for the bot's own close of position %d were "
                 "another party's close of its own exposure; not booked, %s units given "
@@ -2600,40 +2728,50 @@ class _ProtectionMixin(_CTraderBase, ABC):
                              'restored': restored, 'own_close_key': record.key,
                              'order_id': record.order_id,
                              'claims': [[claim.order_id, claim.deal_id, cut]
-                                        for claim, cut in cuts]})
+                                        for claim, cut in cuts or ()]})
         if settle_share:
             self._settle_own_partial_close(record.position_id)
         if released and self._exec_events is not None:
             # Wakes the stream, which delivers the events before the next message.
             self._exec_events.put_nowait(_RELEASE_WAKEUP)
 
-    def _restore_retired_exposure(self, position_id: int, qty: float) -> float:
-        """Give retired exposure back to a position's journal rows, newest first.
+    def _restore_retired_exposure(
+            self, position_id: int, claim: _ClaimedFill, qty: float, *,
+            source: str = 'close_claim_rebooked',
+    ) -> float:
+        """Give back a held fill's journal debits, the last taken first.
 
         The inverse of :meth:`_retire_partial_close_exposure` for volume
-        retired by a fill that turned out not to have closed the bot's share.
-        A closed row (the venue went flat) gets nothing back.
+        retired by a fill that turned out not to have closed the bot's share:
+        only the rows that fill debited get volume back, each at most what the
+        fill took from it, so a debit another close made on a different entry
+        stays. A closed row (the venue went flat) gets nothing back.
 
+        :param position_id: The position the fill closed volume of.
+        :param claim: The held fill whose booking is cut.
+        :param qty: The volume (units) cut off the fill's booking.
+        :param source: The audit event's ``source``.
         :return: The volume (units) given back.
         """
         if self.store_ctx is None or not position_id or qty <= 0.0:
             return 0.0
         pid_str = str(position_id)
         remaining = qty
-        for row in reversed(list(self.store_ctx.iter_live_orders())):
+        kept: list[tuple[str, float]] = []
+        for index in range(len(claim.retired) - 1, -1, -1):
+            coid, taken = claim.retired[index]
             if remaining <= 1e-9:
-                break
-            extras = dict(row.extras or {})
-            position_id_raw = extras.get('position_id')
-            matches_position = (
-                position_id_raw is not None
-                and parse_protocol_id(position_id_raw, field='position_id') == position_id
-            )
-            if not matches_position and row.exchange_order_id != pid_str:
+                kept.insert(0, (coid, taken))
                 continue
+            row = self.store_ctx.get_order(coid)
+            if row is None or row.closed_ts_ms is not None:
+                continue
+            extras = dict(row.extras or {})
             already_raw = extras.get(JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY)
             already = float(already_raw) if isinstance(already_raw, (int, float)) else 0.0
-            give = min(already, remaining)
+            give = min(already, taken, remaining)
+            if taken - give > 1e-9:
+                kept.insert(0, (coid, taken - give))
             if give <= 1e-9:
                 continue
             extras[JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY] = already - give
@@ -2642,9 +2780,60 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 'journal_exposure_restored',
                 client_order_id=row.client_order_id, exchange_order_id=pid_str,
                 payload={'restored': give, 'total_retired': already - give,
-                         'source': 'close_claim_rebooked'})
+                         'source': source})
             remaining -= give
+        claim.retired = kept
         return qty - remaining
+
+    def _reattributed_identity(
+            self, position_id: int, claim: _ClaimedFill,
+    ) -> tuple[str | None, str | None]:
+        """The label and settlement entry of a fill an own close took that was
+        another order's.
+
+        The identity the fill gets with no own close pending: a close of the
+        run the venue named by the fill's order id gives its own; otherwise
+        the run's exposure in the position does, naming its entry only when
+        one entry holds it (:meth:`_run_owned_position_entry`), as for a
+        close the run did not send.
+
+        :param position_id: The position the fill closed volume of.
+        :param claim: The fill.
+        :return: ``(from_entry, settle_entry)``.
+        """
+        other = self._own_close_of_order(claim.order_id, position_id)
+        if other is not None:
+            return other.from_entry, other.settle_entry
+        owners = self._run_owned_position_entry(position_id)
+        owner = owners[0] if owners is not None and len(owners) == 1 else None
+        return owner, owner
+
+    def _replay_claim_debits(self, claims: Sequence[_ClaimedFill], position_id: int) -> None:
+        """Take the journal debits of released fills again, in release order.
+
+        Each fill debited the journal as of its moment, with the identity and
+        quantity it was held under; the fills after it took the rows it left.
+        Once one of them changed, every one's debits are given back (the last
+        taken first), and each takes what it got back again, in the order the
+        engine settles their events, for its final settlement entry
+        (:attr:`_ClaimedFill.settle_entry`).
+
+        :param claims: The released fills, in release order.
+        :param position_id: The position the fills closed volume of.
+        """
+        volumes: list[float] = []
+        for claim in reversed(claims):
+            left = sum(volume for _coid, volume in claim.retired)
+            volumes.append(self._restore_retired_exposure(
+                position_id, claim, left, source='close_claim_reattributed')
+                           if left > 1e-9 else 0.0)
+        volumes.reverse()
+        for claim, left in zip(claims, volumes):
+            claim.retired = (
+                self._retire_partial_close_exposure(
+                    position_id, left, source='close_claim_reattributed',
+                    entry_id=claim.settle_entry)
+                if left > 1e-9 else [])
 
     def _settle_own_partial_close(self, position_id: int) -> None:
         """The bot's own close left a position open: check what it holds of it."""
@@ -2654,6 +2843,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 # A startup-adopted NETTING position: a later close of it is
                 # no longer one this run sent.
                 self._close_dispatch_pine_by_position.pop(position_id, None)
+                self._close_settle_entry_by_position.pop(position_id, None)
         elif share <= _VOLUME_TOL:
             # The bot closed its whole share of a position someone else still
             # holds: nothing on it is the bot's any more, its protection
@@ -2669,7 +2859,8 @@ class _ProtectionMixin(_CTraderBase, ABC):
             payload={'key': record.key, 'position_id': record.position_id,
                      'sent_ms': record.sent_ms, 'order_id': record.order_id,
                      'answered_ms': record.answered_ms, 'refused': refused,
-                     'from_entry': record.from_entry},
+                     'from_entry': record.from_entry,
+                     'settle_entry': record.settle_entry},
         )
 
     def _load_close_evidence(self) -> None:
@@ -2708,6 +2899,8 @@ class _ProtectionMixin(_CTraderBase, ABC):
                     key=key,
                     from_entry=(payload['from_entry']
                                 if isinstance(payload.get('from_entry'), str) else None),
+                    settle_entry=(payload['settle_entry']
+                                  if isinstance(payload.get('settle_entry'), str) else None),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -2784,13 +2977,23 @@ class _ProtectionMixin(_CTraderBase, ABC):
         return next((c for c in self._own_close_history
                      if c.order_id == order_id and c.position_id == position_id), None)
 
-    def _own_close_of_deal(self, position_id: int, deal: _PositionDeal) -> _OwnClose | None:
+    def _own_close_of_deal(
+            self, position_id: int, deal: _PositionDeal, origin: CloseOrigin | None,
+    ) -> _OwnClose | None:
         """The run's close a closing deal of the deal history belongs to: the
-        one the venue named its order, else one of unknown order id whose
-        window holds the deal."""
-        return next(
+        one the venue named its order, else, for a deal judged the bot's own
+        (:meth:`_recovered_close_origin`), one of unknown order id whose window
+        holds the deal.
+
+        :param origin: The deal's judged origin; a deal of the venue's or
+            another client's order never belongs to a close by its window.
+        """
+        exact = next(
             (record for record in self._own_close_history if record.order_id == deal.order_id),
-            None) or next(
+            None)
+        if exact is not None or origin is not CloseOrigin.OWN:
+            return exact
+        return next(
             (record for record in self._own_close_history
              if record.order_id is None
              and record.claims_recovered(position_id, deal.order_id, deal.executed_ms)),
@@ -2802,6 +3005,16 @@ class _ProtectionMixin(_CTraderBase, ABC):
         self._own_closes = [c for c in self._own_closes if c.expires_at > now]
         return next((c for c in self._own_closes
                      if c.position_id == position_id and c.order_id is None), None)
+
+    @staticmethod
+    def _is_venue_close(
+            message: OpenApiMessages.ProtoOAExecutionEvent,
+            order: OpenApiModelMessages.ProtoOAOrder,
+    ) -> bool:
+        """Whether a closing fill is the venue's own close (SL / TP, stop-out,
+        server-initiated): never a close the run sent."""
+        return bool(order.orderType == _STOP_LOSS_TAKE_PROFIT
+                    or order.isStopOut or message.isServerEvent)
 
     def _close_fill_origin(
             self, message: OpenApiMessages.ProtoOAExecutionEvent,
@@ -2818,10 +3031,9 @@ class _ProtectionMixin(_CTraderBase, ABC):
             order id, or taken without knowing it (``order_id`` still
             ``None``; the caller records the claim); else ``None``.
         """
-        if (order.orderType == _STOP_LOSS_TAKE_PROFIT
-                or order.isStopOut or message.isServerEvent):
+        if self._is_venue_close(message, order):
             return CloseOrigin.VENUE, None
-        terminal = message.executionType == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED
+        terminal =message.executionType == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED
         record = self._own_close_by_order(order.orderId, terminal=terminal)
         if record is not None:
             return CloseOrigin.OWN, record
@@ -3206,7 +3418,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 closed_qty=volume_to_units(sum(deal.closed for deal, _, _ in replay.ambiguous)))
         for deal in pending:
             if origins[deal.deal_id] is CloseOrigin.OWN:
-                owner = self._own_close_of_deal(position_id, deal)
+                owner = self._own_close_of_deal(position_id, deal, CloseOrigin.OWN)
                 if owner is not None:
                     owner.count_executed(deal.deal_id, volume_to_units(deal.closed))
         self._mark_close_judged([deal.deal_id for deal in pending], origins)
@@ -3260,15 +3472,25 @@ class _ProtectionMixin(_CTraderBase, ABC):
     ) -> CloseOrigin | None:
         """Classify one closing order found in the deal history.
 
+        A close of the run by order id, or one of the bot's entry orders, is
+        *own* at once. A close of the run whose outcome is unknown claims a
+        deal by position and time only, so the order is looked up first: the
+        venue's SL / TP or stop-out and another client's order keep their
+        verdict, and only an order the lookup cannot attribute
+        (*unattributed*, *unknown*) is taken as that close's.
+
         :param own_orders: Entry orders of the bot's whose journal rows are
             closed (:meth:`_judge_recovered_closes`).
         :return: The origin, or ``None`` when the order lookup failed for now.
         """
-        if order_id in own_orders or any(
+        if order_id in own_orders:
+            return CloseOrigin.OWN
+        kind = await self._closing_order_kind(position_id, order_id, judge_protection=True)
+        if kind in (CloseOrigin.UNATTRIBUTED, CloseOrigin.UNKNOWN) and any(
                 record.claims_recovered(position_id, order_id, executed_ms)
                 for record in self._own_close_history):
             return CloseOrigin.OWN
-        return await self._closing_order_kind(position_id, order_id, judge_protection=True)
+        return kind
 
     async def _recovered_protection_origin(
             self, position_id: int, order: OpenApiModelMessages.ProtoOAOrder,

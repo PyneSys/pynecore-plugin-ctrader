@@ -86,6 +86,7 @@ from .protection import (
     _OWN_ORDER_TERMS_EXTRA,
     _AnswerFill,
     _ProtectionMixin,
+    _nothing_to_amend,
     _write_refused,
     protection_key,
 )
@@ -912,8 +913,9 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         """Reduce ONE broker leg by ``volume`` centi-units under ``coid``."""
         # Remember which Pine id this leg's close serves BEFORE dispatching:
         # the fill's PUSH copy carries only the venue close ``orderId`` +
-        # ``positionId``, and on a startup-adopted position no entry row links
-        # the id — ``_resolve_identity`` then falls back to this map. The core
+        # ``positionId``, so ``_resolve_identity`` labels it from the own-close
+        # record ``_send_own_close`` opens with this id; on a startup-adopted
+        # position no entry row links, the map also keeps it the run's. The core
         # emulator persists the leg row under the deterministic ``coid``
         # (``{parent}:{leg_id}``) with the close's ``pine_entry_id``.
         pine_id: str | None = None
@@ -924,6 +926,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                 pine_id = row.pine_entry_id
                 intent_key = row.intent_key or coid
         self._close_dispatch_pine_by_position[int(leg_id)] = pine_id
+        self._close_settle_entry_by_position[int(leg_id)] = pine_id
         try:
             await self._send_own_close(
                 OpenApiMessages.ProtoOAClosePositionReq(
@@ -1000,7 +1003,11 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         cTrader protection is a single position attribute an amend overwrites
         wholesale, so an all-None amend clears it. A leg that vanished between
         the emulator's leg fetch and this amend surfaces as a ``*_NOT_FOUND``
-        reject — a benign no-op (the bracket is moot). Any other reject
+        reject — a benign no-op (the bracket is moot). A ``Nothing to amend``
+        answer says the leg already carries exactly the requested protection (the
+        core re-sends a co-owner's unchanged level with every merged amend): it is
+        a success, and the requested levels are the leg's protection
+        (:meth:`~_ProtectionMixin._write_protection`). Any other reject
         propagates as :class:`ExchangeOrderRejectedError`; on the attach path the
         core emulator wraps it into a
         :class:`BracketAttachAfterFillRejectedError` so the open, now-unprotected
@@ -1173,6 +1180,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                         await self._write_protection(
                             request, position_id=position_id, row_coid=None,
                             coid=coid, context=step_context,
+                            nothing_to_amend_lands=False,
                         )
                     else:
                         levels = self._requested_protection(request)
@@ -1191,10 +1199,13 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                     # first clear had already stripped the shared bracket, and the
                     # forced-cancel retry re-drove the clear on the bare position,
                     # crashing the run). Nothing to amend IS the clear's goal
-                    # state, so treat it as an idempotent success.
-                    if (isinstance(cause, CTraderProtocolError)
-                            and cause.error_code == 'INVALID_REQUEST'
-                            and 'nothing to amend' in str(cause).lower()):
+                    # state, so treat it as an idempotent success. Only the last
+                    # step clears: an earlier one answering so (the trailing
+                    # flag was already off) leaves the stop armed, so the clear
+                    # still follows.
+                    if _nothing_to_amend(exc):
+                        if index < len(requests):
+                            continue
                         already_bare = True
                         break
                     raise
@@ -1227,6 +1238,27 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                     and not position.HasField('takeProfit')
             )
         return False
+
+    def _close_settle_entry(self, intent: CloseIntent) -> str | None:
+        """The Pine entry the core settles a close's fills against.
+
+        Mirrors the core's close-fill binding: a script close settles the
+        entry it names (``None`` for ``strategy.close_all``), an engine-made
+        close aimed at one entry (``partial_trigger``, ``marketable_exit``)
+        its ``target_entry_id``, a ``defensive_close`` the entry of the
+        position row it targets, a ``reversal_close`` no entry.
+
+        :param intent: The close being dispatched.
+        """
+        if intent.synthetic_kind is None:
+            return intent.pine_id or None
+        if intent.synthetic_kind in ('partial_trigger', 'marketable_exit'):
+            return intent.target_entry_id
+        if (intent.synthetic_kind == 'defensive_close' and self.store_ctx is not None
+                and intent.target_position_coid):
+            row = self.store_ctx.get_order(intent.target_position_coid)
+            return row.pine_entry_id if row is not None else None
+        return None
 
     @staticmethod
     def _raise_nothing_to_close(
@@ -1286,12 +1318,14 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         if position_id is None:
             self._raise_nothing_to_close(intent, "no open position")
         volume = quantize_volume(intent.qty, rules.step_volume)
-        # Same fallback identity as ``close_leg``: a close fill on a
-        # startup-adopted position reverse-maps through this record when no
-        # entry row carries the ``position_id`` ref.
+        # Same identity as ``close_leg``: the own-close record
+        # ``_send_own_close`` opens takes this label and settlement entry, and
+        # a startup-adopted position no entry row carries the ``position_id``
+        # ref of stays the run's through this map.
         self._close_dispatch_pine_by_position[position_id] = (
                 intent.pine_id or None
         )
+        self._close_settle_entry_by_position[position_id] = self._close_settle_entry(intent)
         try:
             event = await self._send_own_close(
                 OpenApiMessages.ProtoOAClosePositionReq(

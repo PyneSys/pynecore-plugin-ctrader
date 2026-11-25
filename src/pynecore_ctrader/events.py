@@ -332,7 +332,8 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         elif order.executionPrice:
             fill_price = order.executionPrice
 
-        pine_id, from_entry, leg_type = self._resolve_identity(order, deal)
+        venue_close = self._is_venue_close(message, order)
+        pine_id, from_entry, leg_type = self._resolve_identity(order, deal, venue=venue_close)
         if (event_type in ('filled', 'partial') and leg_type is None
                 and self.store_ctx is not None):
             # The order/position ref index could not reverse-map this fill.
@@ -441,9 +442,13 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # journal row of this run — so without this the durable book keeps
             # the entry's full exposure and startup ownership / cycle-end
             # reconciliation reads a position the venue no longer holds.
-            self._retire_partial_close_exposure(
-                order.positionId, fill_qty or 0.0)
+            settle_entry = self._settlement_entry(
+                order.positionId, order.orderId, from_entry, venue=venue_close)
+            debits = self._retire_partial_close_exposure(
+                order.positionId, fill_qty or 0.0, entry_id=settle_entry)
             if held_claim is not None:
+                held_claim.retired = debits
+                held_claim.settle_entry = settle_entry
                 # Whether the fill was the bot's close is known once the close
                 # is answered; the share is checked then.
                 held_claim.settles_share = close_origin is CloseOrigin.OWN
@@ -518,7 +523,7 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         )
 
     def _resolve_identity(
-            self, order, deal,
+            self, order, deal, *, venue: bool,
     ) -> tuple[str | None, str | None, LegType | None]:
         """Reverse-map an execution event to its Pine identity.
 
@@ -532,10 +537,13 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         venue handle is the entry ``orderId`` this run placed (recorded as an
         ``order_id`` ref); a close carries only the venue's own close
         ``orderId`` (never in the ref index), so a close maps to this run only
-        when THIS run dispatched a close against the position
-        (``_close_dispatch_pine_by_position``, keyed by the shared
-        ``positionId`` but only ever populated by our own ``execute_close`` /
-        ``close_leg``) or holds exposure in it.
+        when a close THIS run sent claims it — the one the venue named by that
+        ``orderId``, else one on the position whose ``orderId`` is not known
+        yet (:class:`~pynecore_ctrader.protection._OwnClose`, labelled with the
+        entry that close serves) — or the run holds exposure in the position,
+        or dispatched a close against it
+        (:attr:`~_CTraderBase._close_dispatch_pine_by_position`).
+        A fill only the last two prove is the run's names no close's entry.
 
         A close the venue itself fired from the protective bracket armed on the
         position (server-side SL / TP / trailing) is dispatched by neither side,
@@ -550,6 +558,13 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         position here. A fill that maps to neither run-owned handle is another
         run's / external activity and returns ``(None, None, None)`` so the
         caller drops it.
+
+        The label a pending close lends is provisional: once that close's
+        answer (or refusal) shows the fill to be another order's, the held
+        event is attributed again
+        (:meth:`~_ProtectionMixin._release_held_claims`). The venue's own
+        close (``venue``: SL / TP, stop-out, server-initiated) is never a
+        close the run sent, so no pending close lends it a label.
 
         Attribution only: who caused a closing fill attributed here — this
         run, the venue or someone else — is decided by
@@ -582,32 +597,46 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         # this run's exit. This same map also covers a close THIS run
         # dispatched against startup-adopted exposure that no entry row links.
         closing = self._is_closing_fill(order, deal)
-        if closing and order.positionId in (
-                self._close_dispatch_pine_by_position):
-            return (
-                None,
-                self._close_dispatch_pine_by_position[order.positionId],
-                LegType.CLOSE,
-            )
         if closing:
             # A fill of a close this run sent, by the order id the venue
-            # named for it, after the journal closed the position's rows (a
-            # fill taken for the close that was someone else's flattened the
-            # position first).
+            # named for it: it serves the entry of that close, even when a
+            # later close of the same position was dispatched since, or the
+            # journal closed the position's rows (a fill taken for the close
+            # that was someone else's flattened the position first).
             record = self._own_close_of_order(order.orderId, order.positionId)
             if record is not None:
                 return None, record.from_entry, LegType.CLOSE
-        # This run dispatched no close against the position — but the venue can
-        # close it on its OWN initiative through the protective bracket we
+        if closing and order.positionId and not venue:
+            # A close this run sent whose order id the venue has not named
+            # yet takes the fill as its own (:meth:`_close_fill_origin`); the
+            # fill serves that same close's entry. A close the venue refused
+            # left no such record: a later fill is never its.
+            pending = self._own_close_wildcard(order.positionId)
+            if pending is not None:
+                return None, pending.from_entry, LegType.CLOSE
+        # No close of this run claims the fill — but the venue can
+        # close the position on its OWN initiative through the protective bracket we
         # armed on it (position-attribute SL / TP / trailing). That fill carries
         # the venue's close ``orderId`` (never journaled) and no coid of ours,
         # so both handles above miss and the fill used to be dropped as
         # external: the engine's book then kept the stale open size for the rest
         # of the cycle. The bracket is OURS whenever this run still holds the
         # position, so the exposure record is the attribution proof.
+        # A leg several entries own or hold is still the run's: its close is
+        # booked as a reduction the core settles against the oldest bindings,
+        # as the journal retires it, without naming (and so retiring the exits
+        # of) an entry it may not have served.
         if closing and order.positionId:
-            owner = self._run_owned_position_entry(order.positionId)
-            if owner is not None:
+            owners = self._run_owned_position_entry(order.positionId)
+            if owners is not None:
+                owner = owners[0] if len(owners) == 1 else None
+                if owner is None:
+                    logger.warning(
+                        "cTrader: venue close of position %d (order %d) serves one of the "
+                        "entries %s that own its protection or hold it; booked as a "
+                        "reduction of the position without an entry",
+                        order.positionId, order.orderId,
+                        list(owners))
                 self.store_ctx.log_event(
                     'venue_close_attributed_to_entry',
                     exchange_order_id=str(order.orderId) or None,
@@ -616,9 +645,16 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                         'position_id': order.positionId,
                         'order_type': int(order.orderType),
                         'from_entry': owner,
+                        'owner_entries': list(owners),
                     },
                 )
                 return None, owner, LegType.CLOSE
+            if order.positionId in self._close_dispatch_pine_by_position:
+                # A startup-adopted position no entry row links, that this run
+                # dispatched a close against: still the run's. The fill is not
+                # that close's (no record of it claims the fill), so it names
+                # no entry and the core settles it against the oldest bindings.
+                return None, None, LegType.CLOSE
         return None, None, None
 
     def _own_live_entry_coid(self, order) -> bool:
@@ -805,40 +841,66 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         return booked, origin, (
             claim if holder is not None and holder.answered_ms is None else None)
 
-    def _run_owned_position_entry(self, position_id: int) -> str | None:
-        """Pine entry id of the run-owned exposure a venue close just flattened.
+    def _run_owned_position_entry(self, position_id: int) -> tuple[str, ...] | None:
+        """Pine entries of the run-owned exposure a venue close just flattened.
 
-        Two proofs of ownership, both scoped to THIS run instance by
+        Three proofs of ownership, all scoped to THIS run instance by
         ``RunContext`` (``iter_live_orders`` filters on ``run_instance_id``), so
-        neither can adopt another run's book:
+        none can adopt another run's book:
 
-        * a live bracket-ownership row (``bo:<intent_key>:<leg_id>``, state
+        * the entry that opened the leg (:meth:`~_StateMixin._leg_entry_ids`):
+          on a HEDGED account every live row linked to the ``positionId`` is an
+          entry row of this run naming that one Pine id. When it names one,
+          it alone decides;
+        * live bracket-ownership rows (``bo:<intent_key>:<leg_id>``, state
           ``bracket_own``) whose ``bracket_own_leg_id`` is this ``positionId``
-          — the core one-way emulator wrote it BEFORE amending our exit's
-          bracket onto that leg, so a protective fill on the leg is that exit's;
-        * a live ENTRY row of this run whose ``extras['position_id']`` mirror is
+          — the core one-way emulator writes one BEFORE amending an exit's
+          bracket onto that leg, so a protective fill on the leg is an owning
+          exit's;
+        * live ENTRY rows of this run whose ``extras['position_id']`` mirror is
           this ``positionId`` — the run holds open exposure in the netted
           position, whose protective levels are the ones this run last amended.
+
+        Without the first proof, the entries of the other two are returned
+        together. The core merges every owning exit's levels into the leg's
+        one protection, so a leg several exits own cannot tell which entry its
+        protective close served. Neither can a close of exposure that entries
+        other than the protection's owner hold too: the journal retires a
+        partial close from the oldest rows of the position
+        (:meth:`~_ProtectionMixin._retire_partial_close_exposure`), so naming
+        the protection's owner would settle the engine's bindings of a
+        different entry than the journal it restores them from. With several
+        entries the caller attributes the close to none of them, and the core
+        settles it oldest first, as the journal does.
 
         Deliberately last in :meth:`_resolve_identity`: the run-unique handles
         (``order_id`` ref, own close dispatch) are tried first, and a
         ``positionId`` matching NOTHING this run owns still falls through to
         external activity. A malformed persisted id is skipped rather than
         raised on — one bad extras blob must not veto the attribution of the
-        remaining rows (or kill the PUSH stream).
+        remaining rows (or kill the PUSH stream); the leg's opening entry is
+        then not proven, and the other proofs decide.
 
         :param position_id: The closing execution's ``positionId``.
-        :return: The owning entry's Pine id, or ``None`` when unowned.
+        :return: The owning entries' Pine ids (sorted; one when the owner is
+            known), or ``None`` when the run owns nothing of the position.
         """
         if self.store_ctx is None:
             return None
+        try:
+            opened_by = self._leg_entry_ids().get(position_id)
+        except ValueError:
+            opened_by = None
+        if opened_by is not None:
+            return (opened_by,)
+        owners: set[str] = set()
         for row in iter_active_bracket_ownerships(self.store_ctx):
             leg_id = (row.extras or {}).get(EXTRAS_KEY_BRACKET_OWN_LEG_ID)
             if leg_id is None or not row.from_entry:
                 continue
             try:
                 if parse_protocol_id(leg_id, field='bracket_own_leg_id') == position_id:
-                    return row.from_entry
+                    owners.add(row.from_entry)
             except ValueError:
                 continue
         for row in self.store_ctx.iter_live_orders():
@@ -849,10 +911,10 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                 continue
             try:
                 if parse_protocol_id(raw, field='position_id') == position_id:
-                    return row.pine_entry_id
+                    owners.add(row.pine_entry_id)
             except ValueError:
                 continue
-        return None
+        return tuple(sorted(owners)) if owners else None
 
     def _recover_parked_entry_by_coid(self, order) -> str | None:
         """Reverse-map a parked entry fill the order/position ref index missed.

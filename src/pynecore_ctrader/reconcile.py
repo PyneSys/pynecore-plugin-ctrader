@@ -579,8 +579,11 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         truth. That can be more than the shortfall when the venue counts
         another party's exposure too (a NETTING position); never less. Each
         deal that took part of the share is delivered for that part as a close
-        fill of the position's entry (:meth:`_recovered_close_event`), the
-        fill the PUSH stream would have delivered. A shrink a
+        fill (:meth:`_recovered_close_event`), the fill the PUSH stream would
+        have delivered, under the identity the PUSH path gives it
+        (:meth:`_recovered_close_identity`); its part is retired from the
+        entry the core settles it against first, and a shortfall no deal
+        explains from the rows oldest first. A shrink a
         restart found and the startup baseline already retired
         (:attr:`_startup_shrinks`) is judged once, against the share the
         journal held before, and whatever the deals took beyond the baseline
@@ -660,19 +663,52 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 read_started_at=read_started_at)
             if replay is not None:
                 rows = self._position_entry_rows(position_id)
+                booked = [(deal, cents, self._recovered_close_identity(position_id, deal))
+                          for deal, cents in replay.booked]
                 if rows:
                     events.extend(
-                        self._recovered_close_event(rows[0], deal, cents)
-                        for deal, cents in replay.booked
+                        self._recovered_close_event(rows[0], deal, cents, from_entry=label)
+                        for deal, cents, (label, _settle) in booked
                         if deal.deal_id not in self._seen_deal_ids)
                 self._seen_deal_ids.update(deal.deal_id for deal, _cents in replay.booked)
                 self._shrink_judged.add((position_id, key))
                 self._shrink_watch.pop(position_id, None)
                 self._cover_closes(position_id, read_started_at)
-                retired = max(share - venue, volume_to_units(replay.taken))
-                self._retire_partial_close_exposure(
-                    position_id, retired, source='position_shrink')
+                debited = 0.0
+                for _deal, cents, (_label, settle) in booked:
+                    debited += sum(volume for _coid, volume in self._retire_partial_close_exposure(
+                        position_id, volume_to_units(cents), source='position_shrink',
+                        entry_id=settle))
+                rest = max(share - venue, volume_to_units(replay.taken)) - debited
+                if rest > _VOLUME_TOL:
+                    self._retire_partial_close_exposure(
+                        position_id, rest, source='position_shrink')
         return events
+
+    def _recovered_close_identity(
+            self, position_id: int, deal: _PositionDeal,
+    ) -> tuple[str | None, str | None]:
+        """The label and settlement entry of a closing deal a shrink pass recovered.
+
+        The identity the PUSH path gives the same fill: a close of the run
+        the deal belongs to (:meth:`_own_close_of_deal`) gives its own label
+        and the entry recorded with it; otherwise the run's exposure in the
+        position does, naming its entry only when one entry holds it
+        (:meth:`_run_owned_position_entry`). With several entries the close
+        names none, and the core settles it oldest first, as the journal
+        retires it.
+
+        :param position_id: The position the deal closed volume of.
+        :param deal: The closing deal from the position's deal history.
+        :return: ``(from_entry, settle_entry)``.
+        """
+        record = self._own_close_of_deal(
+            position_id, deal, self._judged_close_origins.get(deal.deal_id))
+        if record is not None:
+            return record.from_entry, record.settle_entry
+        owners = self._run_owned_position_entry(position_id)
+        owner = owners[0] if owners is not None and len(owners) == 1 else None
+        return owner, owner
 
     def _cover_closes(self, position_id: int, read_started_at: float) -> None:
         """A pass retired a position's closes from the journal without their events.
@@ -1134,7 +1170,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     if replay is None:
                         return MissingConfirmation(MissingResolution.INCONCLUSIVE)
                     close_events = tuple(
-                        self._recovered_close_event(row, deal, cents)
+                        self._recovered_close_event(
+                            row, deal, cents, from_entry=row.pine_entry_id)
                         for deal, cents in replay.booked
                         if deal.deal_id not in self._seen_deal_ids)
                 # Register the entry fills AND the closing deals: the
@@ -1591,7 +1628,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 timestamp=(deal.executionTimestamp / 1000.0
                            if deal.executionTimestamp else now_ts),
             ))
-        events.extend(self._recovered_close_event(row, close, cents)
+        events.extend(self._recovered_close_event(row, close, cents,
+                                                  from_entry=row.pine_entry_id)
                       for close, cents in closes if close.deal_id not in self._seen_deal_ids)
         return events
 
@@ -1886,18 +1924,21 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
 
     @staticmethod
     def _recovered_close_event(
-            row: 'OrderRow', deal: _PositionDeal, cents: int,
+            row: 'OrderRow', deal: _PositionDeal, cents: int, *,
+            from_entry: str | None,
     ) -> OrderEvent:
         """Build the close fill of a closing deal the PUSH stream missed.
 
         Shaped like the PUSH path's event for the same execution: a close leg
-        of the row's entry carrying the deal id as its fill id, for the part
-        of the bot's share the deal took, at the deal's price, with the
+        labelled ``from_entry`` carrying the deal id as its fill id, for the
+        part of the bot's share the deal took, at the deal's price, with the
         deal's commission prorated to that part.
 
-        :param row: The retired entry row the close belongs to.
+        :param row: An entry row of the position the deal closed.
         :param deal: The closing deal from the position's deal history.
         :param cents: The part of the bot's share the deal took (cents).
+        :param from_entry: The close's label: the entry it closes, a close
+            of the run's own label, or ``None`` for an unbound close.
         """
         qty = volume_to_units(cents)
         fee = deal.fee * cents / deal.filled if deal.filled else 0.0
@@ -1912,7 +1953,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 reduce_only=True,
             ),
             event_type='filled', fill_price=price, fill_qty=qty, timestamp=timestamp,
-            from_entry=row.pine_entry_id, leg_type=LegType.CLOSE, fee=fee,
+            from_entry=from_entry, leg_type=LegType.CLOSE, fee=fee,
             fill_id=str(deal.deal_id),
         )
 

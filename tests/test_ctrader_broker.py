@@ -15,6 +15,7 @@ from pynecore.core.broker.exceptions import (
     UnexpectedCancelError,
     VenueWritesQuarantinedError,
 )
+from pynecore.core.broker.idempotency import KIND_CANCEL
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REJECTED,
     VENUE_DRIVEN_CANCEL_REASONS,
@@ -31,6 +32,7 @@ from pynecore.core.broker.models import (
     QuarantineKind,
 )
 from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
+from pynecore.core.broker.one_way_emulator import OneWayEmulator
 from pynecore.core.broker.protection_guard import ProtectionLevels, rebaseline_after_resume
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
@@ -1113,6 +1115,105 @@ def __test_venue_close_on_unowned_position_stays_external__(tmp_path):
     assert ignored[0]['position_id'] == 99999999
 
 
+def _co_own_leg(broker, *, from_entry, intent_key, position_id=54302872) -> None:
+    create_bracket_ownership_row(
+        broker.store_ctx, coid=f'bo:{intent_key}:{position_id}', symbol='EURUSD',
+        side='sell', qty=10.0, intent_key=intent_key, pine_entry_id='exit',
+        from_entry=from_entry, leg_id=str(position_id), attach_coid='attach-1',
+        tp_price=None, sl_price=1.05, trail_price=None, trail_offset=None,
+    )
+
+
+def __test_venue_close_on_a_hedged_leg_goes_to_the_entry_that_opened_it__(tmp_path):
+    """Several exits own one leg (the core merges their levels into its one
+    protection), but the leg's own entry row proves which entry it holds:
+    that proof wins over the ownership rows, whichever of them comes first."""
+    broker = _FakeBroker()
+    broker._hedging_enabled = True
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, pine_id='L2')
+    _co_own_leg(broker, from_entry='L1', intent_key='X1\0L1')
+    _co_own_leg(broker, from_entry='L2', intent_key='X2\0L2')
+
+    out = broker._translate_exec_event(
+        _venue_bracket_close_event(position_id=54302872))
+
+    assert out is not None
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry == 'L2'
+    [audit] = _store_events(broker, 'venue_close_attributed_to_entry')
+    assert audit['owner_entries'] == ['L2']
+
+
+@pytest.mark.parametrize('hedged', [True, False])
+def __test_venue_close_of_a_leg_several_entries_own_names_no_entry__(tmp_path, hedged):
+    """No entry row proves the leg's entry (a netting position, or a hedged
+    leg the journal cannot attribute) and the ownership rows name two
+    entries: the close is not given to either, but it is still the run's
+    close and is booked as a reduction of the position."""
+    broker = _FakeBroker()
+    broker._hedging_enabled = hedged
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    _co_own_leg(broker, from_entry='L2', intent_key='X2\0L2')
+    _co_own_leg(broker, from_entry='L1', intent_key='X1\0L1')
+
+    out = broker._translate_exec_event(
+        _venue_bracket_close_event(position_id=54302872))
+
+    assert out is not None
+    assert out.event_type == 'filled'
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry is None and out.pine_id is None
+    assert out.fill_qty == pytest.approx(10.0)
+    assert _ignored_external(broker) == []
+    [audit] = _store_events(broker, 'venue_close_attributed_to_entry')
+    assert audit['from_entry'] is None
+    assert audit['owner_entries'] == ['L1', 'L2']
+
+
+def __test_venue_close_of_a_netted_position_names_no_entry_when_others_hold_it_too__(tmp_path):
+    """One exit owns the netted position's protection, but an older entry
+    holds exposure in it too. The journal retires the close from the oldest
+    rows, so naming the protection's owner would settle a different entry's
+    bindings in the engine than in the journal it restores them from: the
+    close is booked as a reduction without an entry."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    _co_own_leg(broker, from_entry='L2', intent_key='X2\0L2')
+
+    out = broker._translate_exec_event(
+        _venue_bracket_close_event(position_id=54302872))
+
+    assert out is not None
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry is None
+    assert _ignored_external(broker) == []
+    [audit] = _store_events(broker, 'venue_close_attributed_to_entry')
+    assert audit['from_entry'] is None
+    assert audit['owner_entries'] == ['L1', 'L2']
+
+
+def __test_venue_close_of_a_netted_position_two_entries_hold_names_no_entry__(tmp_path):
+    """Without ownership rows the entry rows decide; two entries holding the
+    netted position cannot tell which one the protective close served."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+
+    out = broker._translate_exec_event(
+        _venue_bracket_close_event(position_id=54302872))
+
+    assert out is not None
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry is None
+    assert _ignored_external(broker) == []
+
+
 def _partial_close_event(*, position_id, deal_id, closed_cents, remaining_cents,
                          order_id=70215164):
     """A run-owned close fill that leaves the position OPEN with a remainder."""
@@ -1235,6 +1336,54 @@ def __test_partial_close_retire_reduces_pyramid_rows_fifo__(tmp_path):
     assert (first.extras or {})['journal_exposure_retired'] == pytest.approx(4.0)
     assert (second.extras or {})['journal_exposure_retired'] == pytest.approx(1.0)
     assert first.filled_qty == 4.0 and second.filled_qty == 6.0
+
+
+def __test_partial_close_naming_an_entry_retires_that_entrys_rows_first__(tmp_path):
+    """A partial close of one entry of a netted pyramid retires that entry's row.
+
+    The core settles a close the event names an entry for against that entry's
+    bindings first. Retiring the oldest row instead would leave the restart
+    journal holding the closed entry's exposure under the other entry.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker.store_ctx.upsert_order('c1', filled_qty=4.0)
+    broker.store_ctx.upsert_order('c2', filled_qty=6.0)
+    # The run's close of L2, which the venue named order 70215164.
+    broker._close_dispatch_pine_by_position[54302872] = 'L2'
+    broker._close_settle_entry_by_position[54302872] = 'L2'
+    broker._settle_own_close(broker._open_own_close(54302872), 70215164)
+
+    out = broker._translate_exec_event(_partial_close_event(
+        position_id=54302872, deal_id=65, closed_cents=500,
+        remaining_cents=500))
+
+    assert out is not None
+    assert out.leg_type is LegType.CLOSE
+    assert out.from_entry == 'L2'
+    first = broker.store_ctx.get_order('c1')
+    second = broker.store_ctx.get_order('c2')
+    assert 'journal_exposure_retired' not in (first.extras or {})
+    assert (second.extras or {})['journal_exposure_retired'] == pytest.approx(5.0)
+
+
+def __test_partial_close_naming_an_entry_spills_the_rest_oldest_first__(tmp_path):
+    """What the named entry's rows cannot absorb goes to the other rows FIFO."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker.store_ctx.upsert_order('c1', filled_qty=4.0)
+    broker.store_ctx.upsert_order('c2', filled_qty=6.0)
+
+    broker._retire_partial_close_exposure(54302872, 8.0, entry_id='L2')
+
+    first = broker.store_ctx.get_order('c1')
+    second = broker.store_ctx.get_order('c2')
+    assert (second.extras or {})['journal_exposure_retired'] == pytest.approx(6.0)
+    assert (first.extras or {})['journal_exposure_retired'] == pytest.approx(2.0)
 
 
 def __test_full_close_still_retires_the_rows_wholesale__(tmp_path):
@@ -1396,6 +1545,172 @@ def __test_fetch_raw_positions_excludes_foreign_run_leg__(tmp_path):
     _own_entry_row(broker, coid='c1', position_id=1)
     legs = asyncio.run(broker.fetch_raw_positions("EURUSD"))
     assert [leg.leg_id for leg in legs] == ["1"]
+
+
+def _entry_row(broker, *, coid, pine_id, position_id=None, exchange_order_id=None,
+               qty=10.0, **extras):
+    """Seed a live, filled entry row of ``pine_id`` linked as a fill would link it."""
+    create_entry_order_row(
+        broker.store_ctx, coid=coid, symbol='EURUSD', side='buy', qty=qty,
+        intent_key=coid, pine_entry_id=pine_id,
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    row_extras = {'kind': 'position', 'order_type': 'market', **extras}
+    if position_id is not None:
+        row_extras['position_id'] = position_id
+    broker.store_ctx.upsert_order(
+        coid, state='confirmed', filled_qty=qty,
+        exchange_order_id=exchange_order_id or (
+            str(position_id) if position_id is not None else None),
+        extras=row_extras,
+    )
+
+
+def __test_fetch_raw_positions_attributes_hedged_legs_to_their_entries__(tmp_path):
+    # HEDGED: every entry order opens its own position, and the entry row
+    # records the positionId its order opened. Each leg names its own entry,
+    # also when the same Pine id was pyramided into several orders.
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, open_ts=1000),
+        _position(position_id=2, volume=1000, open_ts=2000),
+        _position(position_id=3, volume=1000, open_ts=3000),
+    )
+    _open_store(tmp_path, broker)
+    _entry_row(broker, coid='c1', pine_id='L1', position_id=1)
+    _entry_row(broker, coid='c2', pine_id='L2', position_id=2)
+    _entry_row(broker, coid='c3', pine_id='L2', position_id=3)
+    legs = asyncio.run(broker.fetch_raw_positions("EURUSD"))
+    assert [(leg.leg_id, leg.entry_id) for leg in legs] == [
+        ("1", "L1"), ("2", "L2"), ("3", "L2")]
+
+
+def __test_fetch_raw_positions_attribution_survives_a_partial_close__(tmp_path):
+    # A partial close keeps the entry row live (its retired exposure is
+    # counted on the row), so the reduced leg still names its entry.
+    broker = _hedged_broker(_position(position_id=1, volume=400, open_ts=1000))
+    _open_store(tmp_path, broker)
+    _entry_row(broker, coid='c1', pine_id='L1', position_id=1,
+               journal_exposure_retired=6.0)
+    legs = asyncio.run(broker.fetch_raw_positions("EURUSD"))
+    assert [(leg.leg_id, leg.qty, leg.entry_id) for leg in legs] == [("1", 4.0, "L1")]
+
+
+def __test_fetch_raw_positions_leaves_uncertain_legs_unattributed__(tmp_path):
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, open_ts=1000),
+        _position(position_id=2, volume=1000, open_ts=2000),
+        _position(position_id=3, volume=1000, open_ts=3000),
+        _position(position_id=4, volume=1000, open_ts=4000),
+        _position(position_id=5, volume=1000, open_ts=5000),
+        _position(position_id=6, volume=1000, open_ts=6000),
+    )
+    _open_store(tmp_path, broker)
+    # Two different entries linked to one position.
+    _entry_row(broker, coid='c1a', pine_id='L1', position_id=1)
+    _entry_row(broker, coid='c1b', pine_id='L3', position_id=1)
+    # A startup-adopted own leg: the records of the order that opened it are gone.
+    _entry_row(broker, coid='c2', pine_id='__adopted_startup__', position_id=2,
+               recovered_own_leg=True)
+    # A row of the entry next to the adopted leg's row on the same position.
+    _entry_row(broker, coid='c3a', pine_id='L3', position_id=3)
+    _entry_row(broker, coid='c3b', pine_id='__adopted_startup__', position_id=3,
+               recovered_own_leg=True)
+    # Linked only through the ``exchange_order_id`` fallback.
+    _entry_row(broker, coid='c4', pine_id='L4', exchange_order_id='4')
+    # An entry row naming no Pine id.
+    _entry_row(broker, coid='c5', pine_id=None, position_id=5)
+    # Owned only through a pending own close, with no entry row.
+    broker._close_dispatch_pine_by_position[6] = 'X'
+    legs = asyncio.run(broker.fetch_raw_positions("EURUSD"))
+    assert [(leg.leg_id, leg.entry_id) for leg in legs] == [
+        ("1", None), ("2", None), ("3", None), ("4", None), ("5", None), ("6", None)]
+
+
+def __test_fetch_raw_positions_never_attributes_a_netting_position__(tmp_path):
+    # A netting position merges every entry (and any foreign or adopted
+    # exposure of the symbol), so it never names one entry.
+    res = _oa.ProtoOAReconcileRes()
+    res.position.append(_position(position_id=1, volume=1000))
+    broker = _FakeBroker(reconcile=res)
+    _open_store(tmp_path, broker)
+    _entry_row(broker, coid='c1', pine_id='L1', position_id=1)
+    legs = asyncio.run(broker.fetch_raw_positions("EURUSD"))
+    assert [(leg.leg_id, leg.entry_id) for leg in legs] == [("1", None)]
+
+
+def _exit_envelope(pine_id, from_entry, *, tp=None, sl=None):
+    intent = ExitIntent(pine_id=pine_id, from_entry=from_entry, symbol="EURUSD",
+                        side="sell", qty=10.0, tp_price=tp, sl_price=sl)
+    return _envelope(intent)
+
+
+def _last_amend_by_position(broker) -> dict[int, tuple[float | None, float | None]]:
+    """The (take-profit, stop-loss) each position's latest amend left on it."""
+    levels: dict[int, tuple[float | None, float | None]] = {}
+    for req in broker.sent:
+        if isinstance(req, _oa.ProtoOAAmendPositionSLTPReq):
+            levels[req.positionId] = (
+                req.takeProfit if req.HasField('takeProfit') else None,
+                req.stopLoss if req.HasField('stopLoss') else None,
+            )
+    return levels
+
+
+def __test_pyramided_entries_keep_their_own_exit_levels_per_leg__(tmp_path):
+    # Three pyramided entries, each on its own HEDGED leg with its own exit.
+    # The core emulator targets every exit at its entry's leg through the
+    # attribution, so each leg carries only its own exit's levels.
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, open_ts=1000),
+        _position(position_id=2, volume=1000, open_ts=2000),
+        _position(position_id=3, volume=1000, open_ts=3000),
+    )
+    _open_store(tmp_path, broker)
+    for index in (1, 2, 3):
+        _entry_row(broker, coid=f'c{index}', pine_id=f'L{index}', position_id=index)
+    emulator = OneWayEmulator(broker.store_ctx, mintick=0.00001)
+    for index in (1, 2, 3):
+        result = asyncio.run(emulator.run_exit_bracket(
+            _exit_envelope(f'X{index}', f'L{index}', tp=1.30 + index / 100,
+                           sl=1.10 + index / 100), broker))
+        assert result.legs == (str(index),)
+    assert _last_amend_by_position(broker) == {
+        1: (1.31, 1.11), 2: (1.32, 1.12), 3: (1.33, 1.13)}
+
+    # Retiring the second entry's exit clears only its own leg.
+    broker.sent.clear()
+    cleared = asyncio.run(emulator.run_exit_bracket_clear(
+        _envelope(CancelIntent(pine_id='X2', symbol='EURUSD', from_entry='L2')), broker))
+    assert cleared.legs == ("2",)
+    assert _last_amend_by_position(broker) == {2: (None, None)}
+
+
+def __test_retiring_a_co_owning_exit_reasserts_the_remaining_levels__(tmp_path):
+    # Each leg carries its entry's exit plus a stop of an exit without a
+    # ``from_entry`` that covers every leg. Retiring that exit re-amends every
+    # leg to its remaining owner's levels under the cancel's coid: a clear that
+    # carries levels is a full-replacement amend, not a clear of the leg.
+    broker = _hedged_broker(
+        _position(position_id=1, volume=1000, open_ts=1000),
+        _position(position_id=2, volume=1000, open_ts=2000),
+    )
+    _open_store(tmp_path, broker)
+    for index in (1, 2):
+        _entry_row(broker, coid=f'c{index}', pine_id=f'L{index}', position_id=index)
+    emulator = OneWayEmulator(broker.store_ctx, mintick=0.00001)
+    for index in (1, 2):
+        asyncio.run(emulator.run_exit_bracket(
+            _exit_envelope(f'X{index}', f'L{index}', tp=1.30 + index / 100), broker))
+    asyncio.run(emulator.run_exit_bracket(_exit_envelope('S', '', sl=1.15), broker))
+    assert _last_amend_by_position(broker) == {1: (1.31, 1.15), 2: (1.32, 1.15)}
+
+    broker.sent.clear()
+    cancel = _envelope(CancelIntent(pine_id='S', symbol='EURUSD'))
+    cleared = asyncio.run(emulator.run_exit_bracket_clear(cancel, broker))
+    assert sorted(cleared.legs) == ["1", "2"]
+    assert _last_amend_by_position(broker) == {1: (1.31, None), 2: (1.32, None)}
+    assert len(broker.sent) == 2
+    assert broker.coid_at_dispatch == cancel.client_order_id(KIND_CANCEL)
 
 
 def __test_get_position_excludes_foreign_run_leg_netting__(tmp_path):
@@ -1567,6 +1882,49 @@ def __test_amend_bracket_clear_of_a_bare_position_is_an_idempotent_noop__():
     ))
     amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
     assert len(amends) == 1
+
+
+class _FirstAmendNothingToAmendBroker(_FakeBroker):
+    """Answers only the first SL/TP amend with ``Nothing to amend``."""
+
+    async def _dispatch_order(self, req, *, coid, context, predecessor_cancel_ids=None):
+        first = not any(isinstance(r, _oa.ProtoOAAmendPositionSLTPReq) for r in self.sent)
+        self._raise_on_dispatch = None
+        if first and isinstance(req, _oa.ProtoOAAmendPositionSLTPReq):
+            reject = ExchangeOrderRejectedError("cTrader rejected the order: Nothing to amend.")
+            reject.__cause__ = CTraderProtocolError("INVALID_REQUEST", "Nothing to amend.")
+            self._raise_on_dispatch = reject
+        return await super()._dispatch_order(
+            req, coid=coid, context=context, predecessor_cancel_ids=predecessor_cancel_ids)
+
+
+def __test_amend_bracket_clear_continues_when_the_trailing_disable_has_nothing_to_amend__():
+    """The trailing-disable step of a clear answering ``Nothing to amend`` (the
+    flag was already off) leaves the stop armed: the clear itself must still
+    be sent, and the position is bare only once it landed."""
+    position = _model.ProtoOAPosition(
+        positionId=3,
+        positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+        stopLoss=1.1,
+        trailingStopLoss=True,
+        tradeData=_model.ProtoOATradeData(
+            symbolId=1,
+            volume=1000,
+            tradeSide=_model.ProtoOATradeSide.BUY,
+        ),
+    )
+    broker = _FirstAmendNothingToAmendBroker(
+        reconcile=_oa.ProtoOAReconcileRes(position=[position]))
+    asyncio.run(broker.amend_bracket(
+        "EURUSD", "3", side="sell", tp_price=None, sl_price=None,
+        trail_offset=None, coid="coid-clear-trailing",
+    ))
+    amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
+    assert len(amends) == 2
+    assert amends[0].trailingStopLoss is False
+    set_fields = {f.name for f, _ in amends[1].ListFields()}
+    assert set_fields.isdisjoint({"stopLoss", "takeProfit", "trailingStopLoss"})
+    assert broker._is_bare(3)
 
 
 def __test_reject_out_of_range_below_min_skips__():
@@ -5119,6 +5477,249 @@ def __test_netting_foreign_close_taken_for_a_refused_own_close_is_rebooked__(tmp
     assert audits[0]['restored'] == pytest.approx(10.0)
 
 
+def __test_netting_rebooked_claim_gives_back_its_own_entry_s_debit__(tmp_path):
+    """L1 and L2 hold 10 each; L2 already closed 5 of its own. The bot closes 5
+    of L1; meanwhile the other party closes its own 15, that fill is taken for
+    the bot's close and debited from L1, and the bot's close is refused. The
+    give-back must undo L1's debit, never L2's earlier one: the totals agree
+    either way, but a restart would rebuild the entries the wrong way round."""
+    broker = _merged_broker(tmp_path, venue_cents=3000, share=10.0)
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    extras = dict(broker.store_ctx.get_order('c2').extras or {})
+    extras['journal_exposure_retired'] = 5.0
+    broker.store_ctx.upsert_order('c2', extras=extras)
+    assert broker._own_share(_PID) == pytest.approx(15.0)
+    calls = _spy_quarantine(broker)
+    seen: list = []
+
+    async def foreign_fill_in_flight(_req):
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=1500, remaining_cents=1500)))
+        broker._raise_on_dispatch = _position_locked_reject()
+
+    broker.on_dispatch = foreign_fill_in_flight
+    broker.on_unexpected_cancel = 'ignore'
+    with pytest.raises(OrderSkippedByPlugin):
+        asyncio.run(broker.execute_close(_envelope(CloseIntent(
+            pine_id="L1", symbol="EURUSD", side="sell", qty=5.0))))
+    seen.extend(_released(broker))
+    broker._flush_external_interventions()
+
+    assert seen == [None]
+    assert calls == []
+    assert _retired(broker, 'c1') == pytest.approx(0.0)
+    assert _retired(broker, 'c2') == pytest.approx(5.0)
+    assert broker._own_share(_PID) == pytest.approx(15.0)
+
+
+def __test_netting_partial_trigger_close_retires_its_target_entry_first__(tmp_path):
+    """An engine-made partial close carries a synthetic label; the core settles
+    it against its ``target_entry_id``, so the journal must debit that entry's
+    row, not the oldest one."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID, volume=2000))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    asyncio.run(broker.execute_close(_envelope(CloseIntent(
+        pine_id="__pyne_partial__L2", symbol="EURUSD", side="sell", qty=5.0,
+        synthetic_kind='partial_trigger', target_entry_id='L2'))))
+
+    out = broker._translate_exec_event(_closing_fill(
+        order_id=889, closed_cents=500, remaining_cents=1500, deal_id=8891))
+
+    assert out is not None and out.leg_type is LegType.CLOSE
+    assert out.from_entry == '__pyne_partial__L2'
+    assert _retired(broker, 'c1') == pytest.approx(0.0)
+    assert _retired(broker, 'c2') == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize(('first', 'second', 'debited', 'kept'), [
+    (CloseIntent(pine_id="L1", symbol="EURUSD", side="sell", qty=5.0),
+     CloseIntent(pine_id="__pyne_partial__L2", symbol="EURUSD", side="sell", qty=5.0,
+                 synthetic_kind='partial_trigger', target_entry_id='L2'),
+     'c1', 'c2'),
+    (CloseIntent(pine_id="__pyne_partial__L2", symbol="EURUSD", side="sell", qty=5.0,
+                 synthetic_kind='partial_trigger', target_entry_id='L2'),
+     CloseIntent(pine_id="__pyne_partial__L1", symbol="EURUSD", side="sell", qty=5.0,
+                 synthetic_kind='partial_trigger', target_entry_id='L1'),
+     'c2', 'c1'),
+])
+def __test_netting_delayed_fill_settles_its_own_close_s_entry__(
+        tmp_path, first, second, debited, kept):
+    """The bot sends a close (order 889), then another close of a different
+    entry (order 890) on the same position; the fill of 889 arrives only after
+    that. It is still the first close's: its event carries that close's label
+    and the journal debits the entry it settles, never the later close's."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID, volume=2000))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    asyncio.run(broker.execute_close(_envelope(first)))
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=890, position_id=_PID, closing=True))
+    asyncio.run(broker.execute_close(_envelope(second)))
+
+    out = broker._translate_exec_event(_closing_fill(
+        order_id=889, closed_cents=500, remaining_cents=1500, deal_id=8891))
+
+    assert out is not None and out.leg_type is LegType.CLOSE
+    assert out.from_entry == first.pine_id
+    assert _retired(broker, debited) == pytest.approx(5.0)
+    assert _retired(broker, kept) == pytest.approx(0.0)
+
+
+def __test_netting_refused_close_lends_no_target_to_a_later_fill__(tmp_path):
+    """The bot's engine-made close of L2 is refused; later another party's
+    order closes 5 units of the position. Nothing of the refused close is
+    left to claim that fill: its event does not carry the refused close's
+    label, and the journal debits the oldest entry, as the core settles a
+    close that names no entry, never the refused close's target."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID, volume=2000))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker._raise_on_dispatch = _position_locked_reject()
+    broker.on_unexpected_cancel = 'ignore'
+    with pytest.raises(OrderSkippedByPlugin):
+        asyncio.run(broker.execute_close(_envelope(CloseIntent(
+            pine_id="__pyne_partial__L2", symbol="EURUSD", side="sell", qty=5.0,
+            synthetic_kind='partial_trigger', target_entry_id='L2'))))
+    broker._raise_on_dispatch = None
+
+    out = broker._translate_exec_event(_closing_fill(
+        order_id=70700000, closed_cents=500, remaining_cents=1500, deal_id=7071))
+
+    assert out is not None and out.leg_type is LegType.CLOSE
+    assert out.from_entry is None
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize('answer', ['refused', 'other_order'])
+def __test_netting_foreign_fill_taken_for_an_own_close_loses_its_label__(tmp_path, answer):
+    """The bot's engine-made close of L2 is in flight when another party's
+    order closes 5 units of the position; the close takes that fill as its
+    own, labelled and debited for L2. Its answer (a refusal, or a different
+    order id) shows the fill was not the bot's: the held event is delivered
+    without the close's label, and the journal debit moves to the oldest
+    entry, as for a close the run did not send."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID, volume=2000))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker.on_unexpected_cancel = 'ignore'
+    seen: list = []
+
+    async def foreign_fill_in_flight(_req):
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=500, remaining_cents=1500, deal_id=7071)))
+        assert _retired(broker, 'c2') == pytest.approx(5.0)
+        if answer == 'refused':
+            broker._raise_on_dispatch = _position_locked_reject()
+
+    broker.on_dispatch = foreign_fill_in_flight
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    intent = CloseIntent(
+        pine_id="__pyne_partial__L2", symbol="EURUSD", side="sell", qty=5.0,
+        synthetic_kind='partial_trigger', target_entry_id='L2')
+    if answer == 'refused':
+        with pytest.raises(OrderSkippedByPlugin):
+            asyncio.run(broker.execute_close(_envelope(intent)))
+    else:
+        asyncio.run(broker.execute_close(_envelope(intent)))
+    broker.on_dispatch = None
+    broker._raise_on_dispatch = None
+    seen.extend(_released(broker))
+
+    assert seen[0] is None
+    delivered = [event for event in seen[1:] if event is not None]
+    assert len(delivered) == 1 and delivered[0].leg_type is LegType.CLOSE
+    assert delivered[0].from_entry is None
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+
+
+def __test_netting_reattributed_fill_replays_the_held_debits_in_release_order__(tmp_path):
+    """L1 and L2 hold 10 each. The bot's engine-made close of L2 (20 units)
+    is in flight when another party's order closes 8 and the bot's own close
+    order then fills 5; both fills are held and debited for L2 first. The
+    answer shows the 8 were not the bot's: the core settles them against the
+    oldest entry and the bot's 5 against L2, so the journal must end with 8
+    off L1 and 5 off L2, not the provisional order's allocation."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID, volume=2000))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker.on_unexpected_cancel = 'ignore'
+    seen: list = []
+
+    async def fills_in_flight(_req):
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=800, remaining_cents=1200, deal_id=7071)))
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=889, closed_cents=500, remaining_cents=700, deal_id=8891,
+            partial=True)))
+
+    broker.on_dispatch = fills_in_flight
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    asyncio.run(broker.execute_close(_envelope(CloseIntent(
+        pine_id="__pyne_partial__L2", symbol="EURUSD", side="sell", qty=20.0,
+        synthetic_kind='partial_trigger', target_entry_id='L2'))))
+    broker.on_dispatch = None
+    seen.extend(_released(broker))
+
+    assert seen[:2] == [None, None]
+    delivered = [(event.from_entry, event.fill_qty) for event in seen[2:] if event is not None]
+    assert delivered == [(None, pytest.approx(8.0)), ('__pyne_partial__L2', pytest.approx(5.0))]
+    assert _retired(broker, 'c1') == pytest.approx(8.0)
+    assert _retired(broker, 'c2') == pytest.approx(5.0)
+
+
+def __test_netting_venue_close_during_an_own_close_takes_no_label_from_it__(tmp_path):
+    """The bot's engine-made close of L2 is in flight when the position's
+    SL / TP fires for 5 units. The venue's close is never the bot's close:
+    it does not carry that close's label, and the journal debits the oldest
+    entry, as for any venue close of a position two entries hold."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID, volume=2000))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker, coid='c1', pine_id='L1')
+    _seed_owned_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    broker.on_unexpected_cancel = 'ignore'
+    seen: list = []
+
+    async def venue_fill_in_flight(_req):
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=500, remaining_cents=1500, deal_id=7071,
+            order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)))
+
+    broker.on_dispatch = venue_fill_in_flight
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    asyncio.run(broker.execute_close(_envelope(CloseIntent(
+        pine_id="__pyne_partial__L2", symbol="EURUSD", side="sell", qty=5.0,
+        synthetic_kind='partial_trigger', target_entry_id='L2'))))
+    broker.on_dispatch = None
+    seen.extend(_released(broker))
+
+    delivered = [event for event in seen if event is not None]
+    assert len(delivered) == 1 and delivered[0].leg_type is LegType.CLOSE
+    assert delivered[0].from_entry is None
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+
+
 def __test_netting_foreign_close_taken_for_a_cancelled_own_close_is_rebooked__(tmp_path):
     """The bot holds 20 of 40 and closes 10; meanwhile the other party closes
     exactly its own 20, the venue accepts the bot's close and later cancels
@@ -5905,6 +6506,89 @@ def __test_own_clear_repeated_on_a_position_its_first_clear_left_bare_is_no_edit
     for _ in range(2):
         _snapshot_pass(broker)
     assert len(calls) == 1
+
+
+def _guard_state(broker) -> tuple:
+    """The protection bookkeeping one amend of position ``_PID`` leaves behind."""
+    key = f"position:{_PID}"
+    saved = dict((broker.store_ctx.get_order('c1').extras or {})['protection_levels'])
+    saved.pop('written_at', None)
+    return (saved, key in broker._protection_baselined, _PID in broker._bare_positions,
+            _PID in broker._unguarded_protection, broker._protection_in_flight.get(key),
+            broker._own_protection_levels.get(key))
+
+
+def _merged_amend(broker, *, sl, tp, trail_offset=None) -> None:
+    asyncio.run(broker.amend_bracket(
+        "EURUSD", str(_PID), side="sell", tp_price=tp, sl_price=sl,
+        trail_offset=trail_offset, coid="coid-merged"))
+
+
+@pytest.mark.parametrize('levels', [(1.1, 1.3), (1.1, None), (1.05, 1.3)])
+def __test_amend_the_venue_has_nothing_to_amend_for_settles_like_a_landed_one__(
+        tmp_path, levels):
+    """The core re-sends a leg's merged protection: a co-owner's unchanged
+    level, or the leg's whole current protection. ``Nothing to amend`` says the
+    leg already carries exactly the requested levels: no reject (which would
+    flatten the position on an attach), and the guard ends where a landed
+    amend of the same levels leaves it."""
+    sl, tp = levels
+    landed = _guarded_broker(tmp_path / 'landed')
+    _merged_amend(landed, sl=sl, tp=tp)
+    answered = _guarded_broker(tmp_path / 'answered')
+    calls = _spy_quarantine(answered)
+
+    answered._raise_on_dispatch = _nothing_to_amend()
+    _merged_amend(answered, sl=sl, tp=tp)
+    answered._raise_on_dispatch = None
+
+    assert _guard_state(answered) == _guard_state(landed)
+    _set_venue(answered, sl=sl, tp=tp)
+    for _ in range(3):
+        _snapshot_pass(answered)
+    assert calls == []
+
+
+def __test_attach_the_venue_has_nothing_to_amend_for_is_no_attach_reject__(tmp_path):
+    """The attach path writes through the same guard: ``Nothing to amend``
+    returns the bracket legs instead of a reject that flattens the position."""
+    broker = _guarded_broker(tmp_path)
+    broker._raise_on_dispatch = _nothing_to_amend()
+    intent = ExitIntent(pine_id="Exit", from_entry="L", symbol="EURUSD",
+                        side="sell", qty=10.0, tp_price=1.3, sl_price=1.1)
+
+    legs = asyncio.run(broker.execute_exit(_envelope(intent)))
+
+    assert legs
+
+
+def __test_other_invalid_request_on_a_levelled_amend_still_rejects__(tmp_path):
+    """Only the ``Nothing to amend`` answer is benign: any other
+    ``INVALID_REQUEST`` stays a reject, and its levels are not the bot's."""
+    broker = _guarded_broker(tmp_path)
+    before = _guard_state(broker)[0]['writes']
+    reject = ExchangeOrderRejectedError("cTrader rejected the order: bad stop")
+    reject.__cause__ = CTraderProtocolError("INVALID_REQUEST", "Stop loss is invalid.")
+    broker._raise_on_dispatch = reject
+
+    with pytest.raises(ExchangeOrderRejectedError):
+        _merged_amend(broker, sl=1.05, tp=1.3)
+
+    assert _guard_state(broker)[0]['writes'] == before
+
+
+def __test_unguarded_write_the_venue_has_nothing_to_amend_for_counts_as_landed__(
+        tmp_path):
+    """A write outside the guard (a trailing stop without an anchor) answered
+    ``Nothing to amend`` is no reject either: it counts as landed."""
+    broker = _guarded_broker(tmp_path)
+    broker._last_bid = None
+    broker._raise_on_dispatch = _nothing_to_amend()
+
+    _merged_amend(broker, sl=None, tp=1.3, trail_offset=0.002)
+
+    assert _PID in broker._unguarded_baseline
+    assert not broker._protection_guard().known(f"position:{_PID}")
 
 
 def __test_bare_mark_from_before_an_operator_resume_is_accepted__(tmp_path):

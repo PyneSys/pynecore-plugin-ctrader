@@ -2000,9 +2000,10 @@ def __test_recovered_own_close_by_order_id_is_not_reported__(tmp_path):
 
 
 def __test_recovered_close_after_an_own_close_of_unknown_outcome_is_not_reported__(tmp_path):
-    """The run's close whose answer was lost may be the one that executed."""
+    """The run's close whose answer was lost may be the one that executed: its
+    order carries no client-order-id, as a ``ProtoOAClosePositionReq``'s never does."""
     broker, reports = _recovered_close_broker(
-        tmp_path, _closing_order(999), executed_ms=int(epoch_time() * 1000))
+        tmp_path, _closing_order(999, coid=''), executed_ms=int(epoch_time() * 1000))
     broker._settle_own_close(broker._open_own_close(222), None)
 
     _recover(broker)
@@ -2193,12 +2194,13 @@ def __test_recovered_close_an_earlier_process_sent_is_not_reported__(tmp_path):
 
 
 def __test_recovered_close_after_an_earlier_process_died_mid_close_is_not_reported__(tmp_path):
-    """The earlier process's close never got its answer: it may be the one that executed."""
+    """The earlier process's close never got its answer: it may be the one that
+    executed (its order carries no client-order-id)."""
     first, _ = _recovered_close_broker(
-        tmp_path, _closing_order(999), executed_ms=int(epoch_time() * 1000))
+        tmp_path, _closing_order(999, coid=''), executed_ms=int(epoch_time() * 1000))
     first._open_own_close(222)
 
-    restarted, reports = _restarted(tmp_path, first, _closing_order(999))
+    restarted, reports = _restarted(tmp_path, first, _closing_order(999, coid=''))
     _recover(restarted)
 
     assert 'c3' not in _live_coids(restarted)
@@ -2724,6 +2726,125 @@ def __test_netting_own_close_found_in_the_deal_history_ends_its_uncertainty__(tm
     broker._flush_external_interventions()
     assert out is not None and out.fill_qty == pytest.approx(2.0)
     assert len(reports) == 1 and reports[0][1]['booked_qty'] == pytest.approx(2.0)
+
+
+def __test_netting_shrink_books_an_own_close_of_a_newer_entry_against_that_entry__(tmp_path):
+    """L1 (order 111) and L2 (order 112) hold 10 each; the bot's engine-made
+    close of L2 (order 888, 5 units) was answered, then its fill push was
+    missed and the process restarted. The shrink pass finds the close in the
+    deal history by its order id: it is delivered under that close's label
+    and retired from L2, the entry the core settles it against, not L1."""
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=903, order_id=888, position_id=222, closed_volume=500),
+               1_700_000_003_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1500)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid, pine_id, order_id in (('c1', 'L1', '111'), ('c2', 'L2', '112')):
+        broker.store_ctx.upsert_order(
+            coid, symbol='EURUSD', side='buy', qty=10.0, filled_qty=10.0,
+            state='confirmed', pine_entry_id=pine_id, exchange_order_id='222',
+            extras={'order_id': order_id, 'position_id': 222})
+        broker.store_ctx.add_ref(coid, 'order_id', order_id)
+    broker._close_dispatch_pine_by_position[222] = '__pyne_partial__L2'
+    broker._close_settle_entry_by_position[222] = 'L2'
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 888)
+    process = _next_process(broker)
+
+    events = [event for _ in range(2) for event in _run(process)]
+    process._flush_external_interventions()
+
+    assert reports == []
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('903', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _retired(process, 'c1') == pytest.approx(0.0)
+    assert _retired(process, 'c2') == pytest.approx(5.0)
+
+
+def __test_netting_shrink_gives_a_foreign_deal_no_identity_of_an_unanswered_close__(tmp_path):
+    """L1 and L2 hold 10 each; the bot's close of L2 never got its answer and
+    the process restarted. Another client's order (888, its own client-order-id)
+    closed 5 inside that close's window. The lookup proves the order foreign:
+    it is reported, and delivered and retired as an unbound close (oldest
+    first), never under the unanswered close's label or settled against L2."""
+    now_ms = int(epoch_time() * 1000)
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=903, order_id=888, position_id=222, closed_volume=500),
+               now_ms - 300_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1500)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[_closing_order(888)])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid, pine_id, order_id in (('c1', 'L1', '111'), ('c2', 'L2', '112')):
+        broker.store_ctx.upsert_order(
+            coid, symbol='EURUSD', side='buy', qty=10.0, filled_qty=10.0,
+            state='confirmed', pine_entry_id=pine_id, exchange_order_id='222',
+            extras={'order_id': order_id, 'position_id': 222})
+        broker.store_ctx.add_ref(coid, 'order_id', order_id)
+    broker._close_dispatch_pine_by_position[222] = '__pyne_partial__L2'
+    broker._close_settle_entry_by_position[222] = 'L2'
+    record = broker._open_own_close(222, 5.0)
+    record.sent_ms = now_ms - 310_000
+    broker._journal_own_close(record)
+    process = _next_process(broker)
+
+    events = [event for _ in range(2) for event in _run(process)]
+    process._flush_external_interventions()
+
+    assert [r.orderId for r in _details_requests(process)] == [888]
+    assert len(reports) == 1 and reports[0][1]['order_id'] == 888
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('903', None, pytest.approx(5.0))]
+    assert _retired(process, 'c1') == pytest.approx(5.0)
+    assert _retired(process, 'c2') == pytest.approx(0.0)
+
+
+def __test_recovered_venue_close_inside_an_unanswered_close_window_keeps_its_origin__(tmp_path):
+    """A stop-out of the position inside the window of the earlier process's
+    unanswered close is the venue's, never taken as that close's."""
+    first, _ = _recovered_close_broker(
+        tmp_path, _closing_order(999, stop_out=True, coid=''),
+        executed_ms=int(epoch_time() * 1000))
+    first._open_own_close(222)
+
+    restarted, reports = _restarted(
+        tmp_path, first, _closing_order(999, stop_out=True, coid=''))
+    _recover(restarted)
+
+    assert 'c3' not in _live_coids(restarted)
+    assert reports == []
+    assert [r.orderId for r in _details_requests(restarted)] == [999]
+    assert restarted._judged_close_origins[900] is CloseOrigin.VENUE
+
+
+def __test_recovered_foreign_close_inside_an_unanswered_close_window_is_reported__(tmp_path):
+    """Another client's order (its own client-order-id) closed the position
+    inside the window of the earlier process's unanswered close: the close the
+    run sent carries no client-order-id, so the order is not the run's."""
+    first, _ = _recovered_close_broker(
+        tmp_path, _closing_order(999), executed_ms=int(epoch_time() * 1000))
+    first._open_own_close(222)
+
+    restarted, reports = _restarted(tmp_path, first, _closing_order(999))
+    _recover(restarted)
+
+    assert 'c3' not in _live_coids(restarted)
+    assert [r.orderId for r in _details_requests(restarted)] == [999]
+    assert len(reports) == 1 and reports[0][1]['order_id'] == 999
+    assert restarted._judged_close_origins[900] is CloseOrigin.EXTERNAL
 
 
 def __test_netting_shrink_a_restart_found_retires_what_the_deals_took__(tmp_path):

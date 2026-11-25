@@ -29,6 +29,7 @@ from pynecore.core.broker.models import (
 )
 from pynecore.core.broker.store_helpers import ENTRY_KIND_POSITION, ENTRY_KIND_WORKING
 from pynecore.types.strategy import (
+    ADOPTED_STARTUP_ENTRY_ID,
     ADOPTED_STARTUP_EXTRA_KEY,
     JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY,
 )
@@ -531,6 +532,10 @@ class _StateMixin(_CTraderBase, ABC):
         account it returns at most one leg. Performs ZERO aggregation — the core
         :mod:`~pynecore.core.broker.emulator` owns netting and leg selection.
 
+        Each leg carries the Pine entry that opened it when this run's journal
+        attributes the position to exactly one entry (:meth:`_leg_entry_ids`),
+        ``None`` otherwise.
+
         Unrealized P&L is left at ``0.0`` per leg (the reconcile snapshot does
         not carry it; the sync engine drives off size / side / entry price),
         matching :meth:`get_position`'s existing M2 behaviour.
@@ -545,6 +550,7 @@ class _StateMixin(_CTraderBase, ABC):
         # the one-way emulator's close / reversal planner never plans over a
         # concurrent run's leg on a shared account+symbol scope.
         owned = self._owned_position_ids()
+        entry_ids = self._leg_entry_ids()
         legs: list[PositionLeg] = []
         for position in res.position:
             if position.positionStatus != OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
@@ -563,9 +569,67 @@ class _StateMixin(_CTraderBase, ABC):
                 entry_price=round_price(position.price, digits),
                 open_time=position.tradeData.openTimestamp / 1000.0,
                 unrealized_pnl=0.0,
+                entry_id=entry_ids.get(position.positionId),
             ))
         legs.sort(key=lambda leg: leg.open_time)
         return legs
+
+    def _leg_entry_ids(self) -> dict[int, str]:
+        """The Pine entry that opened each attributable venue position.
+
+        Read from this run's live journal: an entry row records the
+        ``positionId`` its order opened in ``extras['position_id']`` from the
+        order's own answer or fill (:meth:`~_ExecutionMixin._persist_entry`,
+        :meth:`~_EventStreamMixin._link_position`,
+        :meth:`~_EventStreamMixin._recover_parked_entry_by_coid`,
+        :meth:`~_RecoveryMixin._confirm_recovered_entry`), next to the Pine id
+        it was dispatched for. A row stays live while its position is open, a
+        partial close included, and across restarts of the run; it is closed
+        only once the position is gone.
+
+        Only a HEDGED account holds one position per order. A netting position
+        merges every entry, adopted exposure and foreign order of the symbol,
+        so it is never attributed. On a hedged account a position is
+        attributed only when every live row linked to it is an entry row of
+        this run naming the same Pine id. It stays unattributed when one of
+        them is a startup-adopted or recovered own leg (the run's records of
+        the order that opened it are gone), names no Pine id, or is linked
+        only through the ``exchange_order_id`` fallback (which can hold an
+        ``orderId`` instead of a ``positionId``), and when two rows name
+        different Pine ids.
+
+        :return: Pine entry id by ``positionId``; a position missing from it
+            is unattributed.
+        """
+        if self.store_ctx is None or not self.hedging_enabled:
+            return {}
+        claims: dict[int, set[str | None]] = {}
+        for row in self.store_ctx.iter_live_orders():
+            extras = row.extras or {}
+            if extras.get('kind') not in _ENTRY_KINDS:
+                continue
+            raw = extras.get('position_id')
+            if raw is not None:
+                position_id = parse_protocol_id(raw, field='position_id')
+                entry_id = row.pine_entry_id
+                if (not entry_id or entry_id == ADOPTED_STARTUP_ENTRY_ID
+                        or extras.get(ADOPTED_STARTUP_EXTRA_KEY)
+                        or extras.get('recovered_own_leg')):
+                    entry_id = None
+            elif row.exchange_order_id and row.exchange_order_id.isdigit():
+                position_id = int(row.exchange_order_id)
+                entry_id = None
+            else:
+                continue
+            claims.setdefault(position_id, set()).add(entry_id)
+        attributed: dict[int, str] = {}
+        for position_id, entry_ids in claims.items():
+            if len(entry_ids) != 1:
+                continue
+            entry_id = next(iter(entry_ids))
+            if entry_id is not None:
+                attributed[position_id] = entry_id
+        return attributed
 
     async def get_position(self, symbol: str) -> ExchangePosition | None:
         """Return the net open position for ``symbol``, or ``None`` when flat.

@@ -332,13 +332,23 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: ``positionId`` this session dispatched a close against — recorded by
         #: ``execute_close`` / ``close_leg``. A close fill's PUSH copy carries
         #: only the venue's own close ``orderId`` (never in the ref index) plus
-        #: the ``positionId``; when no entry row links that position (a
+        #: the ``positionId``; each close's own-close record takes its label
+        #: from here when it is sent. When no entry row links the position (a
         #: startup-adopted position closed by this run), ``_resolve_identity``
-        #: falls back to this map to attribute closing fills on it as CLOSE
-        #: legs instead of dropping them as external activity. Attribution
-        #: only: whether a closing fill is this run's own close is decided by
-        #: :attr:`_own_closes`.
+        #: still attributes a closing fill on it that no own close claims as
+        #: a CLOSE leg naming no entry, instead of dropping it as external
+        #: activity. Attribution only: whether a closing fill is this run's
+        #: own close is decided by :attr:`_own_closes`.
         self._close_dispatch_pine_by_position: dict[int, str | None] = {}
+        #: The Pine entry the core settles the close dispatched against a
+        #: ``positionId`` against, keyed like
+        #: :attr:`_close_dispatch_pine_by_position`. It differs from the close's
+        #: label for an engine-made close: a ``partial_trigger`` /
+        #: ``marketable_exit`` settles its ``target_entry_id``, a
+        #: ``defensive_close`` the entry of the position row it targets, a
+        #: ``reversal_close`` no entry. The journal retires a partial close's
+        #: quantity from this entry's rows first, as the core does.
+        self._close_settle_entry_by_position: dict[int, str | None] = {}
         #: Closes this run sent whose final fill has not been seen yet. See
         #: ``_ProtectionMixin._close_fill_origin``.
         self._own_closes: list['_OwnClose'] = []
@@ -1834,10 +1844,16 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     def _row_exposure(row: 'OrderRow') -> float: ...
 
     @abstractmethod
+    def _run_owned_position_entry(self, position_id: int) -> tuple[str, ...] | None: ...
+
+    @abstractmethod
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None: ...
 
     @abstractmethod
     async def fetch_raw_positions(self, symbol: str) -> 'list[PositionLeg]': ...
+
+    @abstractmethod
+    def _leg_entry_ids(self) -> dict[int, str]: ...
 
     @abstractmethod
     async def get_volume_quantizer(
