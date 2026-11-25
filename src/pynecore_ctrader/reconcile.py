@@ -32,18 +32,65 @@ one path is never re-applied on the other.
 Scope (2.1): existing ``confirmed`` local rows only. A crash between the entry
 wire-send and its post-ack persist leaves no local row at all — that zero-row
 recovery is the M3 startup-recovery's job, not this loop's.
+
+Where the facts of the filled-then-closed, vanished-row and shrink judgments
+live. Each must reach the next pass and a later process of the run (a
+restart), or be read from the venue again before a judgment needs it:
+
+=============================  ==========================================  ===================================
+Fact                           Lives in                                    After a restart
+=============================  ==========================================  ===================================
+Row order id, position id      row extras ``order_id`` / ``position_id``   journalled
+                               and refs (``_record_recovered_refs``)
+Row executed volume floor      row extras ``executed_cents``               journalled
+Row deal window start          row extras ``submitted_at_ms``              journalled
+Row missing-pending stamp      row extras ``missing_pending_since``        journalled; the vanished position's
+                                                                           wait derives from it
+Row fill cursor, retired share ``filled_qty``, extras                      journalled
+                               ``journal_exposure_retired``
+Row commission booked          ``filled_qty`` (commission is booked with   journalled; a recovery charges the
+                               the fill) minus row extras                  executions beyond the cursor and
+                               ``fee_unbooked``                            the listed ranges, never a deal
+                                                                           the cursor counts
+Fill de-dup deal ids           memory (``_seen_deal_ids``)                 not needed: the push stream never
+                                                                           redelivers an earlier connection's
+                                                                           fills; a share replay's ``seen``
+                                                                           widens only its upper bound
+Judged closing deals, origins  ``ctrader_close_judged`` events             journalled
+Own closes sent, what each     ``ctrader_own_close`` events, written on    journalled
+executed, completion           send, answer, refusal and every own fill
+External-close reports         report pending / done events                journalled
+Startup shrinks                startup shrink pending / done events        journalled
+Covered-until watermark        memory + ``ctrader_close_coverage`` event   journalled
+Resume-accepted watermark      memory + ``ctrader_close_coverage`` event   journalled; written in the
+                                                                           transaction that retires the
+                                                                           accepted shrink
+Expiry overlap                 memory + ``ctrader_close_coverage`` event   journalled
+Shortfall wait (first seen,    memory + ``ctrader_close_coverage`` event   journalled; ended by a startup
+deadline, watermark at start)                                              shrink the baseline retired
+Shrink confirmations, judged   memory (``_shrink_watch``,                  re-derived: the count restarts from
+shrink keys                    ``_shrink_judged``)                         the venue, and the judged deal ids
+                                                                           keep a re-judgment from booking a
+                                                                           deal twice
+Deal walks                     memory (``_deal_walks``)                    re-read from the venue over the
+                                                                           journalled window starts
+Resume-accepted positions      row marks of the operator resume            re-derived from the marks
+Snapshot open positions        memory                                      re-read on the first snapshot
+=============================  ==========================================  ===================================
 """
 import asyncio
 import logging
 import uuid
 from abc import ABC
+from functools import partial
 from itertools import combinations
-from dataclasses import dataclass, field
-from time import time as epoch_time
-from collections.abc import Collection, Sequence
+from dataclasses import dataclass, field, replace
+from time import monotonic, time as epoch_time
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import TYPE_CHECKING, AsyncIterator, cast
 
 from pynecore.core.broker.disappearance import (
+    MISSING_PENDING_EXTRA,
     DisappearanceTracker,
     MissingConfirmation,
     MissingResolution,
@@ -57,6 +104,8 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.store_helpers import PENDING_DISPATCH_STATES
+from pynecore.core.broker.sync_engine import FILL_RECOVERY_HOLD_S
 
 from .exceptions import is_not_found
 from .helpers import (
@@ -71,10 +120,12 @@ from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .protection import (
     _CLOCK_SKEW_MS,
     _ENTRY_ROW_STATES,
+    _OWN_CLOSE_EVENT,
     _VOLUME_TOL,
     CloseOrigin,
     _accepted_by_resume,
     _foreign_claims_taken,
+    _OwnClose,
     _PositionDeal,
     _ProtectionMixin,
     _ShareReplay,
@@ -82,7 +133,7 @@ from .protection import (
 from .wire import CTraderProtocolError, CTraderTimeoutError, CTraderWireError
 
 if TYPE_CHECKING:
-    from pynecore.core.broker.storage import OrderRow
+    from pynecore.core.broker.storage import OrderRow, RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +158,24 @@ _DEAL_PAGE_MAX_ROWS = 1000
 #: below the bot's share before its deal history is judged.
 _SHRINK_CONFIRMATIONS = 2
 
+#: Seconds, from the first reconcile pass that showed an open position below
+#: the bot's share, a confirmed shortfall no deal of the position's history
+#: explains stays in the journal waiting for the close that explains it (its
+#: push, or the deal history showing it on a later pass). The engine holds its
+#: verdict on the venue change while :meth:`~_ReconcileMixin.fill_recovery_pending`
+#: reports it, for up to its fill-report grace plus
+#: :data:`~pynecore.core.broker.sync_engine.FILL_RECOVERY_HOLD_S` from when it
+#: first saw the change. With the engine's book at the journal share it sees
+#: the change no earlier than that pass, so the wait ends while the engine
+#: still holds, and a close delivered during the wait is the engine's only
+#: booking of the shortfall. Past it the judgment still waits for an own close
+#: that may execute, within that close's grace (:meth:`~_ReconcileMixin._judge_shrink`).
+_UNEXPLAINED_SHRINK_WAIT_S = FILL_RECOVERY_HOLD_S
+
+#: Audit of a confirmed shortfall no closing deal explained within
+#: :data:`_UNEXPLAINED_SHRINK_WAIT_S`, retired from the journal unbound.
+_SHRINK_UNEXPLAINED_EVENT = 'ctrader_position_shrink_unexplained'
+
 #: Deal statuses that executed volume.
 _EXECUTED_DEAL_STATUSES = frozenset({
     OpenApiModelMessages.ProtoOADealStatus.FILLED,
@@ -120,6 +189,26 @@ _STARTUP_SHRINK_PENDING_EVENT = 'ctrader_startup_shrink_pending'
 #: Journal event naming the pending startup shrinks whose deals were judged, or
 #: that an operator resume accepted.
 _STARTUP_SHRINK_DONE_EVENT = 'ctrader_startup_shrink_done'
+
+#: Journal event of a position's close coverage: the watermark up to which
+#: reconcile passes retired its closes, its expiry overlap and the running
+#: wait of its unexplained shortfall. A keyed event
+#: (:meth:`~pynecore.core.broker.storage.RunContext.replace_keyed_events`): the
+#: run holds one per position, which a later process of the run takes over.
+_CLOSE_COVERAGE_EVENT = 'ctrader_close_coverage'
+
+#: Journal event of the close fills the judgment of a vanished row recovered
+#: for its position, with the position's live rows at that judgment
+#: (:meth:`~_ReconcileMixin._settle_vanished_close`). A keyed event, one per
+#: position, written in the transaction that records the deals judged.
+_VANISHED_CLOSE_EVENT = 'ctrader_vanished_close_fills'
+
+#: Row extra listing the ``[from, to]`` unit ranges of the row's fill cursor
+#: that a snapshot-only reconcile booked without their commission (the deal
+#: history could not cover them). Commission is otherwise booked with the
+#: fill that advances the cursor, so a recovery charges exactly the executions
+#: beyond the cursor plus these ranges, and clears the ranges it charged.
+_FEE_UNBOOKED_EXTRA = 'fee_unbooked'
 
 #: Disappearance grace window (seconds). A bot-owned row stamped
 #: ``missing_pending_since`` (vanished from BOTH ``order[]`` and ``position[]``)
@@ -323,6 +412,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         """
         if self.store_ctx is None:
             return
+        self._load_close_evidence()
         if self._wire is None or self._live_account_id is None:
             # Live connection not established — a teardown (``disconnect`` set
             # ``_wire = None``) or a reconnect in flight. Honour the documented
@@ -359,13 +449,19 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             rows.append((row, parse_protocol_id(order_id_raw, field='order_id')
                          if order_id_raw is not None else None))
         live_order_ids = {order_id for _row, order_id in rows}
+        live_position_ids = {
+            parse_protocol_id(raw, field='position_id')
+            for raw in ((row.extras or {}).get('position_id') for row, _order_id in rows)
+            if raw is not None}
         # Position-history walks are keyed by the negated position id
-        # (:meth:`_position_history`); they live while their position is open
-        # or a shrink a restart found on it waits for its judgment.
+        # (:meth:`_position_history`); they live while their position is open,
+        # a shrink a restart found on it waits for its judgment, or a live row
+        # of the bot's still holds it (its judgment resumes the walk).
         for stale in [oid for oid in self._deal_walks
                       if (oid not in live_order_ids if oid >= 0
                           else -oid not in open_positions
-                          and -oid not in self._startup_shrinks)]:
+                          and -oid not in self._startup_shrinks
+                          and -oid not in live_position_ids)]:
             del self._deal_walks[stale]
         # Rows whose deal-history walk an earlier pass left unfinished go first,
         # so a lookup that keeps spending most of the budget cannot starve them;
@@ -416,7 +512,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             # remaining quantity may have filled while the stream was down, so it
             # must be recovered through the same bridge — never treated as settled.
             async for event in self._recover_vanished_working_row(
-                    row, order_id, open_positions, now_ts):
+                    row, order_id, open_positions, now_ts, working_orders=orders_by_id):
                 filled_coids.append(row.client_order_id)
                 yield event
         # Presence diff for the settled-position rows: stamp when the position
@@ -524,12 +620,135 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             self, row: 'OrderRow', position_id: int, recovered: float,
     ) -> float:
         """The bot's share of a position counting a row's fill recovered from history."""
+        return self._share_with_recovered_fills(position_id, [(row, recovered)])
+
+    def _share_with_recovered_fills(
+            self, position_id: int, recovered: Sequence[tuple['OrderRow', float]],
+    ) -> float:
+        """The bot's share of a position counting rows' fills recovered from history.
+
+        :param recovered: ``(row, units)`` of each row and the cumulative fill
+            (units) the history shows for its order.
+        """
         rows = self._position_entry_rows(position_id)
+        linked = {r.client_order_id for r in rows}
         net = sum(self._signed_exposure(r) for r in rows)
-        counted = (row.filled_qty
-                   if any(r.client_order_id == row.client_order_id for r in rows) else 0.0)
-        added = max(0.0, min(row.qty, recovered) - counted)
-        return abs(net + (added if row.side == 'buy' else -added))
+        for row, units in recovered:
+            counted = row.filled_qty if row.client_order_id in linked else 0.0
+            added = max(0.0, min(row.qty, units) - counted)
+            net += added if row.side == 'buy' else -added
+        return abs(net)
+
+    async def close_leg_executed(
+            self, symbol: str, leg_id: str, coids: Sequence[str], since_ms: int,
+    ) -> int | None:
+        """Volume (centi-units) the closes sent under ``coids`` executed on ``leg_id``.
+
+        :class:`~pynecore.core.plugin.broker.PositionPort` primitive. A
+        ``ProtoOAClosePositionReq`` carries no client order id, so each send is
+        found through the own-close record :meth:`_send_own_close` journals
+        under its ``coid`` BEFORE the request is written, read across every
+        process instance of the run (:meth:`_close_send_records`):
+
+        * no record — the send never reached the wire: it executed nothing;
+        * a refused record — the venue provably refused it: nothing;
+        * a record whose answer named the close order — that order's own
+          status (``ProtoOAOrderDetailsReq``) settles it: a filled or ended
+          order executed its ``executedVolume``; one still accepted, or a
+          lookup that failed or found no order, cannot settle it yet;
+        * a record without the order (the answer was lost) — only the
+          position's deal history can show what it did, and how late the
+          venue publishes a closing deal there is not measured: a read that
+          shows less than every such send could have closed is no proof that
+          it closed less, so the answer waits. Once the closing deals of the
+          window (from ``since_ms`` less :data:`_SINCE_ANCHOR_SKEW_MS`, whoever
+          sent them — the contract's over-count rule) cover everything those
+          sends and the settled ones could have closed, their sum is the
+          answer.
+
+        ``None`` also while the snapshot shows a closing order still working on
+        the position (a close in flight may execute more), and without a
+        journal to read.
+        """
+        del symbol
+        position_id = int(leg_id)
+        records = self._close_send_records(coids)
+        if records is None:
+            return None
+        snapshot = await self._reconcile()
+        if any(order.closingOrder and order.positionId == position_id
+               for order in snapshot.order):
+            return None
+        settled = 0
+        unanswered = 0
+        for payload in records:
+            if payload.get('refused'):
+                continue
+            order_id = payload.get('order_id')
+            if order_id:
+                executed = await self._close_order_executed(int(order_id))
+                if executed is None:
+                    return None
+                settled += executed
+                continue
+            volume = payload.get('volume_cents')
+            if not isinstance(volume, int):
+                return None
+            unanswered += volume
+        if not unanswered:
+            return settled
+        from_ms = since_ms - _SINCE_ANCHOR_SKEW_MS
+        history = await self._find_fill_deal(
+            -position_id, from_ms, close_position_id=position_id)
+        if not history.conclusive:
+            return None
+        closed = sum(deal.closed for deal in history.position_deals
+                     if deal.executed_ms >= from_ms)
+        return closed if closed >= settled + unanswered else None
+
+    def _close_send_records(self, coids: Sequence[str]) -> list[dict] | None:
+        """The last journalled state of every own close sent under ``coids``.
+
+        Read across every process instance of the logical run, so a send an
+        earlier process made counts; one state per close record (its latest).
+        ``None`` without a journal to read.
+        """
+        store = self.store_ctx
+        if store is None:
+            return None
+        wanted = set(coids)
+        latest: dict[str, dict] = {}
+        for _intent, _coid, _ref, payload in store.iter_events_by_kind_for_run_id(
+                _OWN_CLOSE_EVENT):
+            key = payload.get('key')
+            if isinstance(key, str) and payload.get('coid') in wanted:
+                latest[key] = payload
+        return list(latest.values())
+
+    async def _close_order_executed(self, order_id: int) -> int | None:
+        """Volume (centi-units) an own close order executed, once it can execute no more.
+
+        Filled, rejected, expired and cancelled orders execute no more.
+        ``None`` while the venue reports the order accepted (it may execute
+        more) or in any other status, when it reports no such order, or when
+        the lookup failed.
+        """
+        if self._live_account_id is None:
+            return None
+        try:
+            res = cast(OpenApiMessages.ProtoOAOrderDetailsRes, await self._account_request(
+                OpenApiMessages.ProtoOAOrderDetailsReq(
+                    ctidTraderAccountId=self._live_account_id, orderId=order_id)))
+        except (BrokerError, CTraderWireError, TimeoutError) as exc:
+            logger.debug("cTrader close order %d lookup deferred: %s", order_id, exc)
+            return None
+        order = res.order
+        statuses = OpenApiModelMessages.ProtoOAOrderStatus
+        if order.orderStatus not in (statuses.ORDER_STATUS_FILLED, statuses.ORDER_STATUS_REJECTED,
+                                     statuses.ORDER_STATUS_EXPIRED,
+                                     statuses.ORDER_STATUS_CANCELLED):
+            return None
+        return int(order.executedVolume)
 
     async def _position_history(self, position_id: int, from_ms: int) -> '_DealBridgeResult':
         """Every deal on a position since ``from_ms``, within the pass budget.
@@ -582,8 +801,15 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         fill (:meth:`_recovered_close_event`), the fill the PUSH stream would
         have delivered, under the identity the PUSH path gives it
         (:meth:`_recovered_close_identity`); its part is retired from the
-        entry the core settles it against first, and a shortfall no deal
-        explains from the rows oldest first. A shrink a
+        entry the core settles it against first. A shortfall no deal explains
+        stays in the journal share until :data:`_UNEXPLAINED_SHRINK_WAIT_S`
+        after the first pass that showed the position below the share
+        (:attr:`~_CTraderBase._unexplained_shrinks`): the close that explains it, pushed or
+        shown by the deal history on a later pass, is booked then like one that
+        arrived on time, under its own deal id and price, and retires its
+        volume once. Past the wait the shortfall is retired from the rows
+        oldest first with an ERROR and an audit event, and the engine's verdict
+        on the venue change is no longer held. A shrink a
         restart found and the startup baseline already retired
         (:attr:`_startup_shrinks`) is judged once, against the share the
         journal held before, and whatever the deals took beyond the baseline
@@ -606,6 +832,11 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             return events
         for position_id in [pid for pid in self._shrink_watch if pid not in open_positions]:
             del self._shrink_watch[position_id]
+        for position_id in {pid for watched in (self._shrink_seen_since,
+                                                self._unexplained_shrinks,
+                                                self._shrink_covered_from)
+                            for pid in watched if pid not in open_positions}:
+            self._forget_shrink_wait(position_id)
         self._resume_accepted_positions.intersection_update(open_positions)
         for position_id in list(self._startup_shrinks):
             position = open_positions.get(position_id)
@@ -618,37 +849,49 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             share = self._own_share(position_id)
             if share is None or position_id in self._external_close_reported:
                 self._shrink_watch.pop(position_id, None)
+                self._forget_shrink_wait(position_id)
                 self._resume_accepted_positions.discard(position_id)
                 continue
             venue = self._side_volume(position_id, position)
             startup = self._startup_shrinks.get(position_id)
             if startup is None and venue >= share - _VOLUME_TOL:
                 self._shrink_watch.pop(position_id, None)
+                self._forget_shrink_wait(position_id)
                 self._resume_accepted_positions.discard(position_id)
+                # A later shrink to the same volumes is a new one: the deal
+                # ids keep a close from being judged twice across them.
+                self._shrink_judged = {
+                    judged for judged in self._shrink_judged if judged[0] != position_id}
+                if (abs(venue - share) <= _VOLUME_TOL and queue_idle
+                        and self._share_settled(position_id)):
+                    self._close_expiry_overlap(position_id, read_started_at)
                 continue
+            seen_since = self._shrink_seen_since.setdefault(position_id, read_started_at)
             if not queue_idle or not self._share_settled(position_id):
                 continue
             if position_id in self._resume_accepted_positions:
-                self._resume_accepted_positions.discard(position_id)
                 rows = self._position_entry_rows(position_id)
-                self._note_accepted_by_resume(
-                    position_id, client_order_id=rows[0].client_order_id if rows else None,
-                    volume=share - venue)
-                self._retire_partial_close_exposure(
-                    position_id, share - venue, source='resume_accepted')
-                self._cover_closes(position_id, read_started_at)
+                # The closes are accepted unjudged: their coverage is written
+                # with the retirement, so no later judgment books them. A
+                # failed write keeps the acceptance for the next pass.
+                with self._judgment_span():
+                    self._resume_accepted_positions.discard(position_id)
+                    self._cover_closes(position_id, read_started_at, accepted=True)
+                    self._note_accepted_by_resume(
+                        position_id, client_order_id=rows[0].client_order_id if rows else None,
+                        volume=share - venue)
+                    self._retire_partial_close_exposure(
+                        position_id, share - venue, source='resume_accepted')
                 continue
             if startup is not None:
-                startup_replay = await self._judge_shrink(
+                # A close an earlier pass, or an earlier process, retired is
+                # not taken again, as in a shrink judged at runtime.
+                await self._judge_shrink(
                     position_id, position, venue=venue, share_now=share + startup.volume,
-                    read_started_at=read_started_at)
-                if startup_replay is not None:
-                    taken = volume_to_units(startup_replay.taken)
-                    self._end_startup_shrink(position_id)
-                    self._cover_closes(position_id, read_started_at)
-                    if taken - startup.volume > _VOLUME_TOL:
-                        self._retire_partial_close_exposure(
-                            position_id, taken - startup.volume, source='position_shrink')
+                    read_started_at=read_started_at,
+                    settle=partial(self._settle_startup_shrink, position_id,
+                                   share=share, venue=venue, baseline=startup.volume,
+                                   read_started_at=read_started_at))
                 continue
             key = (raw_volume(venue), raw_volume(share))
             if (position_id, key) in self._shrink_judged:
@@ -658,32 +901,134 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             self._shrink_watch[position_id] = (key, count)
             if count < _SHRINK_CONFIRMATIONS:
                 continue
-            replay = await self._judge_shrink(
+            walk = self._deal_walks.get(-position_id)
+            if position_id in self._unexplained_shrinks and walk is not None and not walk.segments:
+                # The close that explains the shortfall executed before an
+                # earlier read of the deal history, which did not show it: the
+                # history is read again from the window's start, not only
+                # since that read. A reread the pass budget cut short resumes
+                # where it stopped.
+                del self._deal_walks[-position_id]
+            covered_from = self._shrink_covered_from.get(
+                position_id, self._closes_covered_until.get(position_id, 0))
+            deadline = seen_since + _UNEXPLAINED_SHRINK_WAIT_S
+            # Within the wait, an own close sent after the expiry that may
+            # have executed unseen is waited for, not guessed at; past it, only
+            # one that may still execute is, bounded by its grace, as the
+            # vanished rows' judgment waits (:meth:`_confirm_missing_via_deal_history`).
+            await self._judge_shrink(
                 position_id, position, venue=venue, share_now=share,
-                read_started_at=read_started_at)
-            if replay is not None:
-                rows = self._position_entry_rows(position_id)
-                booked = [(deal, cents, self._recovered_close_identity(position_id, deal))
-                          for deal, cents in replay.booked]
-                if rows:
-                    events.extend(
-                        self._recovered_close_event(rows[0], deal, cents, from_entry=label)
-                        for deal, cents, (label, _settle) in booked
-                        if deal.deal_id not in self._seen_deal_ids)
-                self._seen_deal_ids.update(deal.deal_id for deal, _cents in replay.booked)
-                self._shrink_judged.add((position_id, key))
-                self._shrink_watch.pop(position_id, None)
-                self._cover_closes(position_id, read_started_at)
-                debited = 0.0
-                for _deal, cents, (_label, settle) in booked:
-                    debited += sum(volume for _coid, volume in self._retire_partial_close_exposure(
-                        position_id, volume_to_units(cents), source='position_shrink',
-                        entry_id=settle))
-                rest = max(share - venue, volume_to_units(replay.taken)) - debited
-                if rest > _VOLUME_TOL:
-                    self._retire_partial_close_exposure(
-                        position_id, rest, source='position_shrink')
+                read_started_at=read_started_at, hold_for_own_close=True,
+                still_executing=read_started_at >= deadline,
+                settle=partial(self._settle_shrink, position_id, events,
+                               share=share, venue=venue, key=key, covered_from=covered_from,
+                               deadline=deadline, read_started_at=read_started_at))
         return events
+
+    def _settle_startup_shrink(
+            self, position_id: int, replay: _ShareReplay, history: Sequence[_PositionDeal], *,
+            share: float, venue: float, baseline: float, read_started_at: float,
+    ) -> None:
+        """Apply the judgment of a shrink the startup baseline retired.
+
+        Runs in the transaction that records the deals judged
+        (:meth:`~_ProtectionMixin._judge_recovered_close_deals`): what the
+        deals took beyond the baseline is retired, the pending shrink ended and
+        the closes covered.
+
+        :param share: The bot's journal share now, after the baseline.
+        :param venue: The volume (units) the position holds now.
+        :param baseline: The share (units) the startup baseline retired.
+        :param read_started_at: Wall-clock time the snapshot read started.
+        :param replay: The verdict on the deals judged now.
+        :param history: Every deal of the position's history read.
+        """
+        _parts, retired = self._book_expiry_overlap(
+            position_id, replay.booked, history,
+            covered_from=self._closes_covered_until.get(position_id, 0),
+            shortfall=share + baseline - venue)
+        taken = volume_to_units(replay.taken - retired)
+        self._end_startup_shrink(position_id)
+        self._cover_closes(position_id, read_started_at)
+        if taken - baseline > _VOLUME_TOL:
+            self._retire_partial_close_exposure(
+                position_id, taken - baseline, source='position_shrink')
+
+    def _settle_shrink(
+            self, position_id: int, events: list[OrderEvent], replay: _ShareReplay,
+            history: Sequence[_PositionDeal], *, share: float, venue: float,
+            key: tuple[int, int], covered_from: int, deadline: float, read_started_at: float,
+    ) -> None:
+        """Apply the judgment of a shrink a settled pass confirmed.
+
+        Runs in the transaction that records the deals judged
+        (:meth:`~_ProtectionMixin._judge_recovered_close_deals`), so a process
+        that stops before a debit lands leaves the deals unjudged: the next
+        process judges them again and books each against the entry it names.
+
+        :param events: The pass's recovered close fills; the fills of the
+            deals judged now are appended.
+        :param share: The bot's journal share before the judgment.
+        :param venue: The volume (units) the position holds now.
+        :param key: The shrink's ``(venue, share)`` volumes, in raw volume.
+        :param covered_from: The covered-until watermark the shrink's wait
+            started at.
+        :param deadline: The end of the shrink's wait for its explanation.
+        :param read_started_at: Wall-clock time the snapshot read started.
+        :param replay: The verdict on the deals judged now.
+        :param history: Every deal of the position's history read.
+        """
+        rows = self._position_entry_rows(position_id)
+        # A close executed before the closes earlier passes retired is
+        # one of them (retired without its deal when no deal explained
+        # it in time): judged, but neither delivered nor debited again;
+        # in an expiry's overlap only what the shortfall leaves is.
+        parts, retired = self._book_expiry_overlap(
+            position_id, replay.booked, history, covered_from=covered_from,
+            shortfall=share - venue)
+        booked = [(deal, cents, self._recovered_close_identity(position_id, deal))
+                  for deal, cents in parts]
+        taken = volume_to_units(replay.taken - retired)
+        if rows:
+            events.extend(
+                self._recovered_close_event(rows[0], deal, cents, from_entry=label)
+                for deal, cents, (label, _settle) in booked
+                if deal.deal_id not in self._seen_deal_ids)
+        self._seen_deal_ids.update(deal.deal_id for deal, _cents in replay.booked)
+        self._cover_closes(position_id, read_started_at)
+        debited = 0.0
+        for _deal, cents, (_label, settle) in booked:
+            debited += sum(volume for _coid, volume in self._retire_partial_close_exposure(
+                position_id, volume_to_units(cents), source='position_shrink',
+                entry_id=settle))
+        rest = max(share - venue, taken) - debited
+        unexplained = share - venue - taken
+        judged = not (unexplained > _VOLUME_TOL and read_started_at < deadline)
+        if not judged:
+            # The pass judges the shrink again, with the deals the
+            # history shows then.
+            self._await_shrink_explanation(
+                position_id, unexplained, deadline, covered_from=covered_from)
+            rest -= unexplained
+        else:
+            # The shortfall is retired: one a later pass finds is a
+            # new one, with a wait of its own.
+            self._shrink_watch.pop(position_id, None)
+            self._forget_shrink_wait(position_id)
+            if unexplained > _VOLUME_TOL:
+                self._note_unexplained_shrink(position_id, unexplained)
+                self._cover_unexplained_retirement(position_id, read_started_at)
+        if rest > _VOLUME_TOL:
+            self._retire_partial_close_exposure(
+                position_id, rest, source='position_shrink')
+        if judged:
+            # Keyed by the share the judgment LEFT: a shrink whose
+            # retirement did not lower the share is not judged again,
+            # while an entry fill that restores the share before the
+            # next snapshot makes a later equal shrink a new one.
+            share_after = self._own_share(position_id)
+            self._shrink_judged.add((position_id, key if share_after is None else (
+                key[0], raw_volume(share_after))))
 
     def _recovered_close_identity(
             self, position_id: int, deal: _PositionDeal,
@@ -710,40 +1055,554 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         owner = owners[0] if owners is not None and len(owners) == 1 else None
         return owner, owner
 
-    def _cover_closes(self, position_id: int, read_started_at: float) -> None:
+    def _vanished_close_label(
+            self, position_id: int, deal: _PositionDeal, row_entry: str | None,
+    ) -> str | None:
+        """The label of a closing deal the judgment of a vanished row recovered.
+
+        A close of the run the deal belongs to (:meth:`_own_close_of_deal`)
+        gives its own label, as its push would; any other close is labelled
+        with the vanished row's entry.
+        """
+        record = self._own_close_of_deal(
+            position_id, deal, self._judged_close_origins.get(deal.deal_id))
+        return record.from_entry if record is not None else row_entry
+
+    def _reread_finished_walk(self, walk_key: int) -> None:
+        """Read a vanished position's window again from its start for its judgment.
+
+        A deal the history shows only after an earlier read, stamped before
+        that read's end, is one a resumed walk never reads (it reads only from
+        :data:`_SINCE_ANCHOR_SKEW_MS` before the end on): a close whose push
+        was deferred to the history (an expiry overlap's), or a confirmed own
+        close. The judgment that retires the rows therefore reads the whole
+        window; a walk the pass budget cut short resumes where it stopped.
+        """
+        walk = self._deal_walks.get(walk_key)
+        if walk is not None and not walk.segments:
+            del self._deal_walks[walk_key]
+
+    def _fill_history_short(
+            self, bridge: '_DealBridgeResult', row, order_id: int, executed_cents: int = 0,
+    ) -> bool:
+        """Whether an entry order's deal evidence shows less than the fill known for it.
+
+        A recovery that retires an entry row filled then closed judges the
+        closes against the share its order's deals show, so the deals must
+        cover every fill the plugin already knows the order made: the
+        ``executedVolume`` the venue reports for it (``executed_cents``, when
+        its order details were read in this pass, and the ``executed_cents``
+        floor an earlier pass recorded on the row while it waited,
+        :meth:`~_RecoveryMixin._record_recovered_refs`) and the fill the row's
+        journal counts. A
+        history short of that has not published every fill yet; the order's
+        finished walk is dropped so the next pass reads its whole window again
+        (a resumed walk reads only from shortly before its last end, and a
+        late deal may be stamped earlier).
+
+        :param bridge: The order's deal evidence.
+        :param row: The order's entry row.
+        :param order_id: The venue order (its deal walk's key).
+        :param executed_cents: The order's ``executedVolume``; ``0`` when not read.
+        :return: ``True`` while the recovery must wait for a later pass.
+        """
+        known = max(int(executed_cents), int((row.extras or {}).get('executed_cents') or 0),
+                    raw_volume(row.filled_qty))
+        if bridge.filled_cents >= known:
+            return False
+        self._reread_finished_walk(order_id)
+        return True
+
+    async def _with_group_position_history(
+            self, bridge: '_DealBridgeResult', position_id: int, from_ms: int,
+    ) -> '_DealBridgeResult | None':
+        """An entry order's evidence widened to its closed position's history for the group.
+
+        A recovery that finds an entry order filled then closed retires the
+        bot's rows of the position and the other entry rows whose orders
+        filled onto it (:meth:`_unbooked_position_entries`), so the closes are
+        judged over the windows of all of them: the position's history from
+        :meth:`_vanished_window_start`, lowered to the window start of every
+        live entry row that may join the group (a working row not fully filled
+        and a pending dispatch row), merged into ``bridge``. A sibling's
+        opening deal before ``from_ms`` (the recovered order's own window) is
+        then seen, and its fill counts in the share the closes are judged
+        against.
+
+        :return: The widened evidence; ``None`` while the history read is
+            inconclusive (the caller waits for a later pass).
+        """
+        start = self._vanished_window_start(position_id, from_ms)
+        for other in self.store_ctx.iter_live_orders() if self.store_ctx is not None else ():
+            extras = other.extras or {}
+            if other.filled_qty >= other.qty - _VOLUME_TOL:
+                continue
+            if other.state in PENDING_DISPATCH_STATES:
+                start = min(start, other.created_ts_ms - _SINCE_ANCHOR_SKEW_MS,
+                            self._deal_since_ms(extras))
+            elif other.state in _ENTRY_ROW_STATES and extras.get('order_id') is not None:
+                start = min(start, self._deal_since_ms(extras))
+        self._reread_finished_walk(-position_id)
+        history = await self._position_history(position_id, start)
+        if not history.conclusive:
+            return None
+        deals = {deal.deal_id: deal for deal in bridge.position_deals}
+        deals.update((deal.deal_id, deal) for deal in history.position_deals)
+        return replace(
+            bridge,
+            closing_deal_ids=tuple(dict.fromkeys(
+                (*bridge.closing_deal_ids, *history.closing_deal_ids))),
+            position_deals=tuple(sorted(
+                deals.values(), key=lambda deal: (deal.executed_ms, deal.deal_id))))
+
+    def _vanished_window_start(self, position_id: int, from_ms: int) -> int:
+        """The deal-history window start (ms) of a vanished position's judgment.
+
+        ``from_ms`` (the judged row's own window start) lowered to every live
+        entry row's window start on the position (:meth:`_deal_since_ms`) and
+        to the closes earlier passes retired, less the clock skew
+        (:attr:`_closes_covered_until`). Whichever row's judgment runs first
+        retires every row of the position, so it reads the deals of all of
+        them, an expiry overlap included, and the split of
+        :meth:`_book_expiry_overlap` sets apart what earlier passes retired.
+        """
+        self._load_close_evidence()
+        anchors = [from_ms, *(self._deal_since_ms(row.extras or {})
+                              for row in self._position_entry_rows(position_id))]
+        covered = self._closes_covered_until.get(position_id)
+        if covered is not None:
+            anchors.append(covered - _CLOCK_SKEW_MS)
+        return min(anchors)
+
+    def _vanished_position_in_wait(self, position_id: int) -> bool:
+        """Whether a vanished position is within the shrink wait of its settled rows.
+
+        The wait runs :data:`_UNEXPLAINED_SHRINK_WAIT_S` from the earliest
+        ``missing_pending_since`` stamp on the bot's settled rows of the
+        position, the bound :meth:`_confirm_missing_via_deal_history` waits
+        within; a settled row not stamped yet starts it now. Without a settled
+        row there is no such wait.
+        """
+        if self.store_ctx is None:
+            return False
+        stamps: list[float] = []
+        settled = False
+        for row in self.store_ctx.iter_live_orders():
+            if self._tracked_position_refs(row) != {('positions', str(position_id))}:
+                continue
+            settled = True
+            since = (row.extras or {}).get(MISSING_PENDING_EXTRA)
+            if isinstance(since, (int, float)):
+                stamps.append(float(since))
+        if not settled:
+            return False
+        return not stamps or epoch_time() < min(stamps) + _UNEXPLAINED_SHRINK_WAIT_S
+
+    def _cover_closes(
+            self, position_id: int, read_started_at: float, *, accepted: bool = False,
+    ) -> None:
         """A pass retired a position's closes from the journal without their events.
 
         Every closing deal it covered executed before the snapshot read
         (margined by the clock skew): a push of one of them that arrives later
-        must not be booked again (:attr:`_closes_covered_until`).
+        must not be booked again (:attr:`_closes_covered_until`), and a
+        judgment of the position's history never books it again either
+        (:meth:`_book_expiry_overlap`).
+
+        :param accepted: An operator resume accepted the closes as the venue
+            shows them: no judgment reports one of them either
+            (:attr:`~_CTraderBase._resume_accepted_until`).
         """
+        self._load_close_evidence()
         until = int(read_started_at * 1000) - _CLOCK_SKEW_MS
+        changed = False
         if until > self._closes_covered_until.get(position_id, 0):
             self._closes_covered_until[position_id] = until
+            changed = True
+        if accepted and until > self._resume_accepted_until.get(position_id, 0):
+            self._resume_accepted_until[position_id] = until
+            changed = True
+        if changed:
+            self._journal_close_coverage(position_id)
+
+    def _journal_close_coverage(self, position_id: int) -> None:
+        """Journal a position's close coverage once it changed.
+
+        What a judgment of the position's closes needs from earlier passes,
+        in this process or after a restart: the venue time up to which they
+        retired its closes (:attr:`~_CTraderBase._closes_covered_until`), the
+        venue time up to which an operator resume accepted them
+        (:attr:`~_CTraderBase._resume_accepted_until`), its expiry overlap (:attr:`~_CTraderBase._expiry_overlaps`) and the
+        running wait of its unexplained shortfall
+        (:attr:`~_CTraderBase._unexplained_shrinks`) with the watermark the
+        wait began at (:attr:`~_CTraderBase._shrink_covered_from`). The run
+        keeps one record per position, keyed by it, which replaces the
+        earlier one in the same write, so the journal and its read at startup
+        (:meth:`~_ReconcileMixin._restore_close_coverage`) grow with the positions, not with
+        the changes.
+        """
+        store = self.store_ctx
+        if store is None:
+            return
+        self._load_close_evidence()
+        overlap = self._expiry_overlaps.get(position_id)
+        deadline = self._unexplained_shrinks.get(position_id)
+        payload = {
+            'position_id': position_id,
+            'covered_until': self._closes_covered_until.get(position_id),
+            'accepted_until': self._resume_accepted_until.get(position_id),
+            'overlap': None if overlap is None else [overlap[0], overlap[1]],
+            'wait': None if deadline is None else {
+                'seen_since': self._shrink_seen_since.get(
+                    position_id, deadline - _UNEXPLAINED_SHRINK_WAIT_S),
+                'deadline': deadline,
+                'covered_from': self._shrink_covered_from.get(position_id),
+            },
+        }
+        if self._coverage_journalled.get(position_id) == payload:
+            return
+        self._coverage_journalled[position_id] = payload
+        store.replace_keyed_events(_CLOSE_COVERAGE_EVENT, {f'position:{position_id}': payload})
+
+    def _restore_close_coverage(self, store: 'RunContext') -> None:
+        """Take over the close coverage earlier processes of the run journalled.
+
+        The record of each position (:meth:`_journal_close_coverage`). The
+        watermarks only ever rise; an expiry overlap or a shortfall wait this
+        process holds already stays. A wait on a position whose shrink the
+        startup baseline retired ends there: the startup shrink is judged
+        instead (:meth:`_merge_startup_shrink`). A wait on a position that is
+        no longer open ends on the first reconcile pass, as in the process
+        that began it.
+
+        :param store: The journal of the run.
+        """
+        latest: dict[int, dict] = {}
+        for payload in store.keyed_events_for_run_id(_CLOSE_COVERAGE_EVENT).values():
+            position_id = payload.get('position_id')
+            if isinstance(position_id, int):
+                latest[position_id] = payload
+        for position_id, payload in latest.items():
+            covered = payload.get('covered_until')
+            if isinstance(covered, int) and covered > self._closes_covered_until.get(
+                    position_id, 0):
+                self._closes_covered_until[position_id] = covered
+            accepted = payload.get('accepted_until')
+            if isinstance(accepted, int) and accepted > self._resume_accepted_until.get(
+                    position_id, 0):
+                self._resume_accepted_until[position_id] = accepted
+            overlap = payload.get('overlap')
+            if (isinstance(overlap, list) and len(overlap) == 2
+                    and all(isinstance(bound, int) for bound in overlap)
+                    and position_id not in self._expiry_overlaps):
+                self._expiry_overlaps[position_id] = (overlap[0], overlap[1])
+            wait = payload.get('wait')
+            if isinstance(wait, dict) and position_id not in self._unexplained_shrinks:
+                seen_since = wait.get('seen_since')
+                deadline = wait.get('deadline')
+                covered_from = wait.get('covered_from')
+                if (isinstance(seen_since, (int, float))
+                        and isinstance(deadline, (int, float))):
+                    self._shrink_seen_since[position_id] = float(seen_since)
+                    self._unexplained_shrinks[position_id] = float(deadline)
+                    if isinstance(covered_from, int):
+                        self._shrink_covered_from[position_id] = covered_from
+            self._coverage_journalled[position_id] = payload
+
+    def _cover_unexplained_retirement(self, position_id: int, read_started_at: float) -> None:
+        """A wait's expiry retired a shortfall no deal explained: cover its closes too.
+
+        The shortfall retired is the snapshot's. The closes in it executed
+        before the read in venue time, which is known only up to the clock
+        skew: the regular coverage (:meth:`_cover_closes`) ends the skew
+        BEFORE the read, and the span from there to the skew AFTER the read
+        is kept as the position's expiry overlap
+        (:attr:`~_CTraderBase._expiry_overlaps`). A close executed in it is
+        either one the expiry retired or one the snapshot did not hold yet.
+        Its push never books it (:meth:`~_EventStreamMixin._in_expiry_overlap`):
+        only the deal history's judgment does, for the part the journal
+        still counts above the venue, newest first against the shortfall
+        that judgment finds (:meth:`_book_expiry_overlap`). A close the
+        snapshot did not hold is booked under its own deal, price and entry;
+        one the expiry retired is never booked twice.
+        """
+        self._cover_closes(position_id, read_started_at)
+        start = self._closes_covered_until[position_id]
+        end = int(read_started_at * 1000) + _CLOCK_SKEW_MS
+        if end > start:
+            self._expiry_overlaps[position_id] = (start, end)
+            self._journal_close_coverage(position_id)
+
+    def _close_expiry_overlap(self, position_id: int, read_started_at: float) -> None:
+        """A settled snapshot showed the position holding the bot's share: end its overlap.
+
+        Once the read started more than the clock skew after the overlap
+        (:attr:`~_CTraderBase._expiry_overlaps`) ended, every close executed
+        in it is one the venue shows, and the journal holding exactly the
+        venue counts none of them: each is retired, and a later shortfall is
+        never one of them (:attr:`_closes_covered_until`).
+        """
+        self._load_close_evidence()
+        overlap = self._expiry_overlaps.get(position_id)
+        if overlap is None or int(read_started_at * 1000) - _CLOCK_SKEW_MS < overlap[1]:
+            return
+        del self._expiry_overlaps[position_id]
+        if overlap[1] > self._closes_covered_until.get(position_id, 0):
+            self._closes_covered_until[position_id] = overlap[1]
+        self._journal_close_coverage(position_id)
+
+    def _book_expiry_overlap(
+            self, position_id: int, booked: Sequence[tuple[_PositionDeal, int]],
+            deals: Sequence[_PositionDeal], *, covered_from: int, shortfall: float,
+    ) -> tuple[list[tuple[_PositionDeal, int]], int]:
+        """Split a shrink verdict's closes into the parts to book and those retired already.
+
+        A close executed before ``covered_from`` was retired by an earlier
+        pass. One executed in the position's expiry overlap
+        (:attr:`~_CTraderBase._expiry_overlaps`) is booked only for the part
+        the shortfall leaves after every later close, newest first: the
+        closes the snapshot did not hold executed after every close the
+        expiry retired, on the venue's own clock. The bot's own closes sent
+        after the expiry's read may explain the shortfall too, with a deal the
+        history does not show yet (:meth:`_post_expiry_close_pending`): their
+        volume is left to them, so an overlap close the expiry retired is
+        never booked in place of one still missing. Within a shrink's wait the
+        judgment waits for them instead (:meth:`_overlap_awaits_own_close`),
+        so this reservation only decides a verdict the wait could not settle.
+        A close executed after the overlap is booked whole, and so is one in
+        it whose order is an own close sent after the expiry's read: it never
+        executed before that read, so the expiry cannot have retired it.
+
+        :param booked: The closes of the bot's share the verdict stands for,
+            with the volume (cents) each took.
+        :param deals: Every deal of the history the verdict was judged from.
+        :param covered_from: Venue time (ms) up to which earlier passes had
+            retired the position's closes.
+        :param shortfall: Units the journal share counts above the venue now.
+        :return: The ``(deal, cents)`` parts to book, in execution order, and
+            the cents of the verdict retired already.
+        """
+        start, end = self._expiry_overlaps.get(position_id, (0, 0))
+        start = max(start, covered_from)
+        own_after = {record.order_id for record in self._post_expiry_closes(position_id, end)
+                     if record.order_id is not None}
+        retired = 0
+        later: list[tuple[_PositionDeal, int]] = []
+        inside: list[tuple[_PositionDeal, int]] = []
+        for deal, cents in booked:
+            if deal.executed_ms < covered_from:
+                retired += cents
+            elif start <= deal.executed_ms < end and deal.order_id not in own_after:
+                inside.append((deal, cents))
+            else:
+                later.append((deal, cents))
+        budget = raw_volume(shortfall) - sum(cents for _deal, cents in later)
+        if inside:
+            budget -= raw_volume(self._post_expiry_close_pending(position_id, end, deals))
+        kept: list[tuple[_PositionDeal, int]] = []
+        for deal, cents in sorted(inside, key=lambda part: part[0].executed_ms, reverse=True):
+            part = max(0, min(cents, budget))
+            budget -= part
+            retired += cents - part
+            if part > 0:
+                kept.append((deal, part))
+        parts = kept + later
+        parts.sort(key=lambda part: part[0].executed_ms)
+        return parts, retired
+
+    def _post_expiry_closes(self, position_id: int, end: int) -> list[_OwnClose]:
+        """The bot's own closes of the position sent after an expiry's read.
+
+        The read is ``end`` (ms) less the clock skew, both on this process's
+        clock: a close sent after it never executed before it, so the expiry
+        never retired any of its volume.
+
+        :param end: The end (ms) of the position's expiry overlap.
+        """
+        return [record for record in self._own_close_history
+                if record.position_id == position_id and record.sent_ms > end - _CLOCK_SKEW_MS]
+
+    def _post_expiry_close_pending(
+            self, position_id: int, end: int, deals: Sequence[_PositionDeal], *,
+            still_executing: bool = False,
+    ) -> float:
+        """Units of the bot's own closes sent after an expiry the history does not show yet.
+
+        A close sent after the expiry's read (``end`` less the clock skew,
+        both on this process's clock) is never one the expiry retired. What
+        it executed, or may still have executed, beyond its deals in
+        ``deals`` (matched by its order id) may stand in the shortfall with a
+        deal the history does not show yet: a close confirmed filled (by its
+        answer or its push, in this process or in an earlier one that
+        journalled it) counts what it executed; one in flight, or answered and
+        still able to execute within its grace, counts the volume it asked
+        for.
+
+        :param end: The end (ms) of the position's expiry overlap.
+        :param deals: Every deal of the position's history read now.
+        :param still_executing: Count only the closes that may still execute.
+        """
+        now = monotonic()
+        pending = 0.0
+        for record in self._post_expiry_closes(position_id, end):
+            done = record.complete or record.expires_at <= now
+            if done and still_executing:
+                continue
+            if done:
+                expected = record.executed + record.unfolded_claims()
+            elif record.volume is None:
+                continue
+            else:
+                expected = record.volume
+            shown = 0.0 if record.order_id is None else volume_to_units(sum(
+                deal.closed for deal in deals if deal.order_id == record.order_id))
+            pending += max(0.0, expected - shown)
+        return pending
+
+    def _overlap_awaits_own_close(
+            self, position_id: int, deals: Sequence[_PositionDeal], *,
+            still_executing: bool = False, vanished: bool = False,
+    ) -> bool:
+        """Whether judging the position's history now would have to guess an own close.
+
+        True while an unjudged closing deal executed in the position's expiry
+        overlap, of an order no own close sent after the expiry's read made
+        (that one is booked whole), and an own close sent after the expiry may have executed
+        without its deal in ``deals`` (:meth:`_post_expiry_close_pending`):
+        the overlap deal is one the expiry retired or one the snapshot did
+        not hold, and only the close's deal, or its end without one, tells
+        how much of the shortfall is left to the overlap. A later pass judges
+        the history with every deal still unjudged.
+
+        A position that vanished is closed in full, so every unit an own close
+        sent after the expiry executed, or may execute, is part of its close:
+        with ``vanished`` set, such a close missing from ``deals`` is waited
+        for even while no overlap deal shows yet, as the rows' judgment would
+        otherwise retire them without it.
+
+        :param still_executing: Wait only for a close that may still execute
+            (in flight, or answered and within its grace); a close confirmed
+            filled whose deal the history lacks is then left to the
+            reservation of :meth:`_book_expiry_overlap`.
+        :param vanished: The position no longer shows on the venue.
+        """
+        overlap = self._expiry_overlaps.get(position_id)
+        if overlap is None:
+            return False
+        start, end = overlap
+        own_after = {record.order_id for record in self._post_expiry_closes(position_id, end)
+                     if record.order_id is not None}
+        return ((vanished or any(
+                    deal.closed > 0 and deal.deal_id not in self._judged_close_deals
+                    and start <= deal.executed_ms < end and deal.order_id not in own_after
+                    for deal in deals))
+                and self._post_expiry_close_pending(
+                    position_id, end, deals, still_executing=still_executing) > _VOLUME_TOL)
+
+    def _await_shrink_explanation(
+            self, position_id: int, volume: float, deadline: float, *, covered_from: int,
+    ) -> None:
+        """Keep a confirmed shortfall no deal explains in the journal share until ``deadline``.
+
+        Logged once per wait. Until then a closing push of the position no pass
+        judged, executed after the closes earlier passes retired, is not a late
+        copy of a covered close (:attr:`~_CTraderBase._unexplained_shrinks`).
+
+        :param position_id: The open position below the bot's share.
+        :param volume: The shortfall (units) no judged deal explains.
+        :param deadline: Wall-clock time the wait ends.
+        :param covered_from: Venue time (ms) up to which earlier passes had
+            retired the position's closes when the shortfall was first judged
+            (:attr:`~_CTraderBase._shrink_covered_from`).
+        """
+        self._load_close_evidence()
+        if position_id not in self._unexplained_shrinks:
+            logger.warning(
+                "cTrader: bot position %d holds %s units less than the bot's share and its "
+                "deal history shows no close that took them; waiting up to %.0fs for the "
+                "close's fill", position_id, volume, deadline - epoch_time())
+            self._shrink_covered_from[position_id] = covered_from
+        self._unexplained_shrinks[position_id] = deadline
+        self._journal_close_coverage(position_id)
+
+    def _forget_shrink_wait(self, position_id: int) -> None:
+        """A position no longer holds less than the bot's share: its shrink wait ends."""
+        self._load_close_evidence()
+        self._shrink_seen_since.pop(position_id, None)
+        self._unexplained_shrinks.pop(position_id, None)
+        self._shrink_covered_from.pop(position_id, None)
+        self._journal_close_coverage(position_id)
+
+    def _note_unexplained_shrink(self, position_id: int, volume: float) -> None:
+        """A confirmed shortfall no closing deal explained in time: ERROR + audit.
+
+        The caller retires it from the journal unbound; the engine's position
+        check books the venue change the same way.
+        """
+        logger.error(
+            "cTrader: bot position %d holds %s units less than the bot's share and no deal "
+            "explains it after %.0fs; retired from the journal without a fill", position_id,
+            volume, _UNEXPLAINED_SHRINK_WAIT_S)
+        if self.store_ctx is not None:
+            rows = self._position_entry_rows(position_id)
+            self.store_ctx.log_event(
+                _SHRINK_UNEXPLAINED_EVENT,
+                client_order_id=rows[0].client_order_id if rows else None,
+                exchange_order_id=str(position_id),
+                payload={'position_id': position_id, 'volume': volume})
 
     async def _judge_shrink(
             self, position_id: int, position: 'OpenApiModelMessages.ProtoOAPosition', *,
             venue: float, share_now: float, read_started_at: float,
-    ) -> _ShareReplay | None:
+            settle: Callable[[_ShareReplay, Sequence[_PositionDeal]], None],
+            hold_for_own_close: bool = False, still_executing: bool = False,
+    ) -> bool:
         """Judge the deal history of one position open below the bot's share.
 
-        :return: The verdict on the deals judged now
-            (:meth:`_judge_recovered_close_deals`); ``None`` when the history
-            could not be read or judged yet, or a deal in it may postdate the
-            snapshot: the caller retries on a later pass.
+        A wait past :data:`_UNEXPLAINED_SHRINK_WAIT_S` (``still_executing``)
+        can outlast the engine's hold on its verdict, which then books the
+        shortfall as an external reduction. The close's fill delivered after
+        that is still booked once: the engine holds a fill of an order it
+        counted live at the adoption (a dispatched close's intent maps its
+        order) against the adopted reduction and lets the venue settle it,
+        re-pricing the reduction's synthetic close instead of reducing the
+        book again (``OrderSyncEngine._hold_fill_against_adopted_reduction``).
+
+        :param settle: The caller's writes applying the verdict on the deals
+            judged now, given the verdict and every deal of the history read.
+            They run in the transaction that records the deals judged
+            (:meth:`~_ProtectionMixin._judge_recovered_close_deals`).
+        :param hold_for_own_close: Leave the history unjudged while an own
+            close sent after the position's expiry may have executed without
+            its deal in the history (:meth:`_overlap_awaits_own_close`).
+        :param still_executing: With ``hold_for_own_close``, wait only for a
+            close that may still execute (in flight, or answered and within
+            its grace), as past the shrink wait.
+        :return: Whether the history was judged and ``settle`` applied;
+            ``False`` when the history could not be read or judged yet, or a
+            deal in it may postdate the snapshot: the caller retries on a
+            later pass.
         """
         history = await self._position_history(
             position_id, self._position_window_start(position_id, position))
         if not history.conclusive:
-            return None
+            return False
         cutoff = int(read_started_at * 1000) - _CLOCK_SKEW_MS
         if any(deal.executed_ms >= cutoff for deal in history.position_deals):
-            return None
+            return False
+        if hold_for_own_close and self._overlap_awaits_own_close(
+                position_id, history.position_deals, still_executing=still_executing):
+            # The close's deal may show later with an execution time this
+            # read already passed: the next pass reads the window again.
+            self._deal_walks.pop(-position_id, None)
+            return False
         rows = self._position_entry_rows(position_id)
-        return await self._judge_recovered_close_deals(
-            position_id, history.position_deals,
-            from_entry=rows[0].pine_entry_id if rows else None,
-            venue_now=venue, share_now=share_now)
+        deals = history.position_deals
+        replay = await self._judge_recovered_close_deals(
+            position_id, deals, from_entry=rows[0].pine_entry_id if rows else None,
+            venue_now=venue, share_now=share_now,
+            settle=lambda judged: settle(judged, deals))
+        return replay is not None
 
     async def _judge_unshared_startup_shrink(
             self, position_id: int,
@@ -778,13 +1637,16 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         if any(deal.executed_ms >= cutoff for deal in history.position_deals):
             return
         venue = self._side_volume(position_id, position) if position is not None else 0.0
-        taken = await self._judge_recovered_closes(
+        await self._judge_recovered_closes(
             position_id, history.position_deals, from_entry=pending.from_entry,
             venue_now=venue, share_now=(self._own_share(position_id) or 0.0) + pending.volume,
-            own_orders=pending.order_ids)
-        if taken is not None:
-            self._end_startup_shrink(position_id)
-            self._cover_closes(position_id, read_started_at)
+            own_orders=pending.order_ids,
+            settle=lambda _taken: self._end_judged_startup_shrink(position_id, read_started_at))
+
+    def _end_judged_startup_shrink(self, position_id: int, read_started_at: float) -> None:
+        """End a startup shrink whose deals are judged, covering its closes up to the read."""
+        self._end_startup_shrink(position_id)
+        self._cover_closes(position_id, read_started_at)
 
     def _record_startup_shrink(
             self, position: 'OpenApiModelMessages.ProtoOAPosition', row: 'OrderRow',
@@ -826,7 +1688,9 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         Runs once, from the startup adoption baseline, after this process's
         own findings. An operator resume accepted the venue as it stood: a
         pending shrink found before the resume, or on a position whose rows
-        the resume marked, is accepted with a WARNING and an audit event.
+        the resume marked, is accepted with a WARNING and an audit event, and
+        the closes it retired are covered up to the read that found it
+        (:meth:`_cover_closes`), so no judgment books them later.
         """
         store = self.store_ctx
         if store is None:
@@ -855,6 +1719,9 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             done.add(key)
             if position_id in self._resume_accepted_positions or (
                     resume_ts_ms is not None and found_ms <= resume_ts_ms):
+                # Accepted without its closes judged: every one the baseline
+                # that found it retired executed before that process's read.
+                self._cover_closes(position_id, found_ms / 1000.0, accepted=True)
                 self._note_accepted_by_resume(
                     position_id, client_order_id=coid, volume=float(volume))
                 store.log_event(
@@ -867,16 +1734,23 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 order_ids=[oid for oid in order_ids if isinstance(oid, int)], keys=[key]))
 
     def _merge_startup_shrink(self, position_id: int, shrink: _StartupShrink) -> None:
-        """Add a pending startup shrink to the one already pending on its position."""
+        """Add a pending startup shrink to the one already pending on its position.
+
+        A shortfall wait an earlier process journalled on the position ends:
+        the startup baseline retired the shortfall, and the startup shrink
+        judges its deals.
+        """
         pending = self._startup_shrinks.get(position_id)
         if pending is None:
             self._startup_shrinks[position_id] = shrink
-            return
-        pending.volume += shrink.volume
-        pending.since_ms = min(pending.since_ms, shrink.since_ms)
-        pending.from_entry = pending.from_entry or shrink.from_entry
-        pending.order_ids.extend(oid for oid in shrink.order_ids if oid not in pending.order_ids)
-        pending.keys.extend(shrink.keys)
+        else:
+            pending.volume += shrink.volume
+            pending.since_ms = min(pending.since_ms, shrink.since_ms)
+            pending.from_entry = pending.from_entry or shrink.from_entry
+            pending.order_ids.extend(
+                oid for oid in shrink.order_ids if oid not in pending.order_ids)
+            pending.keys.extend(shrink.keys)
+        self._forget_shrink_wait(position_id)
 
     def _end_startup_shrink(self, position_id: int) -> None:
         """A pending startup shrink got its verdict: never judged again by any process."""
@@ -1143,14 +2017,48 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             parse_protocol_id(position_id_raw, field='position_id')
             if position_id_raw is not None else None
         )
+        order_id: int | None = None
         if order_id_raw is not None:
             order_id = parse_protocol_id(order_id_raw, field='order_id')
+        elif position_id is not None:
+            # A row startup adopted from an open position knows no entry order:
+            # its position's history, walked under the negated position id like
+            # a shrink's, holds the closes.
+            order_id = -position_id
+        if order_id is not None:
+            from_ms = self._deal_since_ms(extras)
+            if position_id is not None and self._own_share(position_id) is not None:
+                # Whichever row of the position is judged first retires the
+                # others: its window spans theirs and any expiry overlap.
+                from_ms = self._vanished_window_start(position_id, from_ms)
+            self._reread_finished_walk(order_id)
             bridge = await self._find_fill_deal(
-                order_id, self._deal_since_ms(extras), close_position_id=position_id,
+                order_id, from_ms, close_position_id=position_id,
                 deadline=self._reconcile_pass_deadline,
             )
             if not bridge.conclusive:
                 return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+            held_pid = (bridge.deal.positionId
+                        if bridge.deal is not None and bridge.deal.positionId else position_id)
+            if (held_pid is not None and not _accepted_by_resume(row)
+                    and self._own_share(held_pid) is not None):
+                since = extras.get(MISSING_PENDING_EXTRA)
+                # Within the shrink wait from the first pass that missed the
+                # position, a confirmed own close whose deal the history lacks
+                # is waited for, whether or not the history shows any close
+                # yet; past it, only one that may still execute is, bounded by
+                # its grace.
+                in_wait = (isinstance(since, (int, float))
+                           and epoch_time() < since + _UNEXPLAINED_SHRINK_WAIT_S)
+                if self._overlap_awaits_own_close(
+                        held_pid, bridge.position_deals, still_executing=not in_wait,
+                        vanished=True):
+                    # An own close sent after the expiry may still execute or
+                    # report its fill: judged once it can no longer. Its deal
+                    # may show with an execution time this read already passed,
+                    # so the next check reads the window again.
+                    self._deal_walks.pop(order_id, None)
+                    return MissingConfirmation(MissingResolution.INCONCLUSIVE)
             if bridge.closed_cents > 0 and (bridge.filled_cents > 0
                                             or position_id is not None):
                 close_pid = (
@@ -1164,15 +2072,19 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                         deal_ids=bridge.closing_deal_ids)
                     self._mark_close_judged(list(bridge.closing_deal_ids))
                 else:
+                    closes: list[tuple[_PositionDeal, int, str | None]] = []
                     replay = await self._judge_recovered_close_deals(
                         close_pid, bridge.position_deals, from_entry=row.pine_entry_id,
-                        counted=bridge.deal_ids)
+                        counted=bridge.deal_ids,
+                        settle=partial(self._settle_vanished_close, row, close_pid, closes,
+                                       self._own_share(close_pid), bridge.position_deals,
+                                       self._undelivered_vanished_closes(
+                                           close_pid, row.client_order_id)))
                     if replay is None:
                         return MissingConfirmation(MissingResolution.INCONCLUSIVE)
                     close_events = tuple(
-                        self._recovered_close_event(
-                            row, deal, cents, from_entry=row.pine_entry_id)
-                        for deal, cents in replay.booked
+                        self._recovered_close_event(row, deal, cents, from_entry=label)
+                        for deal, cents, label in closes
                         if deal.deal_id not in self._seen_deal_ids)
                 # Register the entry fills AND the closing deals: the
                 # closure is concluded from the closing evidence, whose
@@ -1263,15 +2175,110 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         against a flat broker.
         """
         pid_ref = confirmation.position_ref
-        if not pid_ref or self.store_ctx is None:
+        if not pid_ref:
+            return []
+        return [coid for coid in self._position_live_coids(pid_ref)
+                if coid != row.client_order_id]
+
+    def _position_live_coids(self, position_ref: str) -> list[str]:
+        """Client order ids of the live journal rows on the position ``position_ref``."""
+        if self.store_ctx is None:
             return []
         return [
             r.client_order_id
             for r in self.store_ctx.iter_live_orders()
-            if r.client_order_id != row.client_order_id
-               and (str((r.extras or {}).get('position_id') or '') == pid_ref
-                    or r.exchange_order_id == pid_ref)
+            if (str((r.extras or {}).get('position_id') or '') == position_ref
+                or r.exchange_order_id == position_ref)
         ]
+
+    def _settle_vanished_close(
+            self, row: 'OrderRow', position_id: int,
+            closes: list[tuple[_PositionDeal, int, str | None]], share: float | None,
+            history: Sequence[_PositionDeal],
+            undelivered: Sequence[tuple[_PositionDeal, int, str | None]],
+            replay: _ShareReplay,
+    ) -> None:
+        """Apply the judgment of a vanished row's position: the close fills it delivers.
+
+        Runs in the transaction that records the deals judged
+        (:meth:`~_ProtectionMixin._judge_recovered_close_deals`). Closes
+        earlier passes retired without their events, and the part of an
+        expiry overlap's closes the expiry retired, are judged but not
+        delivered again: the same split a shrink judgment applies. The fills
+        are journalled with the position's live rows
+        (:data:`_VANISHED_CLOSE_EVENT`): the CLOSED verdict that delivers them
+        is applied later, by the disappearance tracker, so a verdict no
+        tracker applied (the process stopped first, or the tracker dropped it
+        as stale) leaves them to the next judgment of one of those rows.
+
+        :param row: The vanished row judged.
+        :param closes: Receives ``(deal, cents, label)`` of every close fill
+            the verdict delivers, those of an earlier undelivered judgment
+            first.
+        :param share: The bot's share (units) of the position before the
+            judgment; ``None`` when not known.
+        :param history: Every deal of the position's history read.
+        :param undelivered: The close fills an earlier judgment of one of the
+            row's position siblings journalled and no verdict delivered
+            (:meth:`_undelivered_vanished_closes`).
+        :param replay: The verdict on the deals judged now.
+        """
+        parts = replay.booked if share is None else self._book_expiry_overlap(
+            position_id, replay.booked, history,
+            covered_from=self._closes_covered_until.get(position_id, 0),
+            shortfall=share)[0]
+        known = {deal.deal_id for deal, _cents, _label in undelivered}
+        fresh = [(deal, cents, self._vanished_close_label(position_id, deal, row.pine_entry_id))
+                 for deal, cents in parts if deal.deal_id not in known]
+        closes.extend(undelivered)
+        closes.extend(fresh)
+        if not fresh or self.store_ctx is None:
+            return
+        self.store_ctx.replace_keyed_events(_VANISHED_CLOSE_EVENT, {
+            f'position:{position_id}': {
+                'position_id': position_id,
+                'coids': sorted({row.client_order_id,
+                                 *self._position_live_coids(str(position_id))}),
+                'closes': [
+                    {'deal_id': deal.deal_id, 'order_id': deal.order_id,
+                     'executed_ms': deal.executed_ms, 'filled': deal.filled,
+                     'closed': deal.closed, 'side': deal.side, 'price': deal.price,
+                     'fee': deal.fee, 'cents': cents, 'label': label}
+                    for deal, cents, label in closes],
+            }})
+
+    def _undelivered_vanished_closes(
+            self, position_id: int, coid: str,
+    ) -> list[tuple[_PositionDeal, int, str | None]]:
+        """The close fills a vanished-row judgment journalled for ``coid`` and never delivered.
+
+        The judgment names the position's live rows (:meth:`_settle_vanished_close`).
+        The CLOSED verdict that delivers its fills retires every one of them,
+        so a row of that list still live and judged again was never given
+        them: the earlier verdict was not applied.
+
+        :return: ``(deal, cents, label)`` of each such fill; empty when the
+            journal holds none for the row.
+        """
+        if self.store_ctx is None:
+            return []
+        payload = self.store_ctx.keyed_events_for_run_id(_VANISHED_CLOSE_EVENT).get(
+            f'position:{position_id}')
+        if not payload or coid not in (payload.get('coids') or ()):
+            return []
+        closes: list[tuple[_PositionDeal, int, str | None]] = []
+        for entry in payload.get('closes') or ():
+            try:
+                label = entry.get('label')
+                closes.append((_PositionDeal(
+                    deal_id=int(entry['deal_id']), order_id=int(entry['order_id']),
+                    executed_ms=int(entry['executed_ms']), filled=int(entry['filled']),
+                    closed=int(entry['closed']), side=str(entry['side']),
+                    price=float(entry['price']), fee=float(entry['fee']),
+                ), int(entry['cents']), label if isinstance(label, str) else None))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        return closes
 
     def _register_recovered_deals(
             self, _row: 'OrderRow', deal_ids: tuple[str, ...],
@@ -1297,12 +2304,12 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
 
         The snapshot carries no per-execution terms (``executionPrice`` is the
         order's running average) and no commission, so the event takes both
-        from the order's deal history: the price of exactly the new executions
-        and the commission of every deal not booked yet, which are then marked
-        seen. When the history cannot cover the progress (read failed, or the
-        deals are not listed yet) the fill is still booked on time from the
-        snapshot, without commission, and its deals stay unseen so a later
-        recovery of this order books their commission.
+        from the order's deal history: the price and the commission of exactly
+        the new executions (:meth:`~_ReconcileMixin._recovered_commission`), which are then
+        marked seen. When the history cannot cover the progress (read failed,
+        or the deals are not listed yet) the fill is still booked on time from
+        the snapshot, without commission, and the row journals the range in
+        ``fee_unbooked`` so a later recovery of this order books its commission.
         """
         if self.store_ctx is None:
             return None
@@ -1324,13 +2331,20 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         delta_price = (self._delta_fill_price(bridge.fills, row.filled_qty, fill_qty)
                        if bridge.conclusive else None)
         covered: set[int] = set()
+        new_ids: set[int] = set()
+        patch: dict = {}
         if delta_price is not None:
             fill_price = delta_price
             covered = self._deals_covering(bridge.fills, filled)
-            fee = sum(fill[4] for fill in bridge.fills
-                      if fill[1] in covered and fill[1] not in self._seen_deal_ids)
+            fee, new_ids, ranges_left = self._recovered_commission(row, bridge.fills, fill_qty)
+            if ranges_left is not None:
+                patch[_FEE_UNBOOKED_EXTRA] = ranges_left or None
+        else:
+            # Booked from the snapshot alone: the cursor now counts executions
+            # whose commission no event carried yet.
+            patch[_FEE_UNBOOKED_EXTRA] = [
+                *(extras.get(_FEE_UNBOOKED_EXTRA) or ()), [row.filled_qty, filled]]
         position_id: int | None = order.positionId or None
-        patch: dict = {}
         if position_id and extras.get('position_id') is None:
             patch['position_id'] = position_id
         DispatchJournal(self.store_ctx).apply_reconcile_outcome(
@@ -1349,8 +2363,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         if position_id is not None:
             self._link_position_ref(row.client_order_id, position_id)
         self._record_reconciled_fill(
-            order.orderId, position_id, row.side, fill_qty, bridge.fills,
-            {deal_id for deal_id in covered if deal_id not in self._seen_deal_ids})
+            order.orderId, position_id, row.side, fill_qty, bridge.fills, new_ids)
         self._seen_deal_ids.update(covered)
         avg = (open_positions[position_id].price
                if position_id in open_positions else order.executionPrice)
@@ -1382,7 +2395,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         return covered
 
     async def _recover_vanished_working_row(
-            self, row, order_id: int, open_positions: dict, now_ts: float,
+            self, row, order_id: int, open_positions: dict, now_ts: float, *,
+            working_orders: Collection[int] = (),
     ) -> AsyncIterator[OrderEvent]:
         """Bridge a vanished working order to its outcome via the deal history.
 
@@ -1390,7 +2404,13 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         which the snapshot positions lack) is the deterministic source for
         whether it filled. On a FILLED deal: promote the row to a position
         (set ``position_id`` once, advance ``filled_qty``) and emit the fill the
-        PUSH stream missed. On a conclusive no-fill (the history was fully
+        PUSH stream missed. An order that filled onto a position the bot holds
+        a share of, which then closed, retires the bot's other rows of it too:
+        its closes are judged as a vanished settled row's would be, from the
+        position's history since the closes earlier passes retired, waiting
+        for an own close sent after the position's expiry, and never
+        delivering a close those passes or the expiry retired. On a
+        conclusive no-fill (the history was fully
         paginated and carried no FILLED deal): stamp ``missing_pending_since``
         so a later milestone's grace window can retire it. On an inconclusive
         / failed history query: do nothing — the next pass or the PUSH event
@@ -1405,20 +2425,53 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         if bridge.deal is not None:
             closed_pid = bridge.deal.positionId
             closes: list[tuple[_PositionDeal, int]] = []
+            group: list[tuple['OrderRow', _DealBridgeResult]] = []
             if (closed_pid and closed_pid not in open_positions
                     and bridge.closed_cents > 0 and bridge.filled_cents > 0):
+                share = self._own_share(closed_pid)
+                if self._fill_history_short(bridge, row, order_id):
+                    return
+                widened = await self._with_group_position_history(
+                    bridge, closed_pid, self._deal_since_ms(extras))
+                if widened is None:
+                    return
+                bridge = widened
+                if share is not None and self._overlap_awaits_own_close(
+                        closed_pid, bridge.position_deals,
+                        still_executing=not self._vanished_position_in_wait(closed_pid),
+                        vanished=True):
+                    # An own close sent after the expiry may still show its
+                    # deal, possibly stamped before this read: the next pass
+                    # reads both windows again.
+                    self._deal_walks.pop(order_id, None)
+                    self._deal_walks.pop(-closed_pid, None)
+                    return
+                group = await self._unbooked_position_entries(
+                    row, closed_pid, bridge.position_deals, working_orders=working_orders)
+                if group is None:
+                    return
+                share_now = self._share_with_recovered_fills(closed_pid, [
+                    (entry_row, volume_to_units(entry_bridge.filled_cents))
+                    for entry_row, entry_bridge in ((row, bridge), *group)])
                 replay = await self._judge_recovered_close_deals(
                     closed_pid, bridge.position_deals, from_entry=row.pine_entry_id,
-                    share_now=self._share_with_recovered_fill(
-                        row, closed_pid, volume_to_units(bridge.filled_cents)),
-                    counted=bridge.deal_ids)
+                    share_now=share_now, counted=(
+                        *bridge.deal_ids,
+                        *(deal_id for _row, other in group for deal_id in other.deal_ids)))
                 if replay is None:
                     # Who closed the position is not known yet: retire it on a
                     # later pass, once the closing orders could be looked up.
                     return
-                closes = replay.booked
+                # Closes earlier passes retired without their events, and the
+                # part of an expiry overlap's closes the expiry retired, are
+                # judged but not delivered again: the split a vanished row's
+                # judgment applies.
+                closes = replay.booked if share is None else self._book_expiry_overlap(
+                    closed_pid, replay.booked, bridge.position_deals,
+                    covered_from=self._closes_covered_until.get(closed_pid, 0),
+                    shortfall=share_now)[0]
             for event in self._promote_from_deal(
-                    row, bridge, open_positions, now_ts, closes=closes):
+                    row, bridge, open_positions, now_ts, closes=closes, group=group):
                 yield event
             return
         # Conclusive no-fill: stamp the disappearance breadcrumb only on positive
@@ -1437,6 +2490,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
     def _promote_from_deal(
             self, row, bridge: '_DealBridgeResult', open_positions: dict, now_ts: float,
             *, closes: Sequence[tuple[_PositionDeal, int]] = (),
+            group: Sequence[tuple['OrderRow', '_DealBridgeResult']] = (),
     ) -> list[OrderEvent]:
         """Promote a working row to a filled position from its FILLED deals.
 
@@ -1456,6 +2510,10 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
 
         :param closes: ``(deal, cents)`` of the closing deals that took part of
             the bot's share, with that part, in execution order.
+        :param group: The other working rows whose orders filled onto the same
+            closed position (:meth:`_unbooked_position_entries`), with their
+            deal evidence: their entry fills are delivered before the closes
+            and their rows retired with this one.
         :return: The events to deliver, in execution order.
         """
         deal = bridge.deal
@@ -1475,7 +2533,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         # next pass or PUSH resolves it.
         if position_id and not position_open:
             if bridge.closed_cents > 0 and bridge.filled_cents > 0:
-                events = self._filled_then_closed_events(row, bridge, closes, now_ts)
+                events = self._filled_then_closed_events(
+                    row, bridge, closes, now_ts, group=group)
                 # Record the recovered deals on the shared de-dup channel BEFORE
                 # retiring: cTrader can replay or push an uncorrelated copy of the
                 # same execution after reconnect, and a sibling row sharing this
@@ -1485,8 +2544,13 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 # TP/SL, external close), so they must be seeded explicitly too.
                 self._seen_deal_ids.update(bridge.deal_ids)
                 self._seen_deal_ids.update(bridge.closing_deal_ids)
+                for other, other_bridge in group:
+                    self._seen_deal_ids.update(other_bridge.deal_ids)
                 self._retire_filled_then_closed(
                     row, deal, position_id, bridge.closed_cents)
+                for other, other_bridge in group:
+                    self._retire_filled_then_closed(
+                        other, other_bridge.deal, position_id, bridge.closed_cents)
                 return events
             return []
         # A working order that vanished after only a PARTIAL fill (residual
@@ -1518,6 +2582,19 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         if ((recovered > 0 or link_position)
                 and 'missing_pending_since' in (row.extras or {})):
             self._clear_missing_pending(row)
+        fill_qty = cumulative - row.filled_qty
+        # Commission is booked once per execution, with the fill that advances
+        # the cursor: the recovered delta carries its own executions' and the
+        # ranges a snapshot-only pass booked without it, never a deal the
+        # cursor counts (charged by the push path, possibly in an earlier
+        # process whose de-dup set is gone).
+        fee, delta_ids, ranges_left = self._recovered_commission(row, bridge.fills, fill_qty)
+        emits = bool(new_deal_ids) and fill_qty > 1e-9
+        patch: dict = {}
+        if link_position:
+            patch['position_id'] = position_id
+        if emits and ranges_left is not None:
+            patch[_FEE_UNBOOKED_EXTRA] = ranges_left or None
         if cumulative > row.filled_qty + 1e-9 or link_position:
             DispatchJournal(self.store_ctx).apply_reconcile_outcome(
                 row.client_order_id,
@@ -1527,7 +2604,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     new_state='confirmed',
                     audit_event='reconcile_working_promoted',
                     filled_qty=cumulative,
-                    extras_patch={'position_id': position_id} if link_position else None,
+                    extras_patch=patch or None,
                     audit_payload={'deal_id': deal.dealId, 'position_id': position_id},
                     exchange_order_id=str(position_id or deal.orderId),
                 ),
@@ -1540,25 +2617,22 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             # cursor / position link are now consistent, so emit nothing.
             return []
         self._record_reconciled_fill(
-            deal.orderId, position_id, row.side, cumulative - row.filled_qty, bridge.fills,
-            set(new_deal_ids))
+            deal.orderId, position_id, row.side, fill_qty, bridge.fills, delta_ids)
         self._seen_deal_ids.update(new_deal_ids)
-        if cumulative - row.filled_qty <= 1e-9:
+        if not emits:
             # The recovered deals are new to ``_seen_deal_ids`` (now seeded) but
             # the cumulative they sum to is already covered by the durable cursor
             # (a prior PUSH / reconcile counted this progress). Emitting here
             # would yield a zero-qty fill that ``record_fill`` ignores while the
             # engine still runs its post-fill side effects — seed the ids and stop.
-            # Their commission is unbooked only when the snapshot partial path
-            # booked them while their history was unreadable; ``OrderEvent``
-            # carries a fee only with a fill, so surface the amount instead.
-            new_ids = set(new_deal_ids)
-            unbooked = sum(fill[4] for fill in bridge.fills if fill[1] in new_ids)
-            if unbooked:
+            # Their commission is unbooked only for the ranges a snapshot-only
+            # pass booked; ``OrderEvent`` carries a fee only with a fill, so
+            # surface the amount instead (the ranges stay journalled).
+            if fee:
                 logger.warning(
-                    "cTrader order %d: commission %s of deals %s was not booked "
+                    "cTrader order %d: commission %s of the fill ranges %s was not booked "
                     "(their fill was recovered from the snapshot without history)",
-                    deal.orderId, unbooked, sorted(new_ids),
+                    deal.orderId, fee, (row.extras or {}).get(_FEE_UNBOOKED_EXTRA),
                 )
             return []
         # ``fill_price`` is what ``BrokerPosition.record_fill`` books the emitted
@@ -1567,7 +2641,6 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         # which would re-price the part the cursor already booked.
         # ``avg_price`` (the ExchangeOrder snapshot's display field) still prefers
         # the open position's broker-reported average when present.
-        fill_qty = cumulative - row.filled_qty
         bridge_price = bridge.avg_price or deal.executionPrice or None
         fill_price = (self._delta_fill_price(bridge.fills, row.filled_qty, fill_qty)
                       or bridge_price)
@@ -1575,11 +2648,6 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                if position_open else bridge_price)
         status = (OrderStatus.FILLED if cumulative >= row.qty - 1e-9
                   else OrderStatus.PARTIALLY_FILLED)
-        # Commission is booked once per execution: the PUSH path booked it for
-        # every deal already in ``_seen_deal_ids``, the snapshot partial-fill
-        # path books none, so the unseen deals carry every unbooked commission.
-        new_ids = set(new_deal_ids)
-        fee = sum(fill[4] for fill in bridge.fills if fill[1] in new_ids)
         return [self._fill_event(
             row, event_type='filled', status=status,
             exchange_id=str(position_id or deal.orderId), cumulative=cumulative,
@@ -1591,7 +2659,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
 
     def _filled_then_closed_events(
             self, row, bridge: '_DealBridgeResult',
-            closes: Sequence[tuple[_PositionDeal, int]], now_ts: float,
+            closes: Sequence[tuple[_PositionDeal, int]], now_ts: float, *,
+            group: Sequence[tuple['OrderRow', '_DealBridgeResult']] = (),
     ) -> list[OrderEvent]:
         """The fills of a working order that filled and closed while the stream was down.
 
@@ -1599,7 +2668,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         cumulative beyond the row's cursor, priced and charged from exactly
         the executions it stands for, unless every one of them was applied
         live already — then each close of the bot's share
-        (:meth:`_recovered_close_event`) the stream never delivered. Read
+        (:meth:`_recovered_close_event`) the stream never delivered, labelled
+        as a vanished row's close is (:meth:`_vanished_close_label`). Read
         before the deals are seeded into :attr:`_seen_deal_ids`.
 
         :param row: The working order's journal row.
@@ -1607,31 +2677,121 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         :param closes: ``(deal, cents)`` of the closing deals that took part of
             the bot's share, with that part, in execution order.
         :param now_ts: The observation time, for a deal without an execution time.
-        :return: The events, entry fill first.
+        :param group: Other working rows whose orders filled onto the same
+            position, with their deal evidence: their entry fills too precede
+            the closes.
+        :return: The events, entry fills first.
         """
-        events: list[OrderEvent] = []
+        deal = bridge.deal
+        entries = [event for event in (
+            self._recovered_entry_event(entry_row, entry_bridge, now_ts)
+            for entry_row, entry_bridge in ((row, bridge), *group)) if event is not None]
+        entries.sort(key=lambda event: event.timestamp)
+        events: list[OrderEvent] = list(entries)
+        events.extend(
+            self._recovered_close_event(
+                row, close, cents, from_entry=(
+                    row.pine_entry_id if deal is None else self._vanished_close_label(
+                        deal.positionId, close, row.pine_entry_id)))
+            for close, cents in closes if close.deal_id not in self._seen_deal_ids)
+        return events
+
+    def _recovered_entry_event(
+            self, row, bridge: '_DealBridgeResult', now_ts: float,
+    ) -> OrderEvent | None:
+        """The entry fill of a working order the stream never delivered, or ``None``.
+
+        The order's recovered cumulative beyond the row's cursor, priced and
+        charged from exactly the executions it stands for
+        (:meth:`~_ReconcileMixin._recovered_commission`); ``None`` when every one of them was
+        applied live already. Read before the deals are seeded into
+        :attr:`_seen_deal_ids`.
+        """
         deal = bridge.deal
         new_ids = {deal_id for deal_id in bridge.deal_ids if deal_id not in self._seen_deal_ids}
         cumulative = min(row.qty, max(row.filled_qty, volume_to_units(bridge.filled_cents)))
         fill_qty = cumulative - row.filled_qty
-        if deal is not None and new_ids and fill_qty > _VOLUME_TOL:
-            bridge_price = bridge.avg_price or deal.executionPrice or None
-            events.append(self._fill_event(
-                row, event_type='filled',
-                status=(OrderStatus.FILLED if cumulative >= row.qty - 1e-9
-                        else OrderStatus.PARTIALLY_FILLED),
-                exchange_id=str(deal.positionId or deal.orderId), cumulative=cumulative,
-                fill_qty=fill_qty, avg_price=bridge_price,
-                fill_price=(self._delta_fill_price(bridge.fills, row.filled_qty, fill_qty)
-                            or bridge_price),
-                fee=sum(fill[4] for fill in bridge.fills if fill[1] in new_ids),
-                timestamp=(deal.executionTimestamp / 1000.0
-                           if deal.executionTimestamp else now_ts),
-            ))
-        events.extend(self._recovered_close_event(row, close, cents,
-                                                  from_entry=row.pine_entry_id)
-                      for close, cents in closes if close.deal_id not in self._seen_deal_ids)
-        return events
+        if deal is None or not new_ids or fill_qty <= _VOLUME_TOL:
+            return None
+        fee, _delta_ids, _ranges_left = self._recovered_commission(row, bridge.fills, fill_qty)
+        bridge_price = bridge.avg_price or deal.executionPrice or None
+        return self._fill_event(
+            row, event_type='filled',
+            status=(OrderStatus.FILLED if cumulative >= row.qty - 1e-9
+                    else OrderStatus.PARTIALLY_FILLED),
+            exchange_id=str(deal.positionId or deal.orderId), cumulative=cumulative,
+            fill_qty=fill_qty, avg_price=bridge_price,
+            fill_price=(self._delta_fill_price(bridge.fills, row.filled_qty, fill_qty)
+                        or bridge_price),
+            fee=fee,
+            timestamp=(deal.executionTimestamp / 1000.0
+                       if deal.executionTimestamp else now_ts),
+        )
+
+    async def _unbooked_position_entries(
+            self, row, position_id: int, deals: Sequence[_PositionDeal], *,
+            working_orders: Collection[int] = (),
+            pending_orders: Mapping[str, tuple[int, int]] | None = None,
+    ) -> list[tuple['OrderRow', '_DealBridgeResult']] | None:
+        """The run's other entry rows whose orders filled onto a position that closed.
+
+        A recovery that finds an entry order's position filled then closed (a
+        working order's, or a pending dispatch's at startup) retires the bot's
+        rows of it, so the closes are judged against the share counting every
+        entry fill the journal does not count yet: each other live working or
+        pending dispatch row (not fully filled) whose recorded order opened
+        volume in the position's ``deals``, or which an earlier pass tied to
+        the position (its refs name it, and it carries the ``executedVolume``
+        floor the order reported, :meth:`~_RecoveryMixin._record_recovered_refs`)
+        before its deals show, and each pending dispatch row of
+        ``pending_orders`` (which also names an order the order history ties to
+        the position before its deals show), with its own deal evidence. A
+        runtime pass and a startup recovery thus form the same group.
+        ``None`` while the evidence of
+        one of them cannot be read in full, or shows less than the fill known
+        for its order (:meth:`_fill_history_short`): the recovery waits for a
+        later pass.
+
+        :param row: The entry row being recovered.
+        :param position_id: The closed position the group retires.
+        :param deals: Every deal of the position's history read.
+        :param working_orders: Orders the snapshot still shows working; a row
+            of one is left to its own reconcile.
+        :param pending_orders: Client order id -> ``(venue order, its
+            executedVolume or 0 when not read)`` of the pending dispatch rows
+            whose order filled onto the position
+            (:meth:`~_RecoveryMixin._pending_position_orders`); the journal
+            counts no fill of such a row yet.
+        """
+        if self.store_ctx is None:
+            return []
+        pending_orders = pending_orders or {}
+        opening_orders = {deal.order_id for deal in deals if deal.opened > 0}
+        group: list[tuple['OrderRow', _DealBridgeResult]] = []
+        for other in list(self.store_ctx.iter_live_orders()):
+            pending_id, executed = pending_orders.get(other.client_order_id, (None, 0))
+            extras = other.extras or {}
+            raw = extras.get('order_id') if pending_id is None else pending_id
+            if (other.client_order_id == row.client_order_id or raw is None
+                    or (pending_id is None and other.state not in _ENTRY_ROW_STATES
+                        and other.state not in PENDING_DISPATCH_STATES)
+                    or other.filled_qty >= other.qty - _VOLUME_TOL):
+                continue
+            other_id = parse_protocol_id(raw, field='order_id')
+            tied = (int(extras.get('executed_cents') or 0) > 0
+                    and str(extras.get('position_id')) == str(position_id))
+            if ((pending_id is None and other_id not in opening_orders and not tied)
+                    or other_id in working_orders):
+                continue
+            evidence = await self._find_fill_deal(
+                other_id, self._deal_since_ms(extras),
+                deadline=self._reconcile_pass_deadline)
+            if (not evidence.conclusive
+                    or self._fill_history_short(evidence, other, other_id, executed)
+                    or evidence.deal is None):
+                return None
+            group.append((other, evidence))
+        return group
 
     @staticmethod
     def _delta_fill_price(
@@ -1650,23 +2810,82 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         :param qty: Units of the recovered delta.
         :return: The delta's price, or ``None`` when the deals do not cover it.
         """
+        parts = _ReconcileMixin._executions_after(fills, booked, qty)
+        taken = sum(part for _deal_id, part, _price, _fee in parts)
+        if taken < qty - 1e-9:
+            return None
+        return sum(price * part for _deal_id, part, price, _fee in parts) / taken
+
+    @staticmethod
+    def _executions_after(
+            fills: tuple[tuple[int, int, int, float, float], ...],
+            booked: float, qty: float,
+    ) -> list[tuple[int, float, float, float]]:
+        """The executions that make up the ``qty`` units filled after ``booked``.
+
+        An order fills in time order, so the ``booked`` units are the OLDEST
+        executions; a deal straddling either boundary contributes only its part,
+        with its commission prorated to that part.
+
+        :param fills: The bridge's per-deal terms, oldest first
+            (:attr:`_DealBridgeResult.fills`).
+        :param booked: Units before the slice (a cursor or a range start).
+        :param qty: Units of the slice.
+        :return: ``(deal_id, units, price, commission)`` of each execution part,
+            oldest first; their units sum to less than ``qty`` when the deals
+            do not cover the slice.
+        """
         skip = booked
         taken = 0.0
-        notional = 0.0
-        for _ts, _deal_id, cents, price, _fee in fills:
+        parts: list[tuple[int, float, float, float]] = []
+        for _ts, deal_id, cents, price, fee in fills:
+            if taken >= qty - 1e-9:
+                break
             units = volume_to_units(cents)
             if skip >= units - 1e-9:
                 skip -= units
                 continue
             part = min(units - skip, qty - taken)
             skip = 0.0
-            notional += price * part
+            parts.append((deal_id, part, price, fee * part / units))
             taken += part
-            if taken >= qty - 1e-9:
-                break
-        if taken < qty - 1e-9:
-            return None
-        return notional / taken
+        return parts
+
+    def _recovered_commission(
+            self, row, fills: tuple[tuple[int, int, int, float, float], ...], fill_qty: float,
+    ) -> tuple[float, set[int], list[list[float]] | None]:
+        """The commission a recovered fill of a row books, and what it covers.
+
+        Commission is booked with the fill that advances the row's cursor, so a
+        deal the cursor counts was charged already, in this process or an
+        earlier one of the run: the recovered ``fill_qty`` beyond the cursor is
+        charged from exactly its executions (less those the push path applied
+        in this process), plus every range of the cursor a snapshot-only
+        reconcile booked without commission (row extra ``fee_unbooked``) that
+        the deals cover in full.
+
+        :param row: The row whose fill is recovered.
+        :param fills: The order's per-deal terms, oldest first.
+        :param fill_qty: Units of the recovered fill beyond the cursor.
+        :return: ``(commission, the deal ids beyond the cursor not applied yet,
+            the unbooked ranges left)``; the ranges are ``None`` when the row
+            lists none.
+        """
+        beyond = self._executions_after(fills, row.filled_qty, fill_qty)
+        new_ids = {deal_id for deal_id, _part, _price, _fee in beyond
+                   if deal_id not in self._seen_deal_ids}
+        fee = sum(part_fee for deal_id, _part, _price, part_fee in beyond if deal_id in new_ids)
+        ranges = (row.extras or {}).get(_FEE_UNBOOKED_EXTRA)
+        if not ranges:
+            return fee, new_ids, None
+        left: list[list[float]] = []
+        for start, end in ranges:
+            parts = self._executions_after(fills, float(start), float(end) - float(start))
+            if sum(part for _deal_id, part, _price, _fee in parts) < float(end) - float(start) - 1e-9:
+                left.append([float(start), float(end)])
+                continue
+            fee += sum(part_fee for _deal_id, _part, _price, part_fee in parts)
+        return fee, new_ids, left
 
     def _retire_filled_then_closed(
             self, row, deal, position_id: int, closed_cents: int,
@@ -1892,6 +3111,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         """
         if self.store_ctx is None:
             return
+        self._load_close_evidence()
         async for event in self._disappearance_tracker().observe(
                 {'positions': None}, epoch_time()):
             yield event
@@ -1954,7 +3174,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             ),
             event_type='filled', fill_price=price, fill_qty=qty, timestamp=timestamp,
             from_entry=from_entry, leg_type=LegType.CLOSE, fee=fee,
-            fill_id=str(deal.deal_id),
+            fill_id=str(deal.deal_id), journal_fill_qty=qty,
         )
 
     @staticmethod
@@ -1983,4 +3203,6 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             fill_price=fill_price, fill_qty=fill_qty, timestamp=timestamp,
             pine_id=row.pine_entry_id, from_entry=row.from_entry,
             leg_type=LegType.ENTRY, fee=fee,
+            # ``fill_qty`` is the rise of the row's ``filled_qty`` cursor.
+            journal_fill_qty=fill_qty,
         )

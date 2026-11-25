@@ -28,7 +28,8 @@ import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Sequence
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from google.protobuf.message import Message
@@ -476,16 +477,51 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self._shrink_watch: dict[int, tuple[tuple[int, int], int]] = {}
         #: ``(position_id, (venue_cents, share_cents))`` shrinks already judged.
         self._shrink_judged: set[tuple[int, tuple[int, int]]] = set()
+        #: Wall-clock time the snapshot read started on the first reconcile
+        #: pass that showed an open position below the bot's share, per
+        #: position, until it holds the share again.
+        self._shrink_seen_since: dict[int, float] = {}
+        #: Open positions whose confirmed shortfall below the bot's share no
+        #: deal explains yet, with the wall-clock time the wait for the close
+        #: that explains it ends. See
+        #: ``_ReconcileMixin._judge_position_shrinks``.
+        self._unexplained_shrinks: dict[int, float] = {}
+        #: Per position in :attr:`_unexplained_shrinks`: the venue time (ms) up
+        #: to which earlier passes had retired the position's closes when the
+        #: wait began (:attr:`_closes_covered_until` before the wait's own
+        #: passes moved it). A close executed before it is one an earlier pass
+        #: retired already, never the one the wait is for.
+        self._shrink_covered_from: dict[int, int] = {}
         #: Open positions of the latest reconcile snapshot by ``positionId``
         #: (``None`` before the first), the venue view the engine's position
         #: check read. See ``_ReconcileMixin.fill_recovery_pending``.
         self._snapshot_open_positions: (
             'dict[int, OpenApiModelMessages.ProtoOAPosition] | None') = None
+        #: Wall-clock time the latest reconcile snapshot read started (``None``
+        #: before the first): the startup adoption baseline covers the closes
+        #: it retires up to it. See ``_StateMixin._apply_adoption_baseline``.
+        self._snapshot_read_started_at: float | None = None
         #: Venue time (ms) up to which a reconcile pass retired a position's
         #: closes from the journal without an event of theirs, per position: a
         #: closing-fill push executed earlier is a late copy of one of them.
         #: See ``_ReconcileMixin._cover_closes``.
         self._closes_covered_until: dict[int, int] = {}
+        #: Venue time (ms) up to which an operator resume accepted a position's
+        #: closes as the venue showed them, per position: a judgment of the
+        #: position's history never reports a close executed earlier. See
+        #: ``_ReconcileMixin._cover_closes``.
+        self._resume_accepted_until: dict[int, int] = {}
+        #: Venue time span (ms, ``[start, end)``) per open position around the
+        #: snapshot read whose unexplained shortfall a wait's expiry retired:
+        #: a close executed in it may be one the expiry retired or one the
+        #: snapshot did not hold yet. See
+        #: ``_ReconcileMixin._cover_unexplained_retirement``.
+        self._expiry_overlaps: dict[int, tuple[int, int]] = {}
+        #: The close coverage of each position last journalled (by this
+        #: process, or taken over from an earlier one), so an unchanged state
+        #: is not journalled again. See
+        #: ``_ReconcileMixin._journal_close_coverage``.
+        self._coverage_journalled: dict[int, dict] = {}
         #: Positions a restart found shrunk below the journal share whose
         #: deals are not judged yet: this process's finding and those an
         #: earlier process of the run journalled and never judged. See
@@ -1839,6 +1875,17 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     @abstractmethod
     def _restore_startup_shrinks(self) -> None: ...
 
+    @abstractmethod
+    def _restore_close_coverage(self, store: 'RunContext') -> None: ...
+
+    @abstractmethod
+    def _cover_closes(
+            self, position_id: int, read_started_at: float, *, accepted: bool = False,
+    ) -> None: ...
+
+    @abstractmethod
+    def _judgment_span(self) -> AbstractContextManager[None]: ...
+
     @staticmethod
     @abstractmethod
     def _row_exposure(row: 'OrderRow') -> float: ...
@@ -1866,6 +1913,11 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     ) -> None: ...
 
     @abstractmethod
+    async def close_leg_executed(
+            self, symbol: str, leg_id: str, coids: 'Sequence[str]', since_ms: int,
+    ) -> int | None: ...
+
+    @abstractmethod
     async def reject_out_of_range(
             self, envelope: 'DispatchEnvelope', qty: float,
     ) -> None: ...
@@ -1879,5 +1931,15 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     async def amend_bracket(
             self, symbol: str, leg_id: str, *,
             side: str, tp_price: float | None, sl_price: float | None,
-            trail_offset: float | None, coid: str,
+            trail_offset: float | None, qty: float, coid: str,
     ) -> None: ...
+
+    @abstractmethod
+    async def bracket_matches(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            qty: float,
+    ) -> bool | None: ...

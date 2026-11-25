@@ -32,7 +32,10 @@ from pynecore.core.broker.models import (
     QuarantineKind,
 )
 from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
-from pynecore.core.broker.one_way_emulator import OneWayEmulator
+from pynecore.core.broker.one_way_emulator import (
+    OneWayEmulator,
+    close_leg_attempt_client_order_id,
+)
 from pynecore.core.broker.protection_guard import ProtectionLevels, rebaseline_after_resume
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
@@ -40,6 +43,7 @@ from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     create_bracket_ownership_row,
+    create_close_leg_row,
     create_entry_order_row,
     mark_disposition_unknown,
 )
@@ -55,6 +59,8 @@ from pynecore_ctrader.helpers import (
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
 from pynecore_ctrader.models import _SymbolRules
+from pynecore_ctrader.protection import _PositionDeal
+from pynecore_ctrader.reconcile import _DealBridgeResult
 from pynecore_ctrader.wire import WireClient
 
 _RULES = _SymbolRules(
@@ -1386,6 +1392,149 @@ def __test_partial_close_naming_an_entry_spills_the_rest_oldest_first__(tmp_path
     assert (first.extras or {})['journal_exposure_retired'] == pytest.approx(2.0)
 
 
+def _seed_unfilled_entry(broker, *, coid, pine_id, order_id, position_id=54302872):
+    """Seed an entry row of this run on ``position_id`` whose order has not filled yet."""
+    create_entry_order_row(
+        broker.store_ctx, coid=coid, symbol='EURUSD', side='buy', qty=10.0,
+        intent_key=pine_id, pine_entry_id=pine_id,
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    broker.store_ctx.upsert_order(
+        coid, state='confirmed', exchange_order_id=str(position_id),
+        extras={'kind': 'position', 'order_type': 'market',
+                'order_id': order_id, 'position_id': position_id},
+    )
+    broker.store_ctx.add_ref(coid, 'order_id', order_id)
+
+
+def _entry_fill_event(*, order_id, deal_id, position_id=54302872, cents=1000):
+    """A PUSH fill of the run's own entry order on a NETTING position."""
+    order = _make_order(order_id=order_id, volume=cents, executed=cents, price=1.1,
+                        position_id=position_id,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    deal = _model.ProtoOADeal(dealId=deal_id, filledVolume=cents, executionPrice=1.1)
+    return _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order, deal=deal)
+
+
+def _deliver(broker, messages) -> list:
+    """Run ``messages`` through :meth:`watch_orders`; return the events it yields."""
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        for message in messages:
+            broker._exec_events.put_nowait(message)
+        stream = broker.watch_orders()
+        events = []
+        try:
+            while broker._exec_events.qsize() or broker._released_close_events:
+                events.append(await asyncio.wait_for(stream.__anext__(), timeout=5.0))
+        finally:
+            await stream.aclose()
+        return events
+    return asyncio.run(run())
+
+
+def __test_unbound_close_debits_the_entry_that_filled_first__(tmp_path):
+    """An unbound close of a netted position debits the entries in fill order.
+
+    L1 is journaled first, but L2's order fills first. The core binds each
+    entry order on its first fill and settles a close that names no entry
+    against the oldest binding (``BrokerPosition._settle_bindings``), so the
+    venue's 5-unit close comes off L2. The journal must agree, or a restart
+    rebuilds L1 at 5 and L2 at 10 while the engine held L1 at 10 and L2 at 5.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_unfilled_entry(broker, coid='c1', pine_id='L1', order_id='70211174')
+    _seed_unfilled_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+
+    events = _deliver(broker, [
+        _entry_fill_event(order_id=70211175, deal_id=81),
+        _entry_fill_event(order_id=70211174, deal_id=82),
+        _partial_close_event(position_id=54302872, deal_id=83, closed_cents=500,
+                             remaining_cents=1500),
+    ])
+
+    assert [(e.leg_type, e.pine_id, e.from_entry) for e in events] == [
+        (LegType.ENTRY, 'L2', None), (LegType.ENTRY, 'L1', None),
+        (LegType.CLOSE, None, None)]
+    first = broker.store_ctx.get_order('c1')
+    second = broker.store_ctx.get_order('c2')
+    assert 'journal_exposure_retired' not in (first.extras or {})
+    assert (second.extras or {})['journal_exposure_retired'] == pytest.approx(5.0)
+
+
+def __test_unbound_close_after_a_restart_keeps_the_fill_order__(tmp_path):
+    """The fill order is journaled: a later process debits in the same order."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_unfilled_entry(broker, coid='c1', pine_id='L1', order_id='70211174')
+    _seed_unfilled_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    _deliver(broker, [
+        _entry_fill_event(order_id=70211175, deal_id=81),
+        _entry_fill_event(order_id=70211174, deal_id=82),
+    ])
+    restarted = _FakeBroker()
+    restarted.store_ctx = broker.store_ctx
+
+    restarted._retire_partial_close_exposure(54302872, 12.0, source='position_shrink')
+
+    first = restarted.store_ctx.get_order('c1')
+    second = restarted.store_ctx.get_order('c2')
+    assert (second.extras or {})['journal_exposure_retired'] == pytest.approx(10.0)
+    assert (first.extras or {})['journal_exposure_retired'] == pytest.approx(2.0)
+
+
+def __test_named_close_spills_the_rest_in_fill_order__(tmp_path):
+    """What the named entry cannot absorb goes to the others in fill order."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_unfilled_entry(broker, coid='c1', pine_id='L1', order_id='70211174')
+    _seed_unfilled_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    _seed_unfilled_entry(broker, coid='c3', pine_id='L3', order_id='70211176')
+    _deliver(broker, [
+        _entry_fill_event(order_id=70211176, deal_id=81),
+        _entry_fill_event(order_id=70211175, deal_id=82),
+        _entry_fill_event(order_id=70211174, deal_id=83),
+    ])
+
+    broker._retire_partial_close_exposure(54302872, 15.0, entry_id='L1')
+
+    retired = {coid: (broker.store_ctx.get_order(coid).extras or {}).get(
+        'journal_exposure_retired', 0.0) for coid in ('c1', 'c2', 'c3')}
+    assert retired == pytest.approx({'c1': 10.0, 'c2': 0.0, 'c3': 5.0})
+
+
+def __test_entry_refilled_after_its_exposure_was_spent_goes_last__(tmp_path):
+    """A slice of an entry whose exposure a close spent opens a new binding.
+
+    The core spends L2's binding when a close takes all of it, and binds the
+    next slice of the same order anew, behind L1. The journal moves L2 behind
+    L1 as well.
+    """
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_unfilled_entry(broker, coid='c1', pine_id='L1', order_id='70211174')
+    _seed_unfilled_entry(broker, coid='c2', pine_id='L2', order_id='70211175')
+    partial = _entry_fill_event(order_id=70211175, deal_id=81, cents=1000)
+    partial.executionType = _model.ProtoOAExecutionType.ORDER_PARTIAL_FILL
+    partial.order.tradeData.volume = 2000
+    broker.store_ctx.upsert_order('c2', qty=20.0)
+    rest = _entry_fill_event(order_id=70211175, deal_id=84, cents=2000)
+    rest.deal.filledVolume = 1000
+    _deliver(broker, [partial, _entry_fill_event(order_id=70211174, deal_id=82)])
+    broker._retire_partial_close_exposure(54302872, 10.0)
+    assert (broker.store_ctx.get_order('c2').extras or {})[
+        'journal_exposure_retired'] == pytest.approx(10.0)
+    _deliver(broker, [rest])
+
+    broker._retire_partial_close_exposure(54302872, 4.0)
+
+    first = broker.store_ctx.get_order('c1')
+    second = broker.store_ctx.get_order('c2')
+    assert (first.extras or {})['journal_exposure_retired'] == pytest.approx(4.0)
+    assert (second.extras or {})['journal_exposure_retired'] == pytest.approx(10.0)
+
+
 def __test_full_close_still_retires_the_rows_wholesale__(tmp_path):
     """A flat close keeps taking the ``_mark_position_closed`` branch."""
     broker = _FakeBroker()
@@ -1798,6 +1947,201 @@ def __test_close_leg_other_rejects_propagate__():
         asyncio.run(broker.close_leg("EURUSD", "7", 2000, "coid-c"))
 
 
+def _close_leg_store(tmp_path, name="close-leg.sqlite"):
+    """A journal for the leg-close probe, and a function opening a process instance of it."""
+    store = BrokerStore(tmp_path / name, plugin_name="ctrader")
+    identity = RunIdentity(strategy_id="s", symbol="EURUSD", timeframe="60", account_id="999")
+    return store, lambda: store.open_run(identity, script_source="// t")
+
+
+def _close_leg_history(monkeypatch, broker, history):
+    """Answer ``broker``'s deal-history reads with ``history()``; returns the asks."""
+    asked: list[tuple[int, int, int | None]] = []
+
+    async def find_fill_deal(order_id, from_ms, *, close_position_id=None, deadline=None):
+        asked.append((order_id, from_ms, close_position_id))
+        return history()
+
+    monkeypatch.setattr(broker, '_find_fill_deal', find_fill_deal)
+    return asked
+
+
+def __test_close_leg_executed_sums_the_positions_closing_deals__(monkeypatch, tmp_path):
+    """A lost-answer leg close's executed volume is what the position's closing deals took.
+
+    A ``ProtoOAClosePositionReq`` carries no client id, so once the close's
+    answer is lost every closing deal on the position since the close counts
+    (an over-count only leaves the leg less reduced), deals before the window
+    do not, and no answer is given while a closing order is still working,
+    the history is incomplete, or the deals do not cover what the close could
+    have closed (cTrader's deal-history publication lag is not measured: a
+    closing deal can still be missing).
+    """
+    since_ms = 1_700_000_000_000
+
+    def deal(deal_id: int, executed_ms: int, closed: int) -> _PositionDeal:
+        return _PositionDeal(deal_id=deal_id, order_id=deal_id + 1, executed_ms=executed_ms,
+                             filled=closed, closed=closed, side='sell', price=1.1, fee=0.0)
+
+    current = _DealBridgeResult(
+        None, 0, None, True,
+        position_deals=(deal(1, since_ms - 120_000, 500), deal(2, since_ms + 50, 1000),
+                        deal(3, since_ms + 900, 300)),
+    )
+    broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(ctidTraderAccountId=999))
+    store, open_instance = _close_leg_store(tmp_path)
+    broker.store_ctx = open_instance()
+    broker._settle_own_close(
+        broker._open_own_close(7, 10.0, coid="coid-c", volume_cents=1000), None)
+    asked = _close_leg_history(monkeypatch, broker, lambda: current)
+
+    def executed() -> int | None:
+        return asyncio.run(broker.close_leg_executed("EURUSD", "7", ["coid-c"], since_ms))
+
+    assert executed() == 1300
+    assert asked[0][0] == -7 and asked[0][2] == 7 and asked[0][1] < since_ms
+    current = _DealBridgeResult(None, 0, None, False)
+    assert executed() is None
+    broker._reconcile_res = _oa.ProtoOAReconcileRes(
+        ctidTraderAccountId=999, order=[_make_order(position_id=7, closing=True)])
+    assert executed() is None
+    store.close()
+
+
+def __test_close_leg_executed_waits_while_the_history_shows_no_closing_deal__(
+        monkeypatch, tmp_path):
+    """A conclusive history read without the close's deal is not proof it never executed.
+
+    The close's answer was lost, so only the deal history can show what it
+    did, and how late cTrader publishes a closing deal there is not measured.
+    Answering 0 from a read that does not show the deal yet would let the
+    replay close the leg a second time.
+    """
+    since_ms = 1_700_000_000_000
+    current = _DealBridgeResult(None, 0, None, True)
+    broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(ctidTraderAccountId=999))
+    store, open_instance = _close_leg_store(tmp_path)
+    broker.store_ctx = open_instance()
+    broker._settle_own_close(
+        broker._open_own_close(7, 10.0, coid="coid-c", volume_cents=1000), None)
+    _close_leg_history(monkeypatch, broker, lambda: current)
+
+    def executed() -> int | None:
+        return asyncio.run(broker.close_leg_executed("EURUSD", "7", ["coid-c"], since_ms))
+
+    assert executed() is None
+    current = _DealBridgeResult(None, 0, None, True, position_deals=(_PositionDeal(
+        deal_id=5, order_id=6, executed_ms=since_ms + 10, filled=400, closed=400,
+        side='sell', price=1.1, fee=0.0),))
+    assert executed() is None
+    current = _DealBridgeResult(None, 0, None, True, position_deals=(_PositionDeal(
+        deal_id=5, order_id=6, executed_ms=since_ms + 10, filled=1000, closed=1000,
+        side='sell', price=1.1, fee=0.0),))
+    assert executed() == 1000
+    store.close()
+
+
+def __test_close_leg_executed_is_zero_for_a_send_that_never_reached_the_wire__(
+        monkeypatch, tmp_path):
+    """A close row persisted before a crash that came before the send is decidable.
+
+    The own-close record is journalled before the request is written, so a
+    coid without one never reached the venue: it executed nothing, and the
+    replay may send the close, without waiting on any venue read.
+    """
+    broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(ctidTraderAccountId=999))
+    store, open_instance = _close_leg_store(tmp_path)
+    broker.store_ctx = open_instance()
+    asked = _close_leg_history(monkeypatch, broker, lambda: _DealBridgeResult(None, 0, None, False))
+    assert asyncio.run(broker.close_leg_executed(
+        "EURUSD", "7", ["coid-c"], 1_700_000_000_000)) == 0
+    assert asked == []
+    store.close()
+
+
+def __test_close_leg_executed_reads_a_send_an_earlier_process_made__(monkeypatch, tmp_path):
+    """A send journalled by an earlier process instance of the run counts.
+
+    The earlier process lost the close's answer; the restarted one must not
+    take its coid for one that never reached the wire.
+    """
+    store, open_instance = _close_leg_store(tmp_path)
+    first = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(ctidTraderAccountId=999))
+    first.store_ctx = open_instance()
+    first._settle_own_close(
+        first._open_own_close(7, 10.0, coid="coid-c", volume_cents=1000), None)
+    first_instance = first.store_ctx.run_instance_id
+    first.store_ctx.close()
+    restarted = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(ctidTraderAccountId=999))
+    restarted.store_ctx = open_instance()
+    assert restarted.store_ctx.run_instance_id != first_instance
+    _close_leg_history(monkeypatch, restarted, lambda: _DealBridgeResult(None, 0, None, True))
+    assert asyncio.run(restarted.close_leg_executed(
+        "EURUSD", "7", ["coid-c"], 1_700_000_000_000)) is None
+    store.close()
+
+
+def __test_close_leg_executed_settles_an_answered_send_by_its_order__(monkeypatch, tmp_path):
+    """A send whose answer named its close order is settled by that order's status.
+
+    A refused send executed nothing; an ended order executed its
+    ``executedVolume`` whatever the deal history shows yet; one still accepted,
+    or a lookup that fails, leaves the answer open.
+    """
+    broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(ctidTraderAccountId=999))
+    store, open_instance = _close_leg_store(tmp_path)
+    broker.store_ctx = open_instance()
+    broker._settle_own_close(
+        broker._open_own_close(7, 10.0, coid="coid-c", volume_cents=1000), 4242)
+    broker._drop_own_close(broker._open_own_close(7, 10.0, coid="coid-c#1", volume_cents=1000))
+    asked = _close_leg_history(monkeypatch, broker, lambda: _DealBridgeResult(None, 0, None, True))
+    status = {'value': _model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, 'executed': 600}
+    lookups: list[int] = []
+
+    async def account_request(req):
+        assert isinstance(req, _oa.ProtoOAOrderDetailsReq)
+        lookups.append(req.orderId)
+        if status['value'] is None:
+            raise CTraderProtocolError('ORDER_NOT_FOUND', '')
+        return _oa.ProtoOAOrderDetailsRes(
+            ctidTraderAccountId=999,
+            order=_make_order(order_id=req.orderId, status=status['value'],
+                              executed=status['executed'], position_id=7, closing=True))
+
+    monkeypatch.setattr(broker, '_account_request', account_request)
+
+    def executed() -> int | None:
+        return asyncio.run(broker.close_leg_executed(
+            "EURUSD", "7", ["coid-c", "coid-c#1"], 1_700_000_000_000))
+
+    assert executed() == 600
+    assert lookups == [4242] and asked == []
+    status['value'] = _model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED
+    status['executed'] = 0
+    assert executed() == 0
+    status['value'] = _model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    assert executed() is None
+    status['value'] = None
+    assert executed() is None
+    store.close()
+
+
+def __test_close_leg_resend_keeps_the_close_s_pine_identity__(tmp_path):
+    """A replay re-send of a leg close is labelled with the close's own Pine id."""
+    broker = _FakeBroker()
+    store = BrokerStore(tmp_path / "resend.sqlite", plugin_name="ctrader")
+    broker.store_ctx = store.open_run(RunIdentity(
+        strategy_id="s", symbol="EURUSD", timeframe="60", account_id="999"), script_source="// t")
+    create_close_leg_row(
+        broker.store_ctx, coid="pc:7", symbol="EURUSD", side="sell", qty=2.0,
+        intent_key="Long", pine_entry_id="Long", parent_close_coid="pc", leg_id="7",
+        leg_volume=2000, leg_pre_volume=5000,
+    )
+    asyncio.run(broker.close_leg("EURUSD", "7", 1000, close_leg_attempt_client_order_id("pc:7", 1)))
+    assert broker._close_dispatch_pine_by_position[7] == "Long"
+    store.close()
+
+
 def __test_place_leg_builds_new_order_request__():
     broker = _FakeBroker()
     intent = EntryIntent(pine_id="L", symbol="EURUSD", side="buy", qty=10.0,
@@ -1814,7 +2158,7 @@ def __test_amend_bracket_builds_sltp_request__():
     broker = _FakeBroker()
     asyncio.run(broker.amend_bracket(
         "EURUSD", "3", side="sell", tp_price=1.30, sl_price=1.10,
-        trail_offset=None, coid="coid-b",
+        trail_offset=None, qty=1.0, coid="coid-b",
     ))
     amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
     assert len(amends) == 1
@@ -1839,7 +2183,7 @@ def __test_amend_bracket_all_none_clears_protection__():
     broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(position=[position]))
     asyncio.run(broker.amend_bracket(
         "EURUSD", "3", side="sell", tp_price=None, sl_price=None,
-        trail_offset=None, coid="coid-clear",
+        trail_offset=None, qty=1.0, coid="coid-clear",
     ))
     amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
     assert len(amends) == 2
@@ -1848,6 +2192,46 @@ def __test_amend_bracket_all_none_clears_protection__():
     assert amends[0].trailingStopLoss is False
     set_fields = {f.name for f, _ in amends[1].ListFields()}
     assert set_fields.isdisjoint({"stopLoss", "takeProfit", "trailingStopLoss"})
+
+
+def __test_bracket_matches_reads_the_protection_the_position_holds__():
+    """The fate of an amend without an answer is read from the position itself."""
+    def matches(*, held: dict, status=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                **levels) -> bool | None:
+        position = _model.ProtoOAPosition(
+            positionId=3, positionStatus=status,
+            tradeData=_model.ProtoOATradeData(
+                symbolId=1, volume=1000, tradeSide=_model.ProtoOATradeSide.BUY),
+            **held,
+        )
+        broker = _FakeBroker(reconcile=_oa.ProtoOAReconcileRes(position=[position]))
+        wanted = dict(tp_price=None, sl_price=None, trail_offset=None)
+        wanted.update(levels)
+        return asyncio.run(broker.bracket_matches(
+            "EURUSD", "3", side="sell", qty=1.0, **wanted))
+
+    fixed = dict(stopLoss=1.1, takeProfit=1.3)
+    assert matches(held=fixed, tp_price=1.30, sl_price=1.10)
+    assert not matches(held=fixed, tp_price=1.30, sl_price=1.12)
+    assert not matches(held=fixed, sl_price=1.10)  # the position holds a take-profit too
+    assert not matches(held=fixed)  # a clear did not take effect
+    assert matches(held={}) and not matches(held={}, sl_price=1.10)
+    # A trailing stop has moved since it was written, and the position does not
+    # report its distance: an earlier trailing stop looks the same, so the read
+    # cannot tell (None), never a guessed match.
+    trailing = dict(stopLoss=1.17, trailingStopLoss=True)
+    assert matches(held=trailing, sl_price=1.10, trail_offset=0.05) is None
+    assert matches(held=trailing, trail_offset=0.05) is None
+    assert matches(held=dict(trailing, takeProfit=1.3), sl_price=1.10, trail_offset=0.05,
+                   tp_price=1.30) is None
+    # A level the position does report still decides.
+    assert matches(held=dict(trailing, takeProfit=1.3), trail_offset=0.05) is False
+    assert matches(held={}, trail_offset=0.05) is False
+    assert not matches(held=trailing, sl_price=1.17)
+    assert not matches(held=dict(stopLoss=1.1), sl_price=1.10, trail_offset=0.05)
+    # A closed position holds nothing and matches no write.
+    assert not matches(
+        held={}, status=_model.ProtoOAPositionStatus.POSITION_STATUS_CLOSED)
 
 
 def __test_amend_bracket_clear_of_a_bare_position_is_an_idempotent_noop__():
@@ -1878,7 +2262,7 @@ def __test_amend_bracket_clear_of_a_bare_position_is_an_idempotent_noop__():
     broker._raise_on_dispatch = reject
     asyncio.run(broker.amend_bracket(
         "EURUSD", "3", side="sell", tp_price=None, sl_price=None,
-        trail_offset=None, coid="coid-clear-bare",
+        trail_offset=None, qty=1.0, coid="coid-clear-bare",
     ))
     amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
     assert len(amends) == 1
@@ -1917,7 +2301,7 @@ def __test_amend_bracket_clear_continues_when_the_trailing_disable_has_nothing_t
         reconcile=_oa.ProtoOAReconcileRes(position=[position]))
     asyncio.run(broker.amend_bracket(
         "EURUSD", "3", side="sell", tp_price=None, sl_price=None,
-        trail_offset=None, coid="coid-clear-trailing",
+        trail_offset=None, qty=1.0, coid="coid-clear-trailing",
     ))
     amends = [r for r in broker.sent if isinstance(r, _oa.ProtoOAAmendPositionSLTPReq)]
     assert len(amends) == 2
@@ -2540,10 +2924,10 @@ def __test_quarantine_refuses_every_write_path_but_reads_still_go_out__(tmp_path
         'close_leg': lambda: broker.close_leg("EURUSD", "555", 1000, "coid-c"),
         'amend_bracket': lambda: broker.amend_bracket(
             "EURUSD", "555", side="sell", tp_price=1.30, sl_price=1.10,
-            trail_offset=None, coid="coid-b"),
+            trail_offset=None, qty=1.0, coid="coid-b"),
         'clear_bracket': lambda: broker.amend_bracket(
             "EURUSD", "555", side="sell", tp_price=None, sl_price=None,
-            trail_offset=None, coid="coid-clear"),
+            trail_offset=None, qty=1.0, coid="coid-clear"),
         'publish_native_failsafe_sl': lambda: broker.publish_native_failsafe_sl(
             NativeBracketSnapshot(
                 parent_entry_dispatch_ref='parent', symbol='EURUSD',
@@ -6521,7 +6905,7 @@ def _guard_state(broker) -> tuple:
 def _merged_amend(broker, *, sl, tp, trail_offset=None) -> None:
     asyncio.run(broker.amend_bracket(
         "EURUSD", str(_PID), side="sell", tp_price=tp, sl_price=sl,
-        trail_offset=trail_offset, coid="coid-merged"))
+        trail_offset=trail_offset, qty=1.0, coid="coid-merged"))
 
 
 @pytest.mark.parametrize('levels', [(1.1, 1.3), (1.1, None), (1.05, 1.3)])
@@ -7111,7 +7495,7 @@ def _hedged_guarded_broker(tmp_path, *, sl=1.1, tp=1.3, trail_offset=None):
     _set_venue(broker)
     asyncio.run(broker.amend_bracket(
         'EURUSD', str(_PID), side='sell', tp_price=tp, sl_price=sl,
-        trail_offset=trail_offset, coid='bo-attach'))
+        trail_offset=trail_offset, qty=1.0, coid='bo-attach'))
     return broker
 
 
@@ -7151,7 +7535,7 @@ def __test_hedged_leg_own_amend_and_clear_and_their_echoes_are_never_reported__(
     _set_venue(broker, sl=1.1, tp=1.3)
     asyncio.run(broker.amend_bracket(
         'EURUSD', str(_PID), side='sell', tp_price=1.4, sl_price=1.15,
-        trail_offset=None, coid='bo-amend'))
+        trail_offset=None, qty=1.0, coid='bo-amend'))
     for levels in ({'sl': 1.1, 'tp': 1.3}, {'sl': 1.15, 'tp': 1.4}):
         broker._translate_exec_event(_replaced_push(**levels))
     _set_venue(broker, sl=1.15, tp=1.4)
@@ -7160,7 +7544,7 @@ def __test_hedged_leg_own_amend_and_clear_and_their_echoes_are_never_reported__(
 
     asyncio.run(broker.amend_bracket(
         'EURUSD', str(_PID), side='sell', tp_price=None, sl_price=None,
-        trail_offset=None, coid='bo-clear'))
+        trail_offset=None, qty=1.0, coid='bo-clear'))
     broker._translate_exec_event(_replaced_push(sl=1.15, tp=1.4))
     _set_venue(broker)
     for _ in range(3):

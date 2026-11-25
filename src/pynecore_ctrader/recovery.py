@@ -57,6 +57,7 @@ Resolution rules:
 import asyncio
 import logging
 from abc import ABC
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from time import time as epoch_time
 from typing import cast
@@ -75,7 +76,7 @@ from ._base import _UNKNOWN_DISPATCH_TTL_S
 from .helpers import REQUEST_TIMEOUT, parse_protocol_id, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
-from .protection import _accepted_by_resume
+from .protection import _PositionDeal, _accepted_by_resume
 from .reconcile import _SINCE_ANCHOR_SKEW_MS, _ReconcileMixin
 from .wire import CTraderWireError
 
@@ -336,6 +337,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                         position_id=live_order.positionId or None,
                         submitted_at_ms=(live_order.utcLastUpdateTimestamp
                                          or int(epoch_time() * 1000)),
+                        executed_cents=live_order.executedVolume,
                     )
                     return False
                 self._seen_deal_ids.update(partial.deal_ids)
@@ -359,7 +361,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         found = await self._find_order_by_coid(coid, from_ms)
         if found.order is not None:
             return await self._resolve_recovered_order(
-                row, found.order, open_positions, from_ms)
+                row, found.order, open_positions, from_ms, orders_by_coid=orders_by_coid)
         # Neither source carried the coid. Only a COMPLETE order-history read is
         # evidence of absence — a truncated / failed read stays still_unknown and
         # is retried by the next runtime reconcile re-entry. Never re-dispatch.
@@ -369,9 +371,14 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
 
     async def _resolve_recovered_order(
             self, row, order, open_positions: 'dict[int, OpenApiModelMessages.ProtoOAPosition]',
-            from_ms: int,
+            from_ms: int, *,
+            orders_by_coid: Mapping[str, OpenApiModelMessages.ProtoOAOrder],
     ) -> bool:
-        """Classify a recovered order's disposition from order + deal history."""
+        """Classify a recovered order's disposition from order + deal history.
+
+        :param orders_by_coid: The live snapshot's working orders by client
+            order id.
+        """
         if self.store_ctx is None:
             return False
         # A terminal status with ZERO executed volume is a clean reject / cancel /
@@ -396,36 +403,72 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                     and bridge.deal is not None):
                 # Filled then closed while down. Who closed it is judged first,
                 # against the bot's share counting the fill this row recovers (its
-                # order is the bot's entry, though no ref links it yet): a retired
-                # row leaves every later reconcile scan, so this is the only pass
-                # that can apply the intervention policy. Right after an
-                # operator resume the close is accepted instead. While a closing
-                # order cannot be looked up the row stays pending with its refs,
-                # like an inconclusive history read below.
-                if _accepted_by_resume(row):
+                # order is the bot's entry, though no ref links it yet) and those
+                # of the run's other entry rows whose orders filled onto the same
+                # position (:meth:`_unbooked_position_entries`), which retire
+                # with it: a retired row leaves every later reconcile scan, so
+                # this is the only pass that can apply the intervention policy.
+                # Right after an operator resume the close is accepted instead.
+                # While a closing order, a sibling's order or its deals cannot be
+                # looked up the row stays pending with its refs, like an
+                # inconclusive history read below, and so does it while the
+                # order's deals show less than the ``executedVolume`` the
+                # order reports (:meth:`_fill_history_short`). The closes are
+                # judged over the position's history from the earliest window
+                # of the rows that may join (:meth:`_with_group_position_history`).
+                group = None
+                pending_orders = None
+                widened = None
+                if not self._fill_history_short(
+                        bridge, row, order.orderId, order.executedVolume):
+                    widened = await self._with_group_position_history(
+                        bridge, position_id, from_ms)
+                if widened is not None:
+                    bridge = widened
+                    pending_orders = await self._pending_position_orders(
+                        row, order.orderId, position_id, bridge.position_deals,
+                        orders_by_coid)
+                if pending_orders is not None:
+                    group = await self._unbooked_position_entries(
+                        row, position_id, bridge.position_deals,
+                        working_orders={o.orderId for o in orders_by_coid.values()},
+                        pending_orders=pending_orders)
+                judged = group is not None
+                if group is not None and _accepted_by_resume(row):
                     self._note_accepted_by_resume(
                         position_id, client_order_id=row.client_order_id, volume=None,
                         deal_ids=bridge.closing_deal_ids)
                     self._mark_close_judged(list(bridge.closing_deal_ids))
-                elif await self._judge_recovered_closes(
+                elif group is not None:
+                    judged = await self._judge_recovered_closes(
                         position_id, bridge.position_deals, from_entry=row.pine_entry_id,
-                        share_now=self._share_with_recovered_fill(
-                            row, position_id, volume_to_units(bridge.filled_cents)),
-                        counted=bridge.deal_ids, own_orders=(order.orderId,)) is None:
+                        share_now=self._share_with_recovered_fills(position_id, [
+                            (entry_row, volume_to_units(entry_bridge.filled_cents))
+                            for entry_row, entry_bridge in ((row, bridge), *group)]),
+                        counted=(*bridge.deal_ids, *(
+                            deal_id for _row, other in group for deal_id in other.deal_ids)),
+                        own_orders=(order.orderId, *(
+                            other.deal.orderId for _row, other in group
+                            if other.deal is not None))) is not None
+                if not judged or group is None:
                     self._record_recovered_refs(
                         row, order_id=order.orderId, position_id=position_id,
                         submitted_at_ms=(order.utcLastUpdateTimestamp
                                          or int(epoch_time() * 1000)),
+                        executed_cents=order.executedVolume,
                     )
                     return False
                 # Seed the shared de-dup with the entry fills AND the closing
                 # deals BEFORE retiring, so a reconnect PUSH replay of either is
-                # not re-applied, then land the row closed through the writer.
+                # not re-applied, then land the rows closed through the writer.
                 self._seen_deal_ids.update(bridge.deal_ids)
                 self._seen_deal_ids.update(bridge.closing_deal_ids)
-                self._retire_filled_then_closed(
-                    row, bridge.deal, position_id, bridge.closed_cents)
-                self._clear_intent_anchor(row)
+                for _row, other in group:
+                    self._seen_deal_ids.update(other.deal_ids)
+                for entry_row, entry_bridge in ((row, bridge), *group):
+                    self._retire_filled_then_closed(
+                        entry_row, entry_bridge.deal, position_id, bridge.closed_cents)
+                    self._clear_intent_anchor(entry_row)
                 return False
             if not bridge.conclusive:
                 # Position gone from the open snapshot but the deal-history read
@@ -441,6 +484,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                     row, order_id=order.orderId, position_id=position_id,
                     submitted_at_ms=(order.utcLastUpdateTimestamp
                                      or int(epoch_time() * 1000)),
+                    executed_cents=order.executedVolume,
                 )
                 return False
         if not bridge.filled_cents and order.executedVolume and not bridge.conclusive:
@@ -457,6 +501,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                 row, order_id=order.orderId, position_id=position_id,
                 submitted_at_ms=(order.utcLastUpdateTimestamp
                                  or int(epoch_time() * 1000)),
+                executed_cents=order.executedVolume,
             )
             return False
         recovered = (volume_to_units(bridge.filled_cents) if bridge.filled_cents
@@ -553,7 +598,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
 
     def _record_recovered_refs(
             self, row, *, order_id: int, position_id: int | None,
-            submitted_at_ms: int, before_adoption: bool = True,
+            submitted_at_ms: int, executed_cents: int, before_adoption: bool = True,
     ) -> None:
         """Mirror the broker refs onto a still-pending coid-matched row.
 
@@ -584,6 +629,14 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         above. The runtime reconcile re-entry owns the advance once the deal
         history reads conclusively. A running bot has its adoption baseline
         behind it (``before_adoption=False``), so its rows get no marker.
+
+        The ``executedVolume`` the order reports is kept as the row's
+        ``executed_cents`` floor (never lowered, never a fill cursor): the
+        runtime re-entry that later judges the row's deal evidence
+        (:meth:`_fill_history_short`) still knows every fill the venue already
+        reported for the order, though the journal counts none of it yet.
+
+        :param executed_cents: The order's ``executedVolume``.
         """
         if self.store_ctx is None:
             return
@@ -592,6 +645,8 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         extras['order_id'] = str(order_id)
         extras['position_id'] = position_id or None
         extras['submitted_at_ms'] = self._recovered_since_anchor_ms(row, submitted_at_ms)
+        extras['executed_cents'] = max(
+            int(executed_cents), int(extras.get('executed_cents') or 0))
         if before_adoption:
             extras['recovered_inconclusive'] = True
         self.store_ctx.upsert_order(coid, extras=extras)
@@ -691,6 +746,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             self._record_recovered_refs(
                 row, order_id=order.orderId, position_id=order.positionId or None,
                 submitted_at_ms=order.utcLastUpdateTimestamp or int(epoch_time() * 1000),
+                executed_cents=order.executedVolume,
                 before_adoption=False,
             )
             return ParkedVerdict(ParkedOutcome.LANDED, order_id=str(order.orderId), status=status)
@@ -745,7 +801,9 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
 
         The deal history is read before the store is touched; both rows are
         then read again and the donor's reduction, the row's confirmation and
-        the audit event commit in one transaction. The de-dup is seeded only
+        the audit events commit in one transaction
+        (:meth:`~pynecore_ctrader.protection._ProtectionMixin._judgment_span`), whose
+        rollback also puts back what this process noted of them. The de-dup is seeded only
         after that commit, so a failed transfer suppresses no fill and is
         repeated whole by a later lookup.
 
@@ -780,7 +838,7 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         filled = 0.0
         held: str | None = None
         try:
-            with store.transaction():
+            with self._judgment_span():
                 current = store.get_order(row.client_order_id)
                 donor = store.get_order(adopted.client_order_id)
                 if (current is None or current.closed_ts_ms is not None
@@ -945,6 +1003,67 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         :return: The anchor in ms.
         """
         return min(broker_ts_ms, cls._recovery_lower_bound_ms(row) + _SINCE_ANCHOR_SKEW_MS)
+
+    async def _pending_position_orders(
+            self, row, order_id: int, position_id: int, deals: Sequence[_PositionDeal],
+            orders_by_coid: Mapping[str, OpenApiModelMessages.ProtoOAOrder],
+    ) -> dict[str, tuple[int, int]] | None:
+        """The orders of the run's other pending dispatch rows that filled onto ``position_id``.
+
+        A pending row's order is the one the order history echoes its client
+        order id on (its recorded refs name the same order, but carry no fill);
+        one the live snapshot still shows working is left to its own recovery.
+        Every pending row's order is read on every pass, so the
+        ``executedVolume`` it reports is known each time the group is judged,
+        not only on the pass that first found the order. A row joins when its
+        order opened volume in ``deals``, or when the order history ties an
+        order with executed volume to the position before any of its deals
+        shows: its evidence is then short (:meth:`_fill_history_short`), and the
+        group waits.
+
+        :param row: The pending row being recovered.
+        :param order_id: Its venue order.
+        :param position_id: The closed position the group retires.
+        :param deals: Every deal of the position's history read.
+        :param orders_by_coid: The live snapshot's working orders by client order id.
+        :return: Client order id -> ``(venue order, its executedVolume, 0 when
+            the order history no longer shows it)``
+            (:meth:`_unbooked_position_entries`); ``None`` while an
+            order-history read is inconclusive.
+        """
+        if self.store_ctx is None:
+            return {}
+        pending = [other for other in find_pending_dispatch(self.store_ctx)
+                   if other.client_order_id != row.client_order_id
+                   and other.client_order_id not in orders_by_coid]
+        pending_coids = {other.client_order_id for other in pending}
+        linked = {order_id}
+        for other in self.store_ctx.iter_live_orders():
+            raw = (other.extras or {}).get('order_id')
+            if raw is not None and other.client_order_id not in pending_coids:
+                linked.add(parse_protocol_id(raw, field='order_id'))
+        unlinked = {deal.order_id for deal in deals if deal.opened > 0} - linked
+        found: dict[str, tuple[int, int]] = {}
+        for other in pending:
+            raw = (other.extras or {}).get('order_id')
+            lookup = await self._find_order_by_coid(
+                other.client_order_id, self._recovery_lower_bound_ms(other))
+            if lookup.order is None and not lookup.conclusive:
+                return None
+            executed = 0
+            tied = False
+            if lookup.order is not None:
+                other_id: int | None = lookup.order.orderId
+                executed = int(lookup.order.executedVolume)
+                tied = executed > 0 and lookup.order.positionId == position_id
+            else:
+                other_id = parse_protocol_id(raw, field='order_id') if raw is not None else None
+            if other_id is not None and other_id not in linked and (
+                    other_id in unlinked or tied):
+                found[other.client_order_id] = (other_id, executed)
+                linked.add(other_id)
+                unlinked.discard(other_id)
+        return found
 
     async def _find_order_by_coid(
             self, coid: str, from_ms: int,

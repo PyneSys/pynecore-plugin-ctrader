@@ -56,6 +56,7 @@ from pynecore.core.broker.models import (
     OrderStatus,
     OrderType,
 )
+from pynecore.core.broker.one_way_emulator import close_leg_row_client_order_id
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
@@ -921,7 +922,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         pine_id: str | None = None
         intent_key = coid
         if self.store_ctx is not None:
-            row = self.store_ctx.get_order(coid)
+            row = self.store_ctx.get_order(close_leg_row_client_order_id(coid))
             if row is not None:
                 pine_id = row.pine_entry_id
                 intent_key = row.intent_key or coid
@@ -996,6 +997,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             tp_price: float | None,
             sl_price: float | None,
             trail_offset: float | None,
+            qty: float,
             coid: str,
     ) -> None:
         """Replicate (or, all-None, clear) a protective bracket on ONE leg.
@@ -1012,7 +1014,12 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         core emulator wraps it into a
         :class:`BracketAttachAfterFillRejectedError` so the open, now-unprotected
         position is flattened defensively rather than halting the bot.
+
+        ``qty`` is unused: a position's SL/TP covers the whole position, which
+        is all the core ever asks of this port (``sized_leg_bracket`` is
+        declared ``SOFTWARE``).
         """
+        del qty
         position_id = int(leg_id)
         if tp_price is None and sl_price is None and trail_offset is None:
             await self._clear_position_bracket(
@@ -1049,6 +1056,58 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                 return
             raise
 
+    async def bracket_matches(
+            self, symbol: str, leg_id: str, *,
+            side: str,
+            tp_price: float | None,
+            sl_price: float | None,
+            trail_offset: float | None,
+            qty: float,
+    ) -> bool | None:
+        """Whether position ``leg_id`` holds exactly the protection this amend writes.
+
+        Reads the position from a fresh reconcile snapshot and compares its
+        ``takeProfit`` and trailing flag with the amend's levels after the
+        symbol's price rounding. The ``stopLoss`` is compared too unless the
+        amend asks for a trailing stop: cTrader then moves the stop itself.
+        The position does not report the trailing distance either, so a
+        trailing position whose take-profit matches a trailing write cannot
+        tell whether this write or an earlier trailing stop is in force (the
+        amend from one trailing stop to another with the take-profit kept):
+        the answer is ``None``, "cannot tell", never a guessed match. A
+        position that is not open holds nothing and matches no write.
+        """
+        del side, qty
+        position_id = int(leg_id)
+        rules = await self._get_symbol_rules(symbol)
+        snapshot = await self._reconcile()
+        position = next(
+            (position for position in snapshot.position
+             if position.positionId == position_id
+             and position.positionStatus
+             == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN),
+            None,
+        )
+        if position is None:
+            return False
+        tolerance = 0.5 * 10.0 ** -rules.digits
+
+        def same(held: float | None, wanted: float | None) -> bool:
+            if held is None or wanted is None:
+                return held is wanted
+            return abs(held - round_price(wanted, rules.digits)) <= tolerance
+
+        held_tp = position.takeProfit if position.HasField('takeProfit') else None
+        held_sl = position.stopLoss if position.HasField('stopLoss') else None
+        trailing = position.HasField('trailingStopLoss') and position.trailingStopLoss
+        if not same(held_tp, tp_price):
+            return False
+        if trail_offset is not None:
+            if not trailing or held_sl is None:
+                return False
+            return None
+        return not trailing and same(held_sl, sl_price)
+
     async def _send_own_close(
             self, req: OpenApiMessages.ProtoOAClosePositionReq, *,
             coid: str, context: str,
@@ -1064,7 +1123,8 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         write, an unexpected response, a cancellation — may have executed the
         close: its outcome is unknown.
         """
-        record = self._open_own_close(req.positionId, volume_to_units(req.volume))
+        record = self._open_own_close(req.positionId, volume_to_units(req.volume),
+                                      coid=coid, volume_cents=req.volume)
         try:
             event = await self._dispatch_order(req, coid=coid, context=context)
         except BaseException as exc:

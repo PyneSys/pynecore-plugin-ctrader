@@ -47,13 +47,16 @@ class _RecoveryWire:
     """
 
     def __init__(self, *, order_res=None, deal_res=None, order_fail=False,
-                 deal_fail=False, orders=()):
+                 deal_fail=False, orders=(), honour_window=False):
         self._order_res = order_res
         self._deal_res = deal_res
         self._order_fail = order_fail
         self._deal_fail = deal_fail
         self.orders = {order.orderId: order for order in orders}
         self.requests: list = []
+        #: Answer a deal-history read with only the deals of its time window,
+        #: as the venue does.
+        self.honour_window = honour_window
 
     async def send_request(self, req, *, timeout=None, **_kwargs):
         self.requests.append(req)
@@ -64,6 +67,10 @@ class _RecoveryWire:
         if isinstance(req, _oa.ProtoOADealListReq):
             if self._deal_fail:
                 raise RuntimeError("deal history down")
+            if self.honour_window and self._deal_res is not None:
+                return _oa.ProtoOADealListRes(deal=[
+                    deal for deal in self._deal_res.deal
+                    if req.fromTimestamp <= deal.executionTimestamp <= req.toTimestamp])
             return self._deal_res
         if isinstance(req, _oa.ProtoOAOrderDetailsReq):
             if req.orderId not in self.orders:
@@ -387,6 +394,407 @@ def __test_recover_filled_then_closed_unjudged_close_stays_pending__(tmp_path):
     assert row.state == 'submitted'
     assert (row.extras or {}).get('order_id') is not None
     assert reports == []
+
+
+@pytest.mark.parametrize('sibling', ['pending', 'working'])
+def __test_recover_two_filled_then_closed_entries_judge_their_joint_share__(tmp_path, sibling):
+    """Two entry rows (c4: order 111, c5: order 112, 10 units each) filled
+    onto position 222 while the bot was down; c4 is a pending dispatch, c5
+    one too or a confirmed working order. Another client's order 999 then
+    closed 10 units, and the venue's SL/TP order 998 closed the rest. The bot's
+    share was 20 units, so 999 took the venue below it: reported once, and
+    both rows retire with c4's recovery."""
+    foreign = _close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=1000)
+    native = _close_deal(deal_id=907, order_id=998, position_id=222, closed_volume=1000)
+    native.executionTimestamp = foreign.executionTimestamp + 1_000
+    foreign_order = _closing_order(999)
+    foreign_order.executedVolume = 1000
+    native_order = _closing_order(
+        998, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, coid='')
+    native_order.executedVolume = 1000
+    broker = _RecoveryBroker(
+        _recon(positions=[]),
+        order_res=_order_res(
+            _order(order_id=111, coid='c4', volume=1000, executed=1000,
+                   position_id=222, status=_FILLED),
+            _order(order_id=112, coid='c5', volume=1000, executed=1000,
+                   position_id=222, status=_FILLED)),
+        deal_res=_deal_res(
+            _deal(deal_id=904, order_id=111, position_id=222, filled_volume=1000),
+            _deal(deal_id=905, order_id=112, position_id=222, filled_volume=1000),
+            foreign, native),
+        orders=[foreign_order, native_order],
+    )
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid in ('c4', 'c5'):
+        _seed_submitted(broker, coid, qty=volume_to_units(1000))
+    if sibling == 'working':
+        row = broker.store_ctx.get_order('c5')
+        broker.store_ctx.upsert_order(
+            'c5', state='confirmed', exchange_order_id='112',
+            extras={**(row.extras or {}), 'order_id': '112',
+                    'submitted_at_ms': 1_699_999_990_000})
+        broker.store_ctx.add_ref('c5', 'order_id', '112')
+
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert _live_coids(broker) == set()
+    assert broker.store_ctx.get_order('c5').state == 'closed'
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [906]
+
+
+def __test_recover_filled_then_closed_groups_an_older_sibling_outside_its_window__(tmp_path):
+    """The case above with a confirmed working sibling (c5, order 112) sent ten
+    minutes before c4, whose fill (deal 905) executed before c4's own deal
+    window, and a deal history that honours each read's window. The closes are
+    judged over the position's history from c5's window on: the foreign close
+    is reported, and c5 retires with c4 instead of staying live for a runtime
+    recovery that would deliver its entry against closes already judged."""
+    now_ms = int(time.time() * 1000)
+
+    def at(deal, ms):
+        deal.executionTimestamp = ms
+        return deal
+
+    foreign_order = _closing_order(999)
+    foreign_order.executedVolume = 1000
+    native_order = _closing_order(
+        998, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, coid='')
+    native_order.executedVolume = 1000
+    broker = _RecoveryBroker(
+        _recon(positions=[]),
+        order_res=_order_res(_order(order_id=111, coid='c4', volume=1000, executed=1000,
+                                    position_id=222, status=_FILLED)),
+        deal_res=_deal_res(
+            at(_deal(deal_id=905, order_id=112, position_id=222, filled_volume=1000),
+               now_ms - 420_000),
+            at(_deal(deal_id=904, order_id=111, position_id=222, filled_volume=1000),
+               now_ms - 30_000),
+            at(_close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=1000),
+               now_ms - 20_000),
+            at(_close_deal(deal_id=907, order_id=998, position_id=222, closed_volume=1000),
+               now_ms - 10_000)),
+        orders=[foreign_order, native_order],
+    )
+    broker._wire.honour_window = True
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid in ('c4', 'c5'):
+        _seed_submitted(broker, coid, qty=volume_to_units(1000))
+    row = broker.store_ctx.get_order('c5')
+    broker.store_ctx.upsert_order(
+        'c5', state='confirmed', exchange_order_id='112',
+        extras={**(row.extras or {}), 'order_id': '112', 'submitted_at_ms': now_ms - 600_000})
+    broker.store_ctx.add_ref('c5', 'order_id', '112')
+
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert _live_coids(broker) == set()
+    assert broker.store_ctx.get_order('c5').state == 'closed'
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [906]
+
+
+def __test_recover_filled_then_closed_waits_for_every_fill_the_order_reports__(tmp_path):
+    """The order history reports c4's order 111 executed 10 units, but the
+    deal history shows only its first 5-unit deal (904) when another client's
+    order 999 has closed the 10-unit position. Judged then, the bot's share
+    would count 5 units: the row stays pending instead. Once the history shows
+    the missing deal (903, stamped before the first read's end), the next
+    recovery reads the order's whole window again and judges the close against
+    the full 10-unit share."""
+    now_ms = int(time.time() * 1000)
+
+    def at(deal, ms):
+        deal.executionTimestamp = ms
+        return deal
+
+    foreign_order = _closing_order(999)
+    foreign_order.executedVolume = 1000
+    broker = _RecoveryBroker(
+        _recon(positions=[]),
+        order_res=_order_res(_order(order_id=111, coid='c4', volume=1000, executed=1000,
+                                    position_id=222, status=_FILLED)),
+        deal_res=_deal_res(
+            at(_deal(deal_id=904, order_id=111, position_id=222, filled_volume=500),
+               now_ms - 30_000),
+            at(_close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=1000),
+               now_ms - 20_000)),
+        orders=[foreign_order],
+    )
+    broker._wire.honour_window = True
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    _seed_submitted(broker, 'c4', qty=volume_to_units(1000))
+
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert 'c4' in _live_coids(broker)
+    assert reports == []
+    assert 906 not in broker._seen_deal_ids
+
+    broker._wire._deal_res.deal.insert(0, at(
+        _deal(deal_id=903, order_id=111, position_id=222, filled_volume=500),
+        now_ms - 40_000))
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert _live_coids(broker) == set()
+    assert {903, 904, 906} <= broker._seen_deal_ids
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [906]
+    assert reports[0][1]['booked_qty'] == 10.0
+
+
+def __test_recover_filled_then_closed_waits_for_every_fill_a_sibling_s_order_reports__(
+        tmp_path):
+    """The joint-share case with pending rows c4 (order 111) and c5 (order
+    112), where the order history reports c5's order executed 10 units but the
+    deal history shows only its first 5-unit deal (905): the group waits, both
+    rows stay pending and nothing is reported. Once the missing deal (908)
+    shows, the next recovery judges the closes against the full 20-unit share."""
+    now_ms = int(time.time() * 1000)
+
+    def at(deal, ms):
+        deal.executionTimestamp = ms
+        return deal
+
+    foreign_order = _closing_order(999)
+    foreign_order.executedVolume = 1000
+    native_order = _closing_order(
+        998, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, coid='')
+    native_order.executedVolume = 1000
+    broker = _RecoveryBroker(
+        _recon(positions=[]),
+        order_res=_order_res(
+            _order(order_id=111, coid='c4', volume=1000, executed=1000,
+                   position_id=222, status=_FILLED),
+            _order(order_id=112, coid='c5', volume=1000, executed=1000,
+                   position_id=222, status=_FILLED)),
+        deal_res=_deal_res(
+            at(_deal(deal_id=904, order_id=111, position_id=222, filled_volume=1000),
+               now_ms - 40_000),
+            at(_deal(deal_id=905, order_id=112, position_id=222, filled_volume=500),
+               now_ms - 30_000),
+            at(_close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=1000),
+               now_ms - 20_000),
+            at(_close_deal(deal_id=907, order_id=998, position_id=222, closed_volume=1000),
+               now_ms - 10_000)),
+        orders=[foreign_order, native_order],
+    )
+    broker._wire.honour_window = True
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid in ('c4', 'c5'):
+        _seed_submitted(broker, coid, qty=volume_to_units(1000))
+
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert _live_coids(broker) == {'c4', 'c5'}
+    assert reports == []
+
+    broker._wire._deal_res.deal.insert(2, at(
+        _deal(deal_id=908, order_id=112, position_id=222, filled_volume=500),
+        now_ms - 25_000))
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert _live_coids(broker) == set()
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [906]
+
+
+def _joint_share_broker(tmp_path, now_ms, *sibling_deals):
+    """Pending rows c4 (order 111, its 10-unit deal 904) and c5 (order 112,
+    whose order history reports 10 units executed onto position 222 and whose
+    deals are ``sibling_deals``); another client's order 999 closed 10 units of
+    the position and the venue's SL/TP order 998 the rest."""
+    def at(deal, ms):
+        deal.executionTimestamp = ms
+        return deal
+
+    foreign_order = _closing_order(999)
+    foreign_order.executedVolume = 1000
+    native_order = _closing_order(
+        998, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, coid='')
+    native_order.executedVolume = 1000
+    broker = _RecoveryBroker(
+        _recon(positions=[]),
+        order_res=_order_res(
+            _order(order_id=111, coid='c4', volume=1000, executed=1000,
+                   position_id=222, status=_FILLED),
+            _order(order_id=112, coid='c5', volume=1000, executed=1000,
+                   position_id=222, status=_FILLED)),
+        deal_res=_deal_res(
+            at(_deal(deal_id=904, order_id=111, position_id=222, filled_volume=1000),
+               now_ms - 40_000),
+            *sibling_deals,
+            at(_close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=1000),
+               now_ms - 20_000),
+            at(_close_deal(deal_id=907, order_id=998, position_id=222, closed_volume=1000),
+               now_ms - 10_000)),
+        orders=[foreign_order, native_order],
+    )
+    broker._wire.honour_window = True
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid in ('c4', 'c5'):
+        _seed_submitted(broker, coid, qty=volume_to_units(1000))
+    return broker, reports
+
+
+def __test_recover_filled_then_closed_keeps_waiting_for_a_sibling_s_fill_on_every_pass__(
+        tmp_path):
+    """The sibling case above read twice before c5's missing deal (908) shows.
+    The first pass records c5's order refs while it waits; the second still
+    knows the 10 units the order history reports for c5's order 112, so the
+    group keeps waiting instead of judging the foreign close against a 15-unit
+    share. Once the deal shows, the closes are judged against all 20 units."""
+    now_ms = int(time.time() * 1000)
+    first = _deal(deal_id=905, order_id=112, position_id=222, filled_volume=500)
+    first.executionTimestamp = now_ms - 30_000
+    broker, reports = _joint_share_broker(tmp_path, now_ms, first)
+
+    for _ in range(2):
+        _recover(broker)
+        broker._flush_external_interventions()
+        assert _live_coids(broker) == {'c4', 'c5'}
+        assert reports == []
+    assert (broker.store_ctx.get_order('c5').extras or {}).get('order_id') == '112'
+
+    late = _deal(deal_id=908, order_id=112, position_id=222, filled_volume=500)
+    late.executionTimestamp = now_ms - 25_000
+    broker._wire._deal_res.deal.insert(2, late)
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert _live_coids(broker) == set()
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [906]
+    assert reports[0][1]['booked_qty'] == 10.0
+
+
+def __test_recover_filled_then_closed_waits_for_a_sibling_whose_deals_have_not_shown__(
+        tmp_path):
+    """The order history ties c5's order 112 (10 units executed) to the closed
+    position 222 before any of its deals shows. c5 joins c4's group anyway and
+    the group waits, so the foreign close is never judged against c4's 10 units
+    alone. Once c5's deal (905) shows, the closes are judged against 20 units."""
+    now_ms = int(time.time() * 1000)
+    broker, reports = _joint_share_broker(tmp_path, now_ms)
+
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert 'c4' in _live_coids(broker)
+    assert reports == []
+    assert 906 not in broker._seen_deal_ids
+
+    deal = _deal(deal_id=905, order_id=112, position_id=222, filled_volume=1000)
+    deal.executionTimestamp = now_ms - 30_000
+    broker._wire._deal_res.deal.insert(1, deal)
+    _recover(broker)
+    broker._flush_external_interventions()
+
+    assert _live_coids(broker) == set()
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [906]
+    assert reports[0][1]['booked_qty'] == 10.0
+
+
+def _joint_share_fills(events) -> list[tuple[str, str | None, float]]:
+    """The fill events of a reconcile pass as ``(order id, entry coid, units)``."""
+    return sorted((event.order.id, getattr(event.order, 'client_order_id', None),
+                   event.fill_qty)
+                  for event in events if event.event_type in ('filled', 'partial'))
+
+
+def __test_live_reconcile_keeps_waiting_for_a_sibling_s_fill_startup_waited_for__(tmp_path):
+    """Startup leaves c4 and c5 pending while c5's order 112 reports 10 units
+    executed but its deals show 5. The first live reconcile pass after that
+    handoff still knows those 10 units from the floor startup recorded on c5,
+    so it keeps both rows instead of retiring them against a 15-unit share.
+    Once the missing deal (908) shows, the pass books both 10-unit entries and
+    both 10-unit closes (the stream ends flat), reports the foreign close
+    against all 20 units, and a later pass emits nothing."""
+    now_ms = int(time.time() * 1000)
+    first = _deal(deal_id=905, order_id=112, position_id=222, filled_volume=500)
+    first.executionTimestamp = now_ms - 30_000
+    broker, reports = _joint_share_broker(tmp_path, now_ms, first)
+    _recover(broker)
+    broker._flush_external_interventions()
+    assert (broker.store_ctx.get_order('c5').extras or {}).get('executed_cents') == 1000
+
+    events = _reconcile_events(broker)
+    broker._flush_external_interventions()
+
+    assert _joint_share_fills(events) == []
+    assert _live_coids(broker) == {'c4', 'c5'}
+    assert reports == []
+
+    late = _deal(deal_id=908, order_id=112, position_id=222, filled_volume=500)
+    late.executionTimestamp = now_ms - 25_000
+    broker._wire._deal_res.deal.insert(2, late)
+    events = _reconcile_events(broker)
+    broker._flush_external_interventions()
+
+    assert _joint_share_fills(events) == [
+        ('222', 'c4', 10.0), ('222', 'c5', 10.0), ('998', None, 10.0), ('999', None, 10.0)]
+    assert _live_coids(broker) == set()
+    assert len(reports) == 1
+    assert reports[0][1]['deal_ids'] == [906]
+    assert reports[0][1]['booked_qty'] == 10.0
+    assert _joint_share_fills(_reconcile_events(broker)) == []
+
+
+def __test_live_reconcile_waits_for_a_sibling_tied_to_the_position_before_its_deals__(
+        tmp_path):
+    """c4 and c5 carry the refs and the ``executedVolume`` floor a waiting
+    startup records (c5's order 112 reported 10 units on position 222), but no
+    deal of c5's order shows yet. The live pass joins c5 to c4's group through
+    those refs and waits, so the foreign close is never judged against c4's 10
+    units alone; once c5's deal (905) shows, the stream ends flat."""
+    now_ms = int(time.time() * 1000)
+    broker, reports = _joint_share_broker(tmp_path, now_ms)
+    for coid, order_id in (('c4', 111), ('c5', 112)):
+        broker._record_recovered_refs(
+            broker.store_ctx.get_order(coid), order_id=order_id, position_id=222,
+            submitted_at_ms=now_ms - 60_000, executed_cents=1000)
+
+    events = _reconcile_events(broker)
+    broker._flush_external_interventions()
+
+    assert _joint_share_fills(events) == []
+    assert _live_coids(broker) == {'c4', 'c5'}
+    assert reports == []
+
+    deal = _deal(deal_id=905, order_id=112, position_id=222, filled_volume=1000)
+    deal.executionTimestamp = now_ms - 30_000
+    broker._wire._deal_res.deal.insert(1, deal)
+    events = _reconcile_events(broker)
+    broker._flush_external_interventions()
+
+    assert _joint_share_fills(events) == [
+        ('222', 'c4', 10.0), ('222', 'c5', 10.0), ('998', None, 10.0), ('999', None, 10.0)]
+    assert _live_coids(broker) == set()
+    assert len(reports) == 1
+    assert reports[0][1]['booked_qty'] == 10.0
 
 
 def __test_recover_rejected_order_lands_rejected__(tmp_path):

@@ -98,6 +98,10 @@ class _StateMixin(_CTraderBase, ABC):
             reduce_only=CapabilityLevel.SOFTWARE,
             watch_orders=CapabilityLevel.NATIVE,
             fetch_position=CapabilityLevel.NATIVE,
+            # A position's SL/TP is an attribute of the whole position. A leg
+            # that needs less protected (an opposing leg partly offsets it) is
+            # guarded by the core in software.
+            sized_leg_bracket=CapabilityLevel.SOFTWARE,
             idempotency=CapabilityLevel.PARTIAL_NATIVE,
             # CFD venue: a SELL on a flat or smaller-long book opens/flips
             # to a short position natively.
@@ -137,12 +141,14 @@ class _StateMixin(_CTraderBase, ABC):
         # Route through ``_account_request`` so a mid-session account de-auth is
         # transparently re-authorized and the (idempotent) snapshot retried,
         # rather than raising a raw protocol error that crashes the dispatch.
+        started_at = epoch_time()
         res = cast(OpenApiMessages.ProtoOAReconcileRes, await self._account_request(
             OpenApiMessages.ProtoOAReconcileReq(
                 ctidTraderAccountId=self._live_account_id,
                 returnProtectionOrders=return_protection_orders,
             )
         ))
+        self._snapshot_read_started_at = started_at
         self._snapshot_open_positions = {
             position.positionId: position for position in res.position
             if position.positionStatus
@@ -250,7 +256,11 @@ class _StateMixin(_CTraderBase, ABC):
             if cumulative > row.filled_qty + 1e-9:
                 self.store_ctx.set_filled(row.client_order_id, cumulative)
         self._grow_recovered_own_legs(res)
-        self._retire_shrunk_position_exposure(res)
+        # A snapshot handed in without a read of this process is taken as read
+        # now, the time the cursor baseline above stamps it with too.
+        read_started_at = (self._snapshot_read_started_at
+                           if self._snapshot_read_started_at is not None else read_ms / 1000.0)
+        self._retire_shrunk_position_exposure(res, read_started_at=read_started_at)
         self._rebaseline_bare_marks(res)
 
     def _grow_recovered_own_legs(self, res: OpenApiMessages.ProtoOAReconcileRes) -> None:
@@ -350,7 +360,7 @@ class _StateMixin(_CTraderBase, ABC):
             or row.exchange_order_id or row.filled_qty > 0.0)
 
     def _retire_shrunk_position_exposure(
-            self, res: OpenApiMessages.ProtoOAReconcileRes,
+            self, res: OpenApiMessages.ProtoOAReconcileRes, *, read_started_at: float,
     ) -> None:
         """Baseline the retired-exposure counter to a shrunk open position.
 
@@ -381,7 +391,12 @@ class _StateMixin(_CTraderBase, ABC):
         after an operator resume the resume marked the rows: the operator
         accepted the venue as it stands, so the shrink is accepted instead,
         and a position several rows share is accepted on the first settled
-        reconcile pass (:attr:`_resume_accepted_positions`).
+        reconcile pass (:attr:`_resume_accepted_positions`). The closes an
+        accepted shrink retired are covered up to the read
+        (``_ReconcileMixin._cover_closes``): no judgment of the position's
+        history books them later.
+
+        :param read_started_at: Wall-clock time the snapshot read started.
         """
         if self.store_ctx is None:
             return
@@ -422,22 +437,31 @@ class _StateMixin(_CTraderBase, ABC):
                 continue
             retired = already + (journal_remaining - venue_remaining)
             extras[JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY] = retired
-            self.store_ctx.upsert_order(row.client_order_id, extras=extras)
-            if accepted:
-                self._note_accepted_by_resume(
-                    position_id, client_order_id=row.client_order_id,
-                    volume=journal_remaining - venue_remaining)
-            else:
-                self._record_startup_shrink(
-                    open_by_id[position_id], row, journal_remaining - venue_remaining)
-            self.store_ctx.log_event(
-                'journal_exposure_retired',
-                client_order_id=row.client_order_id,
-                exchange_order_id=str(position_id),
-                payload={'retired': journal_remaining - venue_remaining,
-                         'total_retired': retired,
-                         'source': 'adoption_baseline'},
-            )
+            # One transaction: a shrink retired without the record of what
+            # judges its closes, or of their coverage, would leave those
+            # closes unjudged, and a later judgment of the position's history
+            # would book them again. A failed write leaves the coverage and
+            # the pending shrink of this process as the journal holds them.
+            with self._judgment_span():
+                self.store_ctx.upsert_order(row.client_order_id, extras=extras)
+                if accepted:
+                    # The resume accepted the closes without judging them:
+                    # every one executed before the read is covered.
+                    self._cover_closes(position_id, read_started_at, accepted=True)
+                    self._note_accepted_by_resume(
+                        position_id, client_order_id=row.client_order_id,
+                        volume=journal_remaining - venue_remaining)
+                else:
+                    self._record_startup_shrink(
+                        open_by_id[position_id], row, journal_remaining - venue_remaining)
+                self.store_ctx.log_event(
+                    'journal_exposure_retired',
+                    client_order_id=row.client_order_id,
+                    exchange_order_id=str(position_id),
+                    payload={'retired': journal_remaining - venue_remaining,
+                             'total_retired': retired,
+                             'source': 'adoption_baseline'},
+                )
         self._restore_startup_shrinks()
 
     async def _resolve_state_symbol_id(self, symbol: str) -> int | None:

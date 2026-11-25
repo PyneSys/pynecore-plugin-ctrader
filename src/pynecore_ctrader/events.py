@@ -16,6 +16,7 @@ never silently dropped (the queue is unbounded; a backlog watermark only warns).
 import asyncio
 import logging
 from abc import ABC
+from contextlib import aclosing
 from time import time as epoch_time
 from typing import AsyncIterator, cast
 
@@ -113,7 +114,18 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         once it was answered, ahead of the next message and before any report.
         After an operator resume a snapshot sets the protection baseline before
         any push is judged (``_ProtectionMixin._observe_resume_baseline``).
+
+        Every event passes :meth:`~_ProtectionMixin._note_entry_fill_order` on
+        its way out, so the journal knows the order in which the engine booked
+        the entry fills.
         """
+        async with aclosing(self._order_event_stream()) as stream:
+            async for event in stream:
+                self._note_entry_fill_order(event)
+                yield event
+
+    async def _order_event_stream(self) -> AsyncIterator[OrderEvent]:
+        """The events :meth:`watch_orders` delivers, in delivery order."""
         execq = self._exec_events
         if execq is None:
             raise CTraderConnectionError("live event router not started")
@@ -270,8 +282,9 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         if event_type in ('cancelled', 'rejected') and order.closingOrder:
             # Nothing more of the bot's close can execute.
             for record in self._own_close_history:
-                if record.order_id == order.orderId:
+                if record.order_id == order.orderId and not record.complete:
                     record.complete = True
+                    self._journal_own_close(record)
         # A cancel the venue's own mechanics caused (an expiry, a
         # server-initiated cancel) names its reason, so the engine never runs
         # the unexpected-cancel policy for it.
@@ -380,12 +393,23 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         filled_view: OpenApiModelMessages.ProtoOAPosition | None = None
         close_origin: CloseOrigin | None = None
         held_claim: _ClaimedFill | None = None
+        if is_fill and leg_type is LegType.CLOSE:
+            self._load_close_evidence()
         if (is_fill and leg_type is LegType.CLOSE and deal is not None
                 and deal.executionTimestamp
                 and deal.executionTimestamp < self._closes_covered_until.get(
-                    order.positionId, 0)):
+                    order.positionId, 0)
+                and not (deal.dealId not in self._judged_close_deals
+                         and epoch_time() < self._unexplained_shrinks.get(
+                             order.positionId, 0.0)
+                         and deal.executionTimestamp >= self._shrink_covered_from.get(
+                             order.positionId, 0))):
             # A reconcile pass already retired this close from the journal
-            # from the deal history: a late copy, never booked twice.
+            # from the deal history: a late copy, never booked twice. A close
+            # no pass judged, of a position whose shortfall waits for the close
+            # that explains it, is that close when it executed after the
+            # closes earlier passes retired: the journal still counts its
+            # volume, and it is booked below like one that arrived on time.
             if self.store_ctx is not None:
                 self.store_ctx.log_event(
                     'external_activity_ignored',
@@ -399,6 +423,19 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                 # Another party's opposite order reduced the position: only its
                 # closing part is a close of the bot's position.
                 fill_qty = volume_to_units(deal.closePositionDetail.closedVolume)
+            if deal is not None and self._in_expiry_overlap(deal):
+                # The push cannot tell this close from one the expiry retired:
+                # the deal history judges it (:meth:`_book_expiry_overlap`)
+                # and delivers its fill, so its id stays unseen.
+                self._seen_deal_ids.discard(deal.dealId)
+                if self.store_ctx is not None:
+                    self.store_ctx.log_event(
+                        'external_activity_ignored',
+                        exchange_order_id=str(order.orderId) or None,
+                        payload={'execution_type': 'close', 'order_id': order.orderId,
+                                 'position_id': order.positionId, 'deal_id': deal.dealId,
+                                 'reason': 'deferred_to_deal_history'})
+                return None
             judged = self._judge_close_fill(
                 message, order, deal, fill_qty=fill_qty or 0.0, from_entry=from_entry)
             if judged is None:
@@ -489,6 +526,9 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             fee_currency=fee_currency,
             fill_id=fill_id,
             cancel_reason=cancel_reason,
+            # The journal rows count executed volume in traded units, the
+            # unit of ``fill_qty`` (``volume_to_units``).
+            journal_fill_qty=fill_qty,
         )
         if held_claim is not None:
             # Taken for an own close in flight: its answer releases it.
@@ -666,6 +706,23 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         return (row is not None and row.pine_entry_id is not None
                 and row.closed_ts_ms is None)
 
+    def _in_expiry_overlap(self, deal: OpenApiModelMessages.ProtoOADeal) -> bool:
+        """Whether a pushed close executed in its position's expiry overlap.
+
+        A close executed in the overlap (:attr:`~_CTraderBase._expiry_overlaps`)
+        is one the wait's expiry retired, or one the expiry snapshot did not
+        hold yet. A push cannot tell which: it carries the venue of the
+        close's execution only, while the journal share may have moved since
+        (an entry fill, another booked close). Such a close is never booked
+        from its push; the deal history's judgment decides it, comparing the
+        share and the venue of the same moment and identifying the deals by
+        id (:meth:`~_ReconcileMixin._book_expiry_overlap`). A position the
+        journal holds no share of is judged as usual.
+        """
+        start, end = self._expiry_overlaps.get(deal.positionId, (0, 0))
+        return bool(deal.executionTimestamp and start <= deal.executionTimestamp < end
+                    and self._own_share(deal.positionId) is not None)
+
     @staticmethod
     def _is_closing_fill(order, deal) -> bool:
         """Whether a fill closed position volume: a closing order, or any order
@@ -729,6 +786,7 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # The close's own fill: that much of it no longer runs unseen.
             record.count_executed(deal_id, fill_qty)
             record.complete = record.complete or terminal
+            self._journal_own_close(record)
         if origin is CloseOrigin.VENUE:
             if order.orderType == OpenApiModelMessages.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT:
                 if bounds is None or bounds.high > _VOLUME_TOL:

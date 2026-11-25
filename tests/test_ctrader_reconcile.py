@@ -19,7 +19,9 @@ from pynecore.core.broker.models import (
     OrderStatus,
     QuarantineKind,
 )
+from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.protection_guard import ProtectionLevels
+from pynecore.core.broker.sync_engine import OrderSyncEngine
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
 from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
@@ -33,6 +35,7 @@ from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
 from pynecore_ctrader.models import _SymbolRules
 from pynecore_ctrader.protection import (
     CloseOrigin,
+    _AnswerFill,
     _ClaimedFill,
     _PositionDeal,
     protection_key,
@@ -46,6 +49,10 @@ from pynecore_ctrader.wire import CTraderProtocolError, CTraderTimeoutError
 class _FakeWire:
     """Stubbed wire serving the deal-history bridge: every request returns ``deal_res``.
 
+    With ``honour_window`` set, a ``ProtoOADealListReq`` returns only the deals
+    of ``deal_res`` executed inside its ``fromTimestamp`` .. ``toTimestamp``
+    window, as the venue does, so a test can prove which window a read asks for.
+
     A closing order looked up by ``ProtoOAOrderDetailsReq`` is the position's
     own SL/TP order: the venue closed it.
     """
@@ -53,6 +60,7 @@ class _FakeWire:
     def __init__(self, *, deal_res=None, fail=False):
         self._deal_res = deal_res
         self._fail = fail
+        self.honour_window = False
         self.requests: list = []
         self.timeouts: list = []
 
@@ -69,6 +77,12 @@ class _FakeWire:
                 closingOrder=True,
                 tradeData=_model.ProtoOATradeData(symbolId=1, volume=0,
                                                   tradeSide=_model.ProtoOATradeSide.SELL)))
+        if (self.honour_window and self._deal_res is not None
+                and isinstance(req, _oa.ProtoOADealListReq)):
+            return _deal_res(*(
+                deal for deal in self._deal_res.deal
+                if req.fromTimestamp <= (deal.executionTimestamp or deal.createTimestamp)
+                <= req.toTimestamp), has_more=self._deal_res.hasMore)
         return self._deal_res
 
 
@@ -482,11 +496,25 @@ def __test_reconcile_partial_then_vanished_prices_only_the_new_fill__(tmp_path):
     assert ev.fee == 5.0
 
 
-def __test_reconcile_snapshot_booked_partial_commission_recovered_once__(tmp_path):
-    # The first half was booked by the snapshot partial-fill path, which knows
-    # no deal and books no commission. The recovered residual is still priced
-    # from its own (later) deal, and the commissions of BOTH unseen deals are
-    # booked now, since neither was booked before.
+def _restarted_process(tmp_path, broker, recon, deal_res):
+    """A new process of the same run: the journal survives, the memory does not."""
+    broker.store_ctx.close()
+    restarted = _ReconcileBroker(recon, deal_res=deal_res)
+    _open(tmp_path, restarted)
+    return restarted
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['same-process', 'restart'])
+def __test_reconcile_snapshot_booked_partial_commission_recovered_once__(
+        tmp_path, monkeypatch, restart):
+    # The first half was booked by the snapshot partial-fill path while the
+    # deal history did not list it yet, so it carried no commission. The
+    # recovered residual is still priced from its own (later) deal, and the
+    # commissions of BOTH deals are booked now, since neither was booked
+    # before — in the same process, and in a later one that has no memory of
+    # which deals were applied.
+    clock = [1_700_000_100.0]
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: clock[0])
     qty = volume_to_units(2000)
     partial = volume_to_units(1000)
     first = _deal(deal_id=920, order_id=111, position_id=222,
@@ -497,12 +525,21 @@ def __test_reconcile_snapshot_booked_partial_commission_recovered_once__(tmp_pat
     second.commission = 500
     second.executionTimestamp = first.executionTimestamp + 60_000
     broker = _ReconcileBroker(
-        _recon(positions=[_position(position_id=222, volume=2000)]),
-        deal_res=_deal_res(second, first),
+        _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                              position_id=222, price=1.0)]),
+        deal_res=_deal_res(),
     )
     _open(tmp_path, broker)
-    _seed_partial_working(broker, 'c11', order_id=111, qty=qty,
-                          filled=partial, position_id=222)
+    _seed_working(broker, 'c11', order_id=111, qty=qty)
+    (booked,) = _run(broker)
+    assert booked.fill_qty == partial and booked.fee == 0.0
+    clock[0] += 5.0
+    recon = _recon(positions=[_position(position_id=222, volume=2000)])
+    if restart:
+        broker = _restarted_process(tmp_path, broker, recon, _deal_res(second, first))
+    else:
+        broker._recon = recon
+        broker._wire._deal_res = _deal_res(second, first)
 
     events = _run(broker)
 
@@ -510,6 +547,99 @@ def __test_reconcile_snapshot_booked_partial_commission_recovered_once__(tmp_pat
     ev = events[0]
     assert ev.fill_price == 2.0
     assert ev.fee == 8.0
+    row = broker.store_ctx.get_order('c11')
+    assert row is not None and not (row.extras or {}).get('fee_unbooked')
+
+
+def __test_recovered_residual_after_a_restart_charges_only_its_own_commission__(tmp_path):
+    # The push stream booked the first deal, with its commission, in an
+    # earlier process of the run; the residual filled while no process ran.
+    # The restarted process has no memory of the applied deal, yet the
+    # journalled cursor counts it: only the residual's commission is booked.
+    qty = volume_to_units(2000)
+    partial = volume_to_units(1000)
+    first = _deal(deal_id=930, order_id=111, position_id=222,
+                  filled_volume=1000, price=1.0)
+    first.commission = 300
+    second = _deal(deal_id=931, order_id=111, position_id=222,
+                   filled_volume=1000, price=2.0)
+    second.commission = 500
+    second.executionTimestamp = first.executionTimestamp + 60_000
+    recon = _recon(positions=[_position(position_id=222, volume=2000)])
+    earlier = _ReconcileBroker(recon, deal_res=_deal_res())
+    _open(tmp_path, earlier)
+    _seed_partial_working(earlier, 'c12', order_id=111, qty=qty,
+                          filled=partial, position_id=222)
+    broker = _restarted_process(tmp_path, earlier, recon, _deal_res(second, first))
+
+    events = _run(broker)
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.fill_qty == qty - partial
+    assert ev.fill_price == 2.0
+    assert ev.fee == 5.0
+
+
+def __test_partial_progress_after_a_restart_charges_only_its_own_commission__(tmp_path):
+    # The working order's first deal was booked by the push stream in an
+    # earlier process; a second partial deal executed while no process ran.
+    # The snapshot partial-fill path charges only the new deal's commission.
+    qty = volume_to_units(2000)
+    first = _deal(deal_id=940, order_id=111, position_id=222,
+                  filled_volume=1000, price=1.0)
+    first.commission = 300
+    second = _deal(deal_id=941, order_id=111, position_id=222,
+                   filled_volume=500, price=2.0)
+    second.commission = 200
+    second.executionTimestamp = first.executionTimestamp + 60_000
+    recon = _recon(orders=[_order(order_id=111, volume=2000, executed=1500,
+                                  position_id=222, price=1.33)])
+    earlier = _ReconcileBroker(recon, deal_res=_deal_res())
+    _open(tmp_path, earlier)
+    _seed_partial_working(earlier, 'c13', order_id=111, qty=qty,
+                          filled=volume_to_units(1000), position_id=222)
+    broker = _restarted_process(tmp_path, earlier, recon, _deal_res(second, first))
+
+    events = _run(broker)
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.fill_qty == volume_to_units(500)
+    assert ev.fill_price == 2.0
+    assert ev.fee == pytest.approx(2.0)
+
+
+def __test_filled_then_closed_after_a_restart_charges_only_the_entry_residual__(tmp_path):
+    # The entry's first deal was booked by the push stream in an earlier
+    # process; the residual filled and the SL closed the position while no
+    # process ran. The recovered entry fill carries only the residual's
+    # commission.
+    qty = volume_to_units(2000)
+    first = _deal(deal_id=950, order_id=111, position_id=222,
+                  filled_volume=1000, price=1.0)
+    first.commission = 300
+    second = _deal(deal_id=951, order_id=111, position_id=222,
+                   filled_volume=1000, price=2.0)
+    second.commission = 500
+    second.executionTimestamp = first.executionTimestamp + 60_000
+    close = _close_deal(deal_id=952, order_id=999, position_id=222, closed_volume=2000,
+                        price=1.5, commission=0)
+    close.executionTimestamp = first.executionTimestamp + 120_000
+    recon = _recon(positions=[])
+    earlier = _ReconcileBroker(recon, deal_res=_deal_res())
+    _open(tmp_path, earlier)
+    _seed_partial_working(earlier, 'c15', order_id=111, qty=qty,
+                          filled=volume_to_units(1000), position_id=222)
+    broker = _restarted_process(tmp_path, earlier, recon, _deal_res(close, second, first))
+
+    events = _run(broker)
+
+    entries = [event for event in events if event.leg_type is LegType.ENTRY]
+    assert len(entries) == 1
+    assert entries[0].fill_qty == volume_to_units(1000)
+    assert entries[0].fill_price == 2.0
+    assert entries[0].fee == 5.0
 
 
 # === Reconcile-pass I/O budget ============================================
@@ -1049,6 +1179,45 @@ def __test_filled_then_closed_deals_the_push_delivered_are_not_delivered_again__
     assert 'c14' not in _live_coids(broker)
 
 
+def __test_filled_then_closed_waits_for_every_fill_the_journal_counts__(tmp_path):
+    """Working order 111 (20 units) had filled 10 units onto position 222 when
+    it vanished, and the position's SL then closed those 10 units. The deal
+    history first shows only one 5-unit deal (905) of the order: the recovery
+    waits. Once the missing deal (904, stamped before the first read's end)
+    shows, the next pass reads the order's whole window again and delivers the
+    10-unit close once, with no entry fill the journal already counted."""
+    now_ms = int(epoch_time() * 1000)
+
+    def at(deal, ms):
+        deal.executionTimestamp = ms
+        return deal
+
+    broker = _ReconcileBroker(_recon(positions=[]), deal_res=_deal_res(
+        at(_deal(deal_id=905, order_id=111, position_id=222, filled_volume=500),
+           now_ms - 30_000),
+        at(_close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=1000),
+           now_ms - 10_000)))
+    broker._wire.honour_window = True
+    _open(tmp_path, broker)
+    _seed_partial_working(broker, 'c14', order_id=111, qty=volume_to_units(2000),
+                          filled=volume_to_units(1000), position_id=222)
+    row = broker.store_ctx.get_order('c14')
+    broker.store_ctx.upsert_order('c14', extras={
+        **(row.extras or {}), 'submitted_at_ms': now_ms - 60_000})
+
+    assert _run(broker) == []
+    assert 'c14' in _live_coids(broker)
+
+    broker._wire._deal_res.deal.insert(0, at(
+        _deal(deal_id=904, order_id=111, position_id=222, filled_volume=500),
+        now_ms - 40_000))
+    events = _run(broker)
+
+    assert [(e.leg_type, e.fill_qty) for e in events] == [
+        (LegType.CLOSE, pytest.approx(volume_to_units(1000)))]
+    assert 'c14' not in _live_coids(broker)
+
+
 def __test_filled_then_closed_close_the_push_delivered_leaves_the_entry_fill__(tmp_path):
     broker = _filled_then_closed_broker(tmp_path)
     broker._seen_deal_ids.add(906)
@@ -1266,6 +1435,41 @@ def __test_grace_expired_natural_close_booked_as_close_not_cancel__(tmp_path):
     assert err is None                        # no halt
     assert 'c3' not in _live_coids(broker)    # retired as a close
     assert 900 in broker._seen_deal_ids       # close deal recorded on the de-dup channel
+
+
+def __test_grace_expired_close_judged_before_its_verdict_landed_is_delivered_after_a_restart__(
+        tmp_path):
+    # The process judged the vanished position's close deal, then stopped
+    # before the disappearance tracker applied the CLOSED verdict that
+    # delivers its fill. The next process finds the deal judged; it still
+    # delivers the close fill the judgment journalled, once.
+    qty = volume_to_units(2000)
+    broker = _ReconcileBroker(
+        _recon(),
+        deal_res=_deal_res(_close_deal(
+            deal_id=900, order_id=111, position_id=222, closed_volume=2000)),
+    )
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=qty,
+                   extras={'missing_pending_since': 0.0})
+
+    def stop_before_apply(*_args, **_kwargs):
+        raise RuntimeError('process stopped')
+
+    broker._disappearance_tracker()._apply_confirmation = stop_before_apply
+    with pytest.raises(RuntimeError, match='process stopped'):
+        _drive_tracker(broker)
+    assert 900 in broker._judged_close_deals
+    process = _next_process(broker)
+
+    events, err = _drive_tracker(process)
+
+    assert [(e.event_type, e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('filled', '900', 'long', pytest.approx(qty))]
+    assert err is None
+    assert 'c3' not in _live_coids(process)
+    later = _next_process(process)
+    assert _drive_tracker(later) == ([], None)
 
 
 def __test_grace_expired_inconclusive_recheck_defers_retire__(tmp_path):
@@ -2603,6 +2807,1282 @@ def __test_late_push_of_a_close_a_shrink_pass_retired_is_not_booked_again__(tmp_
     assert reports == []
 
 
+def _own_close_903(*, price):
+    """The fill push of the bot's own close (order 600) of 10 of position 222."""
+    order = _model.ProtoOAOrder(
+        orderId=600, orderType=_model.ProtoOAOrderType.MARKET, closingOrder=True,
+        positionId=222, executedVolume=1000,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=1000,
+                                          tradeSide=_model.ProtoOATradeSide.SELL))
+    push = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    push.order.CopyFrom(order)
+    push.deal.CopyFrom(_close_deal_903(price=price))
+    push.position.CopyFrom(_position(position_id=222, volume=1000))
+    return push
+
+
+def _close_deal_903(*, price):
+    return _timed(_close_deal(deal_id=903, order_id=600, position_id=222, closed_volume=1000,
+                              price=price), 1_700_000_003_000)
+
+
+def _unexplained_shrink_broker(tmp_path):
+    """Position 222 holds 10 of the bot's 20; the bot's own close of 10 (order
+    600) executed, but neither its push nor its deal reached the bot yet: the
+    deal history holds only the opening deal."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker._wire = _VenueWire(deal_res=_deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000)), orders=[_closing_order(600)])
+    broker._settle_own_close(broker._open_own_close(222, 10.0), 600)
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=1000)}
+    return broker, reports
+
+
+def __test_late_push_of_a_close_an_unexplained_shrink_waits_for_is_booked_once__(tmp_path):
+    """A confirmed shrink whose deal history shows no closing deal waits for
+    its explanation; the close's push arriving afterwards is delivered with
+    its own deal id and price, and the journal retires its volume once."""
+    broker, reports = _unexplained_shrink_broker(tmp_path)
+    assert _run(broker) == [] and _run(broker) == []
+    assert broker.fill_recovery_pending({'long'}) is True, "the engine's verdict waits"
+
+    event = broker._translate_exec_event(_own_close_903(price=1.2345))
+
+    assert event is not None
+    assert (event.leg_type, event.fill_id, event.fill_qty, event.fill_price) == (
+        LegType.CLOSE, '903', pytest.approx(10.0), pytest.approx(1.2345))
+    assert _retired(broker) == pytest.approx(10.0)
+    assert _run(broker) == [] and _run(broker) == []
+    assert _retired(broker) == pytest.approx(10.0)
+    assert broker.fill_recovery_pending({'long'}) is False
+    assert broker._translate_exec_event(_own_close_903(price=1.2345)) is None
+    assert reports == []
+
+
+def __test_closing_deal_the_history_shows_late_explains_a_waiting_shrink__(tmp_path):
+    """The deal history shows the close only on a later pass: that pass
+    delivers it, and its push arriving afterwards is not booked again."""
+    broker, reports = _unexplained_shrink_broker(tmp_path)
+    assert _run(broker) == [] and _run(broker) == []
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _close_deal_903(price=1.2345))
+
+    events = _run(broker)
+
+    assert [(e.leg_type, e.fill_id, e.fill_qty, e.fill_price) for e in events] == [
+        (LegType.CLOSE, '903', pytest.approx(10.0), pytest.approx(1.2345))]
+    assert _retired(broker) == pytest.approx(10.0)
+    assert broker._translate_exec_event(_own_close_903(price=1.2345)) is None
+    assert _run(broker) == []
+    assert _retired(broker) == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_unexplained_shrink_is_retired_once_its_wait_ends__(tmp_path, caplog):
+    """No deal explains the shrink before the wait ends: the shortfall is
+    retired unbound with an ERROR and an audit event, and the engine's verdict
+    is released; a push arriving after that is covered, never booked."""
+    broker, reports = _unexplained_shrink_broker(tmp_path)
+    assert _run(broker) == []
+    broker._shrink_seen_since[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+
+    with caplog.at_level(logging.ERROR):
+        assert _run(broker) == []
+
+    assert _retired(broker) == pytest.approx(10.0)
+    assert any('no deal explains' in record.getMessage() for record in caplog.records)
+    store = broker.store_ctx
+    assert store is not None
+    audits = [payload for _i, _c, _r, payload in store.iter_events_by_kind_for_run_id(
+        ctrader_reconcile._SHRINK_UNEXPLAINED_EVENT)]
+    assert [(a['position_id'], a['volume']) for a in audits] == [(222, pytest.approx(10.0))]
+    assert broker.fill_recovery_pending({'long'}) is False
+    assert broker._translate_exec_event(_own_close_903(price=1.2345)) is None
+    assert _retired(broker) == pytest.approx(10.0)
+    assert reports == []
+
+
+def _second_unexplained_shrink_broker(tmp_path):
+    """The 10-unit shortfall of :func:`_unexplained_shrink_broker` expired and
+    was retired unbound; the position then shrank from 10 to 5 with no deal
+    explaining that either, and the second wait is running."""
+    broker, reports = _unexplained_shrink_broker(tmp_path)
+    assert _run(broker) == []
+    broker._shrink_seen_since[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    assert _run(broker) == [] and _run(broker) == []
+    assert _retired(broker) == pytest.approx(10.0)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+    assert _run(broker) == [] and _run(broker) == []
+    assert 222 in broker._unexplained_shrinks
+    assert _retired(broker) == pytest.approx(10.0)
+    return broker, reports
+
+
+def __test_close_an_expired_wait_retired_is_not_booked_by_a_later_wait__(tmp_path):
+    """The push of the first shortfall's close, arriving during the wait of a
+    second shortfall, is a late copy of a close the journal retired already."""
+    broker, reports = _second_unexplained_shrink_broker(tmp_path)
+
+    assert broker._translate_exec_event(_own_close_903(price=1.2345)) is None
+
+    assert _retired(broker) == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_history_close_an_expired_wait_retired_is_not_booked_by_a_later_wait__(tmp_path):
+    """The deal history showing the first shortfall's close only during the
+    second wait neither delivers nor debits it; the second shortfall keeps
+    waiting for its own close."""
+    broker, reports = _second_unexplained_shrink_broker(tmp_path)
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _close_deal_903(price=1.2345))
+
+    assert _run(broker) == []
+
+    assert _retired(broker) == pytest.approx(10.0)
+    assert 222 in broker._unexplained_shrinks
+    assert reports == []
+
+
+def __test_close_inside_the_skew_window_an_expiry_retired_is_not_booked_again__(tmp_path):
+    """The shortfall grows shortly before the wait ends (20 -> 15 -> 10) and the
+    deal history shows neither close: the expiry retires the whole 10. The
+    push of the second close, executed seconds before that read, is part of
+    what the expiry retired and is not booked again."""
+    broker, reports = _unexplained_shrink_broker(tmp_path)
+    broker._wire.orders[601] = _closing_order(601)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 601)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1500)])
+    assert _run(broker) == [] and _run(broker) == []
+    assert 222 in broker._unexplained_shrinks
+    broker._shrink_seen_since[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    broker._unexplained_shrinks[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    second_close_ms = int(epoch_time() * 1000) - 10_000
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    assert _run(broker) == [] and _run(broker) == []
+    assert _retired(broker) == pytest.approx(10.0)
+    assert 222 not in broker._unexplained_shrinks
+
+    order = _model.ProtoOAOrder(
+        orderId=601, orderType=_model.ProtoOAOrderType.MARKET, closingOrder=True,
+        positionId=222, executedVolume=500,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=500,
+                                          tradeSide=_model.ProtoOATradeSide.SELL))
+    push = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    push.order.CopyFrom(order)
+    push.deal.CopyFrom(_model.ProtoOADeal(
+        dealId=906, orderId=601, positionId=222, filledVolume=500, executionPrice=1.1,
+        executionTimestamp=second_close_ms,
+        closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=500)))
+    push.position.CopyFrom(_position(position_id=222, volume=1000))
+
+    assert broker._translate_exec_event(push) is None
+    assert _retired(broker) == pytest.approx(10.0)
+    assert reports == []
+
+
+def _expired_two_entry_shrink_broker(tmp_path):
+    """L1 (c1, order 111) and L2 (c2, order 112) hold 10 each on position
+    222; the venue shows 15 and no deal explains the 5 missing. The wait
+    expires and retires the 5 from L1, the oldest. The bot's close of L2
+    (order 602, 10 units) is sent right after that read. The deal history
+    honours each read's time window, and each row's window starts at its own
+    order's dispatch, as the execution path stamps it."""
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1500)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[_closing_order(600)])
+    broker._wire.honour_window = True
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid, pine_id, order_id, submitted_ms in (
+            ('c1', 'L1', '111', 1_700_000_001_000), ('c2', 'L2', '112', 1_700_000_002_000)):
+        broker.store_ctx.upsert_order(
+            coid, symbol='EURUSD', side='buy', qty=10.0, filled_qty=10.0,
+            state='confirmed', pine_entry_id=pine_id, exchange_order_id='222',
+            extras={'order_id': order_id, 'position_id': 222,
+                    'submitted_at_ms': submitted_ms})
+        broker.store_ctx.add_ref(coid, 'order_id', order_id)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 600)
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=1500)}
+    assert _run(broker) == [] and _run(broker) == []
+    assert 222 in broker._unexplained_shrinks
+    broker._shrink_seen_since[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    broker._unexplained_shrinks[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    assert _run(broker) == []
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+    assert 222 not in broker._unexplained_shrinks
+    broker._close_dispatch_pine_by_position[222] = '__pyne_partial__L2'
+    broker._close_settle_entry_by_position[222] = 'L2'
+    broker._wire.orders[602] = _model.ProtoOAOrder(
+        orderId=602, orderType=_model.ProtoOAOrderType.MARKET, closingOrder=True,
+        positionId=222, executedVolume=1000,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=1000,
+                                          tradeSide=_model.ProtoOATradeSide.SELL))
+    broker._settle_own_close(broker._open_own_close(222, 10.0), 602)
+    return broker, reports
+
+
+def _shift_expiry(broker, shift):
+    """Move the expiry of :func:`_expired_two_entry_shrink_broker` and the
+    closes sent around it ``shift`` ms into the past, as if that much time
+    had passed since; return the overlap as it was before the move. The deal
+    history reads made so far move with them: each walk resumes from where
+    the expiry's reads ended, never from the real time they ran at."""
+    start, end = broker._expiry_overlaps[222]
+    broker._expiry_overlaps[222] = (start - shift, end - shift)
+    broker._closes_covered_until[222] -= shift
+    for walk in broker._deal_walks.values():
+        walk.high_ms = max(walk.from_ms, walk.high_ms - shift)
+        for segment in walk.segments:
+            segment[0] = max(walk.from_ms, segment[0] - shift)
+            segment[1] = max(walk.from_ms, segment[1] - shift)
+    for record in broker._own_closes:
+        record.sent_ms -= shift
+        if record.answered_ms is not None:
+            record.answered_ms -= shift
+    return start, end
+
+
+def __test_named_close_pushed_inside_an_expiry_overlap_is_booked_against_its_entry__(
+        tmp_path):
+    """A close the expiry snapshot did not hold yet, executed inside the clock
+    skew after its read, is never booked from its push, even one reporting
+    the position it left: the deal history's judgment books it under its own
+    deal and entry, exactly once."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    push = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    push.order.CopyFrom(broker._wire.orders[602])
+    push.deal.CopyFrom(_model.ProtoOADeal(
+        dealId=907, orderId=602, positionId=222, filledVolume=1000, executionPrice=1.1,
+        executionTimestamp=close_ms,
+        closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=1000)))
+    push.position.CopyFrom(_position(position_id=222, volume=500))
+
+    assert broker._translate_exec_event(push) is None
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=500)}
+    assert broker.fill_recovery_pending({'L2'}) is True, "the engine's verdict waits"
+
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms))
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    events = [event for _ in range(2) for event in _run(broker)]
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+@pytest.mark.parametrize('pushed', [True, False])
+def __test_vanished_position_does_not_book_a_close_its_expiry_retired__(tmp_path, pushed):
+    """After the expiry (20 -> 15), the deal history of the position, gone
+    by now, shows the retired 5-unit close (order 600) and the 10-unit close
+    of L2 (order 602), both in the overlap, then a 5-unit close (order 603)
+    that emptied it. The vanished rows' judgment delivers only the 15 the
+    journal still counted: 602 and 603, never the close the expiry retired,
+    whether or not the overlap pushes arrived first."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    last_ms = end - shift + 1_000
+    broker._wire.orders[603] = _closing_order(603)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 603)
+    if pushed:
+        for deal_id, order_id, cents, executed_ms, left in (
+                (908, 600, 500, retired_ms, 1500), (907, 602, 1000, close_ms, 500)):
+            push = _oa.ProtoOAExecutionEvent(
+                executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+            push.order.CopyFrom(_model.ProtoOAOrder(
+                orderId=order_id, orderType=_model.ProtoOAOrderType.MARKET,
+                closingOrder=True, positionId=222, executedVolume=cents,
+                orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+                tradeData=_model.ProtoOATradeData(
+                    symbolId=1, volume=cents, tradeSide=_model.ProtoOATradeSide.SELL)))
+            push.deal.CopyFrom(_model.ProtoOADeal(
+                dealId=deal_id, orderId=order_id, positionId=222, filledVolume=cents,
+                executionPrice=1.1, executionTimestamp=executed_ms,
+                closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=cents)))
+            push.position.CopyFrom(_position(position_id=222, volume=left))
+            assert broker._translate_exec_event(push) is None
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms),
+        _timed(_close_deal(deal_id=909, order_id=603, position_id=222, closed_volume=500),
+               last_ms))
+    for coid in ('c1', 'c2'):
+        row = broker.store_ctx.get_order(coid)
+        broker.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), 'missing_pending_since': 0.0})
+    assert broker._own_share(222) == pytest.approx(15.0)
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert sorted((e.fill_id, e.from_entry, e.fill_qty)
+                  for e in events if e.fill_id is not None) == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_vanished_position_waits_for_an_own_close_that_may_still_execute__(tmp_path):
+    """The vanished position of the test above, with one more own close
+    (order 604, 5 units) sent after the expiry, answered and still within its
+    grace. The rows' judgment waits for it; once it ends without a fill, 602
+    and 603 are delivered whole, never cut by 604's volume."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    last_ms = end - shift + 1_000
+    broker._wire.orders[603] = _closing_order(603)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 603)
+    pending = broker._open_own_close(222, 5.0)
+    broker._settle_own_close(pending, 604)
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms),
+        _timed(_close_deal(deal_id=909, order_id=603, position_id=222, closed_volume=500),
+               last_ms))
+    for coid in ('c1', 'c2'):
+        row = broker.store_ctx.get_order(coid)
+        broker.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), 'missing_pending_since': 0.0})
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert [e for e in events if e.fill_id is not None] == []
+    assert sorted(_live_coids(broker)) == ['c1', 'c2']
+
+    pending.complete = True
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert sorted((e.fill_id, e.from_entry, e.fill_qty)
+                  for e in events if e.fill_id is not None) == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_retired_overlap_deal_shown_first_does_not_take_a_missing_close_shortfall__(
+        tmp_path):
+    """After the expiry (20 -> 15), the bot's close of L2 (order 602, 10
+    units) takes the venue to 5, but the deal history shows only the 5-unit
+    close the expiry retired (order 600). That deal never takes the shortfall
+    the missing close leaves: nothing is delivered or retired until the close
+    of L2 shows, which is then booked under its own deal and entry."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    # The close of L2 was sent a second after the expiry's read.
+    for record in broker._own_closes:
+        if record.order_id == 602:
+            record.sent_ms += 1_000
+    entries = (
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms))
+    broker._wire._deal_res = _deal_res(*entries)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    assert [event for _ in range(2) for event in _run(broker)] == []
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+
+    broker._wire._deal_res = _deal_res(*entries, _timed(
+        _close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000), close_ms))
+    events = [event for _ in range(2) for event in _run(broker)]
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_confirmed_close_missing_from_history_does_not_let_a_retired_deal_book__(
+        tmp_path):
+    """As above, but the answer of the close of L2 already confirmed its
+    10-unit fill (deal 907), which the deal history does not show yet. The
+    5-unit close the expiry retired (order 600) is never booked in its place:
+    nothing is delivered until 907 shows, which is then booked whole."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    record = next(r for r in broker._own_closes if r.order_id == 602)
+    record.sent_ms += 1_000
+    record.count_executed(907, 10.0)
+    record.complete = True
+    entries = (
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms))
+    broker._wire._deal_res = _deal_res(*entries)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    assert [event for _ in range(3) for event in _run(broker)] == []
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+
+    broker._wire._deal_res = _deal_res(*entries, _timed(
+        _close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000), close_ms))
+    events = [event for _ in range(2) for event in _run(broker)]
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_pending_own_close_does_not_suppress_a_shown_overlap_close__(tmp_path):
+    """The history already shows the 10-unit close of L2 (deal 907) in the
+    overlap, while a second own close (order 604, 5 units), sent after the
+    expiry, is answered but may still execute. The judgment waits for it; once
+    604 ends without a fill, 907 is booked whole, not cut by 604's volume."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    second = broker._open_own_close(222, 5.0)
+    broker._settle_own_close(second, 604)
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms))
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    assert [event for _ in range(3) for event in _run(broker)] == []
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+
+    second.complete = True
+    events = [event for _ in range(2) for event in _run(broker)]
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+def _shrink_past_deadline_with_a_pending_close(tmp_path):
+    """The shrink of the test above, past its wait, while the own close 604
+    (5 units, sent after the expiry) is answered and may still execute; the
+    close of L2 (deal 907, order 602) was sent after the expiry's read too.
+
+    :return: ``(broker, reports, second)``, ``second`` being 604's record.
+    """
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    for record in broker._own_closes:
+        if record.order_id == 602:
+            record.sent_ms += 1_000
+    second = broker._open_own_close(222, 5.0)
+    broker._settle_own_close(second, 604)
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms))
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    assert _run(broker) == []
+    broker._shrink_seen_since[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    return broker, reports, second
+
+
+def __test_shrink_past_its_deadline_waits_for_an_own_close_that_may_still_execute__(
+        tmp_path):
+    """Past the shrink's wait, the judgment still waits while 604 may execute,
+    as the vanished rows' judgment does: nothing is delivered or retired. Once
+    604 ends without a fill, 907 is booked whole, never cut by the volume
+    reserved for 604, and nothing more follows."""
+    broker, reports, second = _shrink_past_deadline_with_a_pending_close(tmp_path)
+
+    assert [event for _ in range(2) for event in _run(broker)] == []
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+    # The engine's position check reads the same snapshot: its verdict stays held.
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=500)}
+    assert broker.fill_recovery_pending({'L1', 'L2'})
+
+    second.complete = True
+    events = _run(broker)
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert [event for _ in range(2) for event in _run(broker)] == []
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_shrink_past_its_deadline_stops_waiting_at_the_own_close_s_grace__(tmp_path):
+    """As above, but 604 never reports its end: the wait past the deadline is
+    bounded by 604's grace, after which 907 is booked whole."""
+    broker, reports, second = _shrink_past_deadline_with_a_pending_close(tmp_path)
+
+    assert _run(broker) == []
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+
+    second.expires_at = 0.0
+    events = _run(broker)
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_vanished_position_waits_for_a_confirmed_close_missing_from_history__(tmp_path):
+    """The vanished position of the tests above, but the answer of the close
+    of L2 (order 602) already confirmed its 10-unit fill (deal 907), which
+    the deal history does not show yet: it shows only the close the expiry
+    retired (908) and the 5-unit close that emptied the position (909). The
+    rows' judgment waits within the shrink wait; once 907 shows, 907 and 909
+    are delivered whole and 908 never."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    last_ms = end - shift + 1_000
+    record = next(r for r in broker._own_closes if r.order_id == 602)
+    record.sent_ms += 1_000
+    record.count_executed(907, 10.0)
+    record.complete = True
+    broker._wire.orders[603] = _closing_order(603)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 603)
+    entries = (
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=909, order_id=603, position_id=222, closed_volume=500),
+               last_ms))
+    broker._wire._deal_res = _deal_res(*entries)
+    missing_since = epoch_time() - ctrader_reconcile._MISSING_PENDING_GRACE_S - 1.0
+    for coid in ('c1', 'c2'):
+        row = broker.store_ctx.get_order(coid)
+        broker.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), 'missing_pending_since': missing_since})
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert [e for e in events if e.fill_id is not None] == []
+    assert sorted(_live_coids(broker)) == ['c1', 'c2']
+
+    broker._wire._deal_res = _deal_res(*entries, _timed(
+        _close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000), close_ms))
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert sorted((e.fill_id, e.from_entry, e.fill_qty)
+                  for e in events if e.fill_id is not None) == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_vanished_position_rereads_the_window_for_a_late_shown_earlier_deal__(tmp_path):
+    """As above, with the deal history honouring each read's time window as
+    the venue does. The close of L2 (deal 907) executed more than
+    :data:`_SINCE_ANCHOR_SKEW_MS` before the waiting check read the history,
+    and shows only afterwards: a resumed walk would read from that read's end
+    on and never see it. The waiting check discards the walk, so the next one
+    reads the order's whole window again and finds 907."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    assert broker._wire.honour_window
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    last_ms = end - shift + 1_000
+    record = next(r for r in broker._own_closes if r.order_id == 602)
+    record.sent_ms += 1_000
+    record.count_executed(907, 10.0)
+    record.complete = True
+    broker._wire.orders[603] = _closing_order(603)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 603)
+    entries = (
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=909, order_id=603, position_id=222, closed_volume=500),
+               last_ms))
+    broker._wire._deal_res = _deal_res(*entries)
+    missing_since = epoch_time() - ctrader_reconcile._MISSING_PENDING_GRACE_S - 1.0
+    for coid in ('c1', 'c2'):
+        row = broker.store_ctx.get_order(coid)
+        broker.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), 'missing_pending_since': missing_since})
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert [e for e in events if e.fill_id is not None] == []
+    assert sorted(_live_coids(broker)) == ['c1', 'c2']
+    first_read = broker._wire.requests[-1]
+    assert isinstance(first_read, _oa.ProtoOADealListReq)
+    # 907 lies before the part of the window a resumed walk would read again.
+    assert close_ms < first_read.toTimestamp - ctrader_reconcile._SINCE_ANCHOR_SKEW_MS
+
+    broker._wire._deal_res = _deal_res(*entries, _timed(
+        _close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000), close_ms))
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert sorted((e.fill_id, e.from_entry, e.fill_qty)
+                  for e in events if e.fill_id is not None) == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_vanished_position_waits_for_a_confirmed_close_before_any_overlap_deal__(
+        tmp_path):
+    """As above, but the first check's history shows no overlap deal at all:
+    only the 5-unit close that emptied the position (909). The confirmed
+    10-unit close of L2 (order 602) is still missing from it, so the rows
+    stay pending; once 908 and 907 show, 907 and 909 are delivered whole and
+    908 never."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    last_ms = end - shift + 1_000
+    record = next(r for r in broker._own_closes if r.order_id == 602)
+    record.sent_ms += 1_000
+    record.count_executed(907, 10.0)
+    record.complete = True
+    broker._wire.orders[603] = _closing_order(603)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 603)
+    entries = (
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000))
+    final = _timed(
+        _close_deal(deal_id=909, order_id=603, position_id=222, closed_volume=500), last_ms)
+    broker._wire._deal_res = _deal_res(*entries, final)
+    missing_since = epoch_time() - ctrader_reconcile._MISSING_PENDING_GRACE_S - 1.0
+    for coid in ('c1', 'c2'):
+        row = broker.store_ctx.get_order(coid)
+        broker.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), 'missing_pending_since': missing_since})
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert [e for e in events if e.fill_id is not None] == []
+    assert sorted(_live_coids(broker)) == ['c1', 'c2']
+
+    broker._wire._deal_res = _deal_res(
+        *entries,
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms),
+        final)
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert sorted((e.fill_id, e.from_entry, e.fill_qty)
+                  for e in events if e.fill_id is not None) == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+@pytest.mark.parametrize('read_past_it', [False, True])
+def __test_vanished_adopted_position_books_its_close_from_the_position_history__(
+        tmp_path, read_past_it):
+    """A row startup adopted from an open position knows its position but no
+    entry order. Its 5-unit shrink expires, then the position's SL closes the
+    rest inside the expiry overlap and the position vanishes. The rows'
+    judgment reads the position's own history and books that close, never
+    retiring the row without its fill, even when an earlier read of the
+    position's history ended more than the re-read margin after the close's
+    execution without showing it (``read_past_it``)."""
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=500)]))
+    broker._wire = _VenueWire(deal_res=_deal_res(), orders=[
+        _closing_order(700, order_type=_SLTP)])
+    broker._wire.honour_window = True
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+
+    async def tick(_symbol_id):
+        return 0.00001
+
+    # The adopted protection's check needs the symbol's tick, which no order
+    # of this run loaded: the venue's rules are not under test here.
+    broker._resolve_tick = tick
+    broker._adopt_own_leg(_position(position_id=222, volume=1000))
+    coid = _live_coids(broker)[0]
+    assert 'order_id' not in (broker.store_ctx.get_order(coid).extras or {})
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=500)}
+    assert _run(broker) == [] and _run(broker) == []
+    assert 222 in broker._unexplained_shrinks
+    broker._shrink_seen_since[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    broker._unexplained_shrinks[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    assert _run(broker) == []
+    assert _retired(broker, coid) == pytest.approx(5.0)
+    start, end = broker._expiry_overlaps[222]
+    broker._wire._deal_res = _deal_res(_timed(
+        _close_deal(deal_id=950, order_id=700, position_id=222, closed_volume=500),
+        (start + end) // 2))
+    if read_past_it:
+        walk = broker._deal_walks[-222]
+        assert not walk.segments
+        walk.high_ms = (start + end) // 2 + ctrader_reconcile._SINCE_ANCHOR_SKEW_MS + 1_000
+    row = broker.store_ctx.get_order(coid)
+    broker.store_ctx.upsert_order(coid, extras={
+        **(row.extras or {}),
+        'missing_pending_since': epoch_time() - ctrader_reconcile._MISSING_PENDING_GRACE_S - 1.0})
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert [(e.fill_id, e.fill_qty) for e in events if e.fill_id is not None] == [
+        ('950', pytest.approx(5.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_vanished_position_waits_for_a_confirmed_close_before_any_close_shows__(tmp_path):
+    """As the tests above, but the first check's history shows no closing
+    deal at all, only the entry fills. The confirmed 10-unit close of L2
+    (order 602) is missing from it, so the rows are not retired as a benign
+    close; once 908, 907 and 909 show, 907 and 909 are delivered whole and
+    908 never."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    last_ms = end - shift + 1_000
+    record = next(r for r in broker._own_closes if r.order_id == 602)
+    record.sent_ms += 1_000
+    record.count_executed(907, 10.0)
+    record.complete = True
+    broker._wire.orders[603] = _closing_order(603)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 603)
+    entries = (
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000))
+    broker._wire._deal_res = _deal_res(*entries)
+    missing_since = epoch_time() - ctrader_reconcile._MISSING_PENDING_GRACE_S - 1.0
+    for coid in ('c1', 'c2'):
+        row = broker.store_ctx.get_order(coid)
+        broker.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), 'missing_pending_since': missing_since})
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert [e for e in events if e.fill_id is not None] == []
+    assert sorted(_live_coids(broker)) == ['c1', 'c2']
+
+    broker._wire._deal_res = _deal_res(
+        *entries,
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms),
+        _timed(_close_deal(deal_id=909, order_id=603, position_id=222, closed_volume=500),
+               last_ms))
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert sorted((e.fill_id, e.from_entry, e.fill_qty)
+                  for e in events if e.fill_id is not None) == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_vanished_rows_dispatched_after_the_overlap_read_its_closes__(tmp_path):
+    """The vanished position of the tests above, with L2's row dispatched
+    after the expiry overlap: its own window starts after the close of L2
+    (deal 907) and the close the expiry retired (908), and its grace ends
+    first. Its judgment, which retires L1's row too, reads the windows of
+    every row of the position, so 907 is delivered with 909 and 908 never,
+    instead of the rows closing on 909 alone."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 240_000
+    # The last close is sent before the expiry moves, so it moves with it.
+    broker._wire.orders[603] = _closing_order(603)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 603)
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    last_ms = end - shift + 90_000
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms),
+        _timed(_close_deal(deal_id=909, order_id=603, position_id=222, closed_volume=500),
+               last_ms))
+    for coid, extras in (('c1', {'missing_pending_since': epoch_time()}),
+                         ('c2', {'submitted_at_ms': last_ms, 'missing_pending_since': 0.0})):
+        row = broker.store_ctx.get_order(coid)
+        broker.store_ctx.upsert_order(coid, extras={**(row.extras or {}), **extras})
+    assert close_ms < last_ms - ctrader_reconcile._SINCE_ANCHOR_SKEW_MS
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert sorted((e.fill_id, e.from_entry, e.fill_qty)
+                  for e in events if e.fill_id is not None) == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def _filled_then_closed_after_expiry_broker(tmp_path, *, second_entry=False):
+    """After the expiry (20 -> 15), the close of L2 (deal 907, order 602,
+    10 units) leaves 5; a working entry L3 (c3, order 113, dispatched after
+    the overlap) fills 3 units onto the same NETTING position, and the bot's
+    close of the rest (order 603, 8 units) empties it, all while the stream
+    was down. With ``second_entry``, a second working entry L4 (c4, order
+    114) fills 2 units after L3 and the close of the rest takes 10. Return
+    the broker and the deal history's closes."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 240_000
+    # The last close is sent before the expiry moves, so it moves with it.
+    broker._wire.orders[603] = _closing_order(603)
+    rest = 10.0 if second_entry else 8.0
+    broker._settle_own_close(broker._open_own_close(222, rest), 603)
+    start, end = _shift_expiry(broker, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    entry_ms = end - shift + 70_000
+    broker.store_ctx.upsert_order(
+        'c3', symbol='EURUSD', side='buy', qty=3.0, filled_qty=0.0, state='confirmed',
+        pine_entry_id='L3', exchange_order_id='113',
+        extras={'order_id': '113', 'position_id': None, 'submitted_at_ms': entry_ms})
+    broker.store_ctx.add_ref('c3', 'order_id', '113')
+    entries = [_timed(_deal(deal_id=903, order_id=113, position_id=222, filled_volume=300),
+                      entry_ms + 1_000)]
+    if second_entry:
+        broker.store_ctx.upsert_order(
+            'c4', symbol='EURUSD', side='buy', qty=2.0, filled_qty=0.0, state='confirmed',
+            pine_entry_id='L4', exchange_order_id='114',
+            extras={'order_id': '114', 'position_id': None, 'submitted_at_ms': entry_ms})
+        broker.store_ctx.add_ref('c4', 'order_id', '114')
+        entries.append(_timed(
+            _deal(deal_id=904, order_id=114, position_id=222, filled_volume=200),
+            entry_ms + 1_500))
+    for entry in entries:
+        entry.tradeSide = _model.ProtoOATradeSide.BUY
+    closes = (
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms),
+        *entries,
+        _timed(_close_deal(deal_id=909, order_id=603, position_id=222,
+                           closed_volume=int(rest * 100)),
+               entry_ms + 2_000))
+    broker._recon = _recon()
+    assert close_ms < entry_ms - ctrader_reconcile._SINCE_ANCHOR_SKEW_MS
+    return broker, reports, closes
+
+
+def __test_filled_then_closed_entry_judges_the_position_s_closes_like_its_rows__(tmp_path):
+    """The working entry's recovery retires every row of the position, so it
+    judges the closes as the vanished rows would: from the closes earlier
+    passes retired on, which its own window starts after. It delivers its
+    fill, the close of L2 (907) and the last close (909) whole, under their
+    own labels, and never the close the expiry retired (908)."""
+    broker, reports, closes = _filled_then_closed_after_expiry_broker(tmp_path)
+    broker._wire._deal_res = _deal_res(*closes)
+
+    events = _run(broker)
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        (None, None, pytest.approx(3.0)),
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(8.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_filled_then_closed_entry_waits_for_a_confirmed_close_missing_from_history__(
+        tmp_path):
+    """As above, but the answer of the close of L2 (order 602) already
+    confirmed its 10-unit fill, whose deal 907 the history does not show yet.
+    The entry's recovery leaves every row live until 907 shows."""
+    broker, reports, closes = _filled_then_closed_after_expiry_broker(tmp_path)
+    record = next(r for r in broker._own_closes if r.order_id == 602)
+    record.sent_ms += 1_000
+    record.count_executed(907, 10.0)
+    record.complete = True
+    broker._wire._deal_res = _deal_res(*(deal for deal in closes if deal.dealId != 907))
+
+    assert _run(broker) == []
+    assert sorted(_live_coids(broker)) == ['c1', 'c2', 'c3']
+
+    broker._wire._deal_res = _deal_res(*closes)
+    events = _run(broker)
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        (None, None, pytest.approx(3.0)),
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(8.0))]
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_filled_then_closed_entries_of_one_position_are_recovered_together__(tmp_path):
+    """Two working entries (L3, L4) filled onto the position before it was
+    emptied. The first one's recovery judges the closes against the share
+    counting both fills, delivers both entry fills before the closes, and
+    retires both rows: the delivered stream ends flat like the venue."""
+    broker, reports, closes = _filled_then_closed_after_expiry_broker(
+        tmp_path, second_entry=True)
+    broker._wire._deal_res = _deal_res(*closes)
+
+    events = [event for _ in range(2) for event in _run(broker)]
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        (None, None, pytest.approx(3.0)),
+        (None, None, pytest.approx(2.0)),
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert sum(e.fill_qty for e in events if e.fill_id is None) + 15.0 == pytest.approx(
+        sum(e.fill_qty for e in events if e.fill_id is not None))
+    assert _live_coids(broker) == []
+    assert reports == []
+
+
+def __test_settled_snapshot_after_the_overlap_ends_it__(tmp_path):
+    """A settled snapshot read more than the clock skew after the overlap
+    ended shows the venue holding the share: every overlap close is then
+    retired, and a later shortfall never books one of them."""
+    broker, _reports = _expired_two_entry_shrink_broker(tmp_path)
+    _start, end = _shift_expiry(broker, 2 * ctrader_reconcile._CLOCK_SKEW_MS + 1_000)
+    assert _run(broker) == []
+    assert 222 not in broker._expiry_overlaps
+    assert broker._closes_covered_until[222] == (
+        end - 2 * ctrader_reconcile._CLOCK_SKEW_MS - 1_000)
+
+
+def __test_overlap_push_after_an_entry_and_a_close_does_not_book_a_retired_close__(
+        tmp_path):
+    """The case a push-side volume comparison cannot order: the expiry
+    retired a 5-unit close (20 -> 15), then a 5-unit entry (20) and a booked
+    5-unit close (15) brought the share back to the expiry's level. The late
+    push of the retired close still reports the 15 it left; it books
+    nothing, and the deal history, finding no shortfall, books nothing
+    either."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    broker.store_ctx.upsert_order(
+        'c3', symbol='EURUSD', side='buy', qty=5.0, filled_qty=5.0,
+        state='confirmed', pine_entry_id='L3', exchange_order_id='222',
+        extras={'order_id': '113', 'position_id': 222})
+    broker.store_ctx.add_ref('c3', 'order_id', '113')
+    broker._retire_partial_close_exposure(222, 5.0, source='position_shrink', entry_id='L3')
+    assert broker._own_share(222) == pytest.approx(15.0)
+    order = _model.ProtoOAOrder(
+        orderId=600, orderType=_model.ProtoOAOrderType.MARKET, closingOrder=True,
+        positionId=222, executedVolume=500,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=500,
+                                          tradeSide=_model.ProtoOATradeSide.SELL))
+    push = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    push.order.CopyFrom(order)
+    push.deal.CopyFrom(_model.ProtoOADeal(
+        dealId=908, orderId=600, positionId=222, filledVolume=500, executionPrice=1.1,
+        executionTimestamp=int(epoch_time() * 1000) - 10_000,
+        closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=500)))
+    push.position.CopyFrom(_position(position_id=222, volume=1500))
+
+    assert broker._translate_exec_event(push) is None
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1500)])
+    assert _run(broker) == [] and _run(broker) == []
+
+    assert broker._own_share(222) == pytest.approx(15.0)
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+    assert reports == []
+
+
+def __test_named_close_in_history_inside_an_expiry_overlap_is_booked_against_its_entry__(
+        tmp_path):
+    """The same close known only from the deal history: the next shrink
+    judgment books it, newest first against the shortfall, under its own
+    deal and entry, and nothing the expiry retired is booked again."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    # The expiry read happened two minutes ago, the close right after it.
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms))
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    events = [event for _ in range(2) for event in _run(broker)]
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_positionless_overlap_push_leaves_its_close_to_the_deal_history__(tmp_path):
+    """A push of the overlap close that reports no position cannot tell it
+    from one the expiry retired: it books nothing and leaves its deal unseen,
+    so the deal history's judgment delivers the fill under its own deal and
+    entry, exactly once."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    shift = 120_000
+    start, end = _shift_expiry(broker, shift)
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    push = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    push.order.CopyFrom(broker._wire.orders[602])
+    push.deal.CopyFrom(_model.ProtoOADeal(
+        dealId=907, orderId=602, positionId=222, filledVolume=1000, executionPrice=1.1,
+        executionTimestamp=close_ms,
+        closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=1000)))
+
+    assert broker._translate_exec_event(push) is None
+    assert _retired(broker, 'c2') == pytest.approx(0.0)
+
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms))
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    events = [event for _ in range(2) for event in _run(broker)]
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_overlap_push_after_a_refill_does_not_book_a_retired_close_again__(tmp_path):
+    """The expiry retired a 5-unit close executed just before its read (20 ->
+    15); a new 5-unit entry then restored journal and venue to 20. The late
+    push of the retired close still reports the 15 it left: against the share
+    of now it would look new, so it is left to the deal history, which finds
+    no shortfall, and nothing is booked again."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    broker.store_ctx.upsert_order(
+        'c3', symbol='EURUSD', side='buy', qty=5.0, filled_qty=5.0,
+        state='confirmed', pine_entry_id='L3', exchange_order_id='222',
+        extras={'order_id': '113', 'position_id': 222})
+    broker.store_ctx.add_ref('c3', 'order_id', '113')
+    assert broker._own_share(222) == pytest.approx(20.0)
+    order = _model.ProtoOAOrder(
+        orderId=600, orderType=_model.ProtoOAOrderType.MARKET, closingOrder=True,
+        positionId=222, executedVolume=500,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=500,
+                                          tradeSide=_model.ProtoOATradeSide.SELL))
+    push = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    push.order.CopyFrom(order)
+    push.deal.CopyFrom(_model.ProtoOADeal(
+        dealId=908, orderId=600, positionId=222, filledVolume=500, executionPrice=1.1,
+        executionTimestamp=int(epoch_time() * 1000) - 10_000,
+        closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=500)))
+    push.position.CopyFrom(_position(position_id=222, volume=1500))
+
+    assert broker._translate_exec_event(push) is None
+    broker._recon = _recon(positions=[_position(position_id=222, volume=2000)])
+    assert _run(broker) == [] and _run(broker) == []
+
+    assert broker._own_share(222) == pytest.approx(20.0)
+    assert _retired(broker, 'c1') == pytest.approx(5.0)
+    assert _retired(broker, 'c3') == pytest.approx(0.0)
+    assert reports == []
+
+
+def __test_waiting_shrink_reread_cut_short_resumes_where_it_stopped__(tmp_path):
+    """A full reread of the deal history the pass budget cut short is resumed
+    on the next pass, never restarted from the window's start."""
+    broker, _reports = _unexplained_shrink_broker(tmp_path)
+    assert _run(broker) == [] and _run(broker) == []
+    walk = broker._deal_walks[-222]
+    walk.segments.append([walk.from_ms, walk.from_ms + 1])
+
+    _run(broker)
+
+    assert broker._deal_walks[-222] is walk
+
+
+def __test_equal_shrink_after_the_share_came_back_is_judged_again__(tmp_path):
+    """A shrink judged once does not hide a later one to the same volumes on
+    the same position, once the position held the share in between."""
+    broker, reports = _shrunk_position_broker(
+        tmp_path, closing_order=_closing_order(600, stop_out=True))
+    broker._wire.orders[601] = _closing_order(601, stop_out=True)
+    _run(broker)
+    _run(broker)
+    assert _retired(broker) == pytest.approx(10.0)
+    _seed_position(broker, 'c4', position_id=222, qty=10.0, extras={'order_id': '112'})
+    broker.store_ctx.add_ref('c4', 'order_id', '112')
+    broker._recon = _recon(positions=[_position(position_id=222, volume=2000)])
+    _run(broker)
+    # The first shrink was judged in venue time before the second close.
+    broker._closes_covered_until[222] = 1_700_000_003_500
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _timed(_close_deal(deal_id=903, order_id=600, position_id=222, closed_volume=1000),
+               1_700_000_003_000),
+        _timed(_deal(deal_id=904, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_004_000),
+        _timed(_close_deal(deal_id=905, order_id=601, position_id=222, closed_volume=1000),
+               1_700_000_005_000))
+
+    _run(broker)
+    _run(broker)
+
+    assert _retired(broker) + _retired(broker, 'c4') == pytest.approx(20.0)
+    assert reports == []
+
+
+def __test_equal_shrink_after_a_rebound_no_snapshot_saw_is_judged_again__(tmp_path):
+    """An entry fill that restores the share and a second equal close, both
+    between two snapshots, are a new shrink: the first judgment hides nothing."""
+    broker, reports = _shrunk_position_broker(
+        tmp_path, closing_order=_closing_order(600, stop_out=True))
+    broker._wire.orders[601] = _closing_order(601, stop_out=True)
+    _run(broker)
+    _run(broker)
+    assert _retired(broker) == pytest.approx(10.0)
+    # No snapshot shows the position back at 20: the entry and the second
+    # close both happen before the next read.
+    _seed_position(broker, 'c4', position_id=222, qty=10.0, extras={'order_id': '112'})
+    broker.store_ctx.add_ref('c4', 'order_id', '112')
+    broker._closes_covered_until[222] = 1_700_000_003_500
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    broker._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _timed(_close_deal(deal_id=903, order_id=600, position_id=222, closed_volume=1000),
+               1_700_000_003_000),
+        _timed(_deal(deal_id=904, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_004_000),
+        _timed(_close_deal(deal_id=905, order_id=601, position_id=222, closed_volume=1000),
+               1_700_000_005_000))
+
+    _run(broker)
+    _run(broker)
+
+    assert _retired(broker) + _retired(broker, 'c4') == pytest.approx(20.0)
+    assert reports == []
+
+
 def __test_shrink_is_not_judged_while_an_event_waits_in_the_queue__(tmp_path):
     broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
     broker._exec_events = asyncio.Queue()
@@ -2766,6 +4246,154 @@ def __test_netting_shrink_books_an_own_close_of_a_newer_entry_against_that_entry
         ('903', '__pyne_partial__L2', pytest.approx(5.0))]
     assert _retired(process, 'c1') == pytest.approx(0.0)
     assert _retired(process, 'c2') == pytest.approx(5.0)
+
+
+def __test_netting_shrink_interrupted_at_its_debit_is_judged_again_after_a_restart__(tmp_path):
+    """L1 and L2 hold 10 each; the bot's close of L2 (order 888, 5 units)
+    executed with its fill push missed. The process judging the shrink stops
+    at the debit of L2: nothing of that judgment is durable, so the next
+    process judges deal 903 again and books it against L2, not oldest first."""
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=903, order_id=888, position_id=222, closed_volume=500),
+               1_700_000_003_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1500)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid, pine_id, order_id in (('c1', 'L1', '111'), ('c2', 'L2', '112')):
+        broker.store_ctx.upsert_order(
+            coid, symbol='EURUSD', side='buy', qty=10.0, filled_qty=10.0,
+            state='confirmed', pine_entry_id=pine_id, exchange_order_id='222',
+            extras={'order_id': order_id, 'position_id': 222})
+        broker.store_ctx.add_ref(coid, 'order_id', order_id)
+    broker._close_dispatch_pine_by_position[222] = '__pyne_partial__L2'
+    broker._close_settle_entry_by_position[222] = 'L2'
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 888)
+    stopped = _next_process(broker)
+
+    def stop_at_debit(*_args, **_kwargs):
+        raise RuntimeError('process stopped')
+
+    stopped._retire_partial_close_exposure = stop_at_debit
+    _run(stopped)
+    with pytest.raises(RuntimeError, match='process stopped'):
+        _run(stopped)
+    process = _next_process(stopped)
+
+    events = [event for _ in range(2) for event in _run(process)]
+    process._flush_external_interventions()
+
+    assert reports == []
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('903', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _retired(process, 'c1') == pytest.approx(0.0)
+    assert _retired(process, 'c2') == pytest.approx(5.0)
+    # A process that stops after the judgment, before the engine books the
+    # close fill, leaves the engine of the next one its book from the journal.
+    engine = OrderSyncEngine(broker=process, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=process.store_ctx.run_tag, mintick=0.00001,
+                             store_ctx=process.store_ctx)
+    assert engine._recover_adopted_parent_trades(15.0, fifo_trim=True) == [
+        ('L1', pytest.approx(10.0)), ('L2', pytest.approx(5.0))]
+
+
+def __test_netting_shrink_interrupted_at_its_debit_is_judged_again_by_the_same_process__(
+        tmp_path):
+    """As above, but the pass that failed at the debit of L2 is retried by the
+    same process: the state it kept of the rolled-back judgment is put back,
+    so deal 903 is judged again and booked against L2."""
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=903, order_id=888, position_id=222, closed_volume=500),
+               1_700_000_003_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1500)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid, pine_id, order_id in (('c1', 'L1', '111'), ('c2', 'L2', '112')):
+        broker.store_ctx.upsert_order(
+            coid, symbol='EURUSD', side='buy', qty=10.0, filled_qty=10.0,
+            state='confirmed', pine_entry_id=pine_id, exchange_order_id='222',
+            extras={'order_id': order_id, 'position_id': 222})
+        broker.store_ctx.add_ref(coid, 'order_id', order_id)
+    broker._close_dispatch_pine_by_position[222] = '__pyne_partial__L2'
+    broker._close_settle_entry_by_position[222] = 'L2'
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 888)
+    process = _next_process(broker)
+
+    def stop_at_debit(*_args, **_kwargs):
+        raise RuntimeError('debit failed')
+
+    process._retire_partial_close_exposure = stop_at_debit
+    _run(process)
+    with pytest.raises(RuntimeError, match='debit failed'):
+        _run(process)
+    del process._retire_partial_close_exposure
+
+    events = [event for _ in range(2) for event in _run(process)]
+    process._flush_external_interventions()
+
+    assert reports == []
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('903', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _retired(process, 'c1') == pytest.approx(0.0)
+    assert _retired(process, 'c2') == pytest.approx(5.0)
+
+
+def __test_close_answered_after_a_rolled_back_judgment_settles_the_record_the_run_tracks__(
+        tmp_path):
+    """The bot's close of position 222 waits for its answer while a close
+    judgment rolls back. The answer then names order 888: it settles the close
+    record the run tracks, so the position's share is settled again and the
+    close no longer counts as in flight."""
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1000)]))
+    _open(tmp_path, broker)
+
+    async def scenario() -> None:
+        sent = asyncio.Event()
+        release = asyncio.Event()
+
+        async def dispatch(req, *, coid, context, predecessor_cancel_ids=None):
+            sent.set()
+            await release.wait()
+            event = _oa.ProtoOAExecutionEvent(
+                executionType=_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+            event.order.CopyFrom(_model.ProtoOAOrder(
+                orderId=888, clientOrderId=coid, orderType=_model.ProtoOAOrderType.MARKET,
+                orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED,
+                tradeData=_model.ProtoOATradeData(
+                    symbolId=1, volume=req.volume, tradeSide=_model.ProtoOATradeSide.SELL)))
+            return event
+
+        broker._dispatch_order = dispatch
+        send = asyncio.create_task(broker._send_own_close(
+            _oa.ProtoOAClosePositionReq(ctidTraderAccountId=999, positionId=222, volume=500),
+            coid='close-1', context='test'))
+        await sent.wait()
+        with pytest.raises(RuntimeError, match='judgment failed'):
+            with broker._judgment_span():
+                raise RuntimeError('judgment failed')
+        release.set()
+        await send
+
+    asyncio.run(scenario())
+
+    [record] = broker._own_close_history
+    assert record.order_id == 888
+    assert record.answered_ms is not None
+    assert all(tracked is record for tracked in broker._own_closes)
+    assert broker._share_settled(222)
 
 
 def __test_netting_shrink_gives_a_foreign_deal_no_identity_of_an_unanswered_close__(tmp_path):
@@ -3180,9 +4808,10 @@ def __test_shrink_of_a_row_whose_resume_accepted_absence_ended_is_judged__(tmp_p
     assert _store_events(broker, 'ctrader_close_accepted_by_resume') == []
 
 
-def __test_pyramid_shrink_after_an_operator_resume_is_accepted__(tmp_path):
+def __test_pyramid_shrink_after_an_operator_resume_is_accepted__(tmp_path, monkeypatch):
     """Two entry rows share the shrunk position, so the startup baseline leaves
-    it alone; the first pass still accepts the operator's close."""
+    it alone; the first pass, ten minutes ago, still accepts the operator's
+    close."""
     broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
     broker.store_ctx.upsert_order('c3', qty=10.0, filled_qty=10.0)
     _seed_position(broker, 'c4', position_id=222, qty=10.0)
@@ -3190,8 +4819,11 @@ def __test_pyramid_shrink_after_an_operator_resume_is_accepted__(tmp_path):
     broker._apply_adoption_baseline(broker._recon)
     assert _retired(broker) == 0.0
 
+    accepted_at = epoch_time() - 600.0
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: accepted_at)
     for _ in range(3):
         _run(broker)
+    monkeypatch.undo()
     broker._flush_external_interventions()
 
     assert reports == []
@@ -3201,7 +4833,8 @@ def __test_pyramid_shrink_after_an_operator_resume_is_accepted__(tmp_path):
     # A shrink after that first pass is judged as usual.
     broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
     broker._wire._deal_res.deal.append(_timed(_close_deal(
-        deal_id=905, order_id=600, position_id=222, closed_volume=500), 1_700_000_005_000))
+        deal_id=905, order_id=600, position_id=222, closed_volume=500),
+        int(epoch_time() * 1000) - 120_000))
     for _ in range(2):
         _run(broker)
     broker._flush_external_interventions()
@@ -3365,3 +4998,517 @@ def __test_recovered_protection_close_without_levels_after_an_own_view_is_the_ve
     assert 'c3' not in _live_coids(broker)
     assert reports == []
     assert _store_events(broker, 'ctrader_protection_fired_unconfirmed') == []
+
+
+# === Close coverage across a restart ======================================
+
+def __test_history_close_an_expiry_retired_is_not_booked_after_a_restart__(tmp_path):
+    """The first shortfall's wait expired and retired it unbound; the process
+    then stops. The next process of the run sees a second shortfall, and the
+    deal history shows the first shortfall's close only now: it is a close the
+    journal retired already (the coverage watermark the earlier process
+    journalled), neither delivered nor debited, and the second shortfall keeps
+    waiting for its own close."""
+    broker, reports = _unexplained_shrink_broker(tmp_path)
+    assert _run(broker) == []
+    broker._shrink_seen_since[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    assert _run(broker) == [] and _run(broker) == []
+    assert _retired(broker) == pytest.approx(10.0)
+    process = _next_process(broker)
+    process._apply_adoption_baseline(process._recon)
+    assert process._startup_shrinks == {}
+    process._recon = _recon(positions=[_position(position_id=222, volume=500)])
+    assert _run(process) == [] and _run(process) == []
+    assert 222 in process._unexplained_shrinks
+    process._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _close_deal_903(price=1.2345))
+
+    assert _run(process) == []
+
+    assert _retired(process) == pytest.approx(10.0)
+    assert 222 in process._unexplained_shrinks
+    assert reports == []
+
+
+def _waiting_two_entry_shrink_broker(tmp_path):
+    """L1 (c1, order 111) and L2 (c2, order 112) hold 10 each on position
+    222; the venue shows 15, the bot's own close of 5 (order 600) executed,
+    and the deal history shows no close yet: the shortfall's wait runs."""
+    history = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1500)]))
+    broker._wire = _VenueWire(deal_res=history, orders=[_closing_order(600)])
+    broker._wire.honour_window = True
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    for coid, pine_id, order_id, submitted_ms in (
+            ('c1', 'L1', '111', 1_700_000_001_000), ('c2', 'L2', '112', 1_700_000_002_000)):
+        broker.store_ctx.upsert_order(
+            coid, symbol='EURUSD', side='buy', qty=10.0, filled_qty=10.0,
+            state='confirmed', pine_entry_id=pine_id, exchange_order_id='222',
+            extras={'order_id': order_id, 'position_id': 222,
+                    'submitted_at_ms': submitted_ms})
+        broker.store_ctx.add_ref(coid, 'order_id', order_id)
+    broker._settle_own_close(broker._open_own_close(222, 5.0), 600)
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=1500)}
+    assert _run(broker) == [] and _run(broker) == []
+    assert 222 in broker._unexplained_shrinks
+    return broker, reports
+
+
+def __test_close_a_wait_spanning_a_restart_waits_for_is_delivered_with_its_deal__(tmp_path):
+    """The process stops while a shortfall waits for the close that explains
+    it, after its passes moved the coverage watermark past that close's
+    execution time. The next process takes the wait over (journalled with
+    the watermark it began at): the close the deal history shows then is
+    delivered under its own deal id and retires its volume once."""
+    broker, reports = _waiting_two_entry_shrink_broker(tmp_path)
+    process = _next_process(broker)
+    process._apply_adoption_baseline(process._recon)
+    process._load_close_evidence()
+    assert process._startup_shrinks == {}
+    assert 222 in process._unexplained_shrinks
+    assert process._closes_covered_until[222] > 1_700_000_003_000
+    process._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=903, order_id=600, position_id=222, closed_volume=500,
+                           price=1.2345), 1_700_000_003_000))
+
+    events = [event for _ in range(2) for event in _run(process)]
+
+    assert [(e.leg_type, e.fill_id, e.fill_qty, e.fill_price) for e in events] == [
+        (LegType.CLOSE, '903', pytest.approx(5.0), pytest.approx(1.2345))]
+    assert _retired(process, 'c1') + _retired(process, 'c2') == pytest.approx(5.0)
+    assert 222 not in process._unexplained_shrinks
+    assert reports == []
+
+
+def __test_vanished_position_does_not_book_a_close_its_expiry_retired_after_a_restart__(
+        tmp_path):
+    """:func:`__test_vanished_position_does_not_book_a_close_its_expiry_retired__`
+    with a restart between the expiry and the rows' judgment: the next process
+    takes the expiry overlap over from the journal, so the close the expiry
+    retired is still never delivered."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    process = _next_process(broker)
+    process._wire.orders[602] = broker._wire.orders[602]
+    process._close_dispatch_pine_by_position[222] = '__pyne_partial__L2'
+    process._close_settle_entry_by_position[222] = 'L2'
+    process._apply_adoption_baseline(process._recon)
+    process._load_close_evidence()
+    assert 222 in process._expiry_overlaps
+    shift = 120_000
+    for record in process._own_close_history:
+        record.sent_ms -= shift
+        if record.answered_ms is not None:
+            record.answered_ms -= shift
+    start, end = _shift_expiry(process, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    last_ms = end - shift + 1_000
+    process._wire.orders[603] = _closing_order(603)
+    process._settle_own_close(process._open_own_close(222, 5.0), 603)
+    process._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms),
+        _timed(_close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000),
+               close_ms),
+        _timed(_close_deal(deal_id=909, order_id=603, position_id=222, closed_volume=500),
+               last_ms))
+    for coid in ('c1', 'c2'):
+        row = process.store_ctx.get_order(coid)
+        process.store_ctx.upsert_order(
+            coid, extras={**(row.extras or {}), 'missing_pending_since': 0.0})
+    assert process._own_share(222) == pytest.approx(15.0)
+
+    events, err = _drive_tracker(process)
+
+    assert err is None
+    assert sorted((e.fill_id, e.from_entry, e.fill_qty)
+                  for e in events if e.fill_id is not None) == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0)),
+        ('909', '__pyne_partial__L2', pytest.approx(5.0))]
+    assert _live_coids(process) == []
+    assert reports == []
+
+
+@pytest.mark.parametrize('evidence_first', [True, False])
+def __test_wait_the_startup_baseline_retired_is_not_taken_over_after_a_restart__(
+        tmp_path, evidence_first):
+    """The process stops while the shortfall of its one-row position waits;
+    the next process's startup baseline retires that shortfall and judges it
+    as a startup shrink. The journalled wait ends, whether the startup
+    recovery took the earlier processes' close evidence over before the
+    baseline or after it: the close's push is a late copy of what the baseline
+    retired, never booked again."""
+    broker, reports = _unexplained_shrink_broker(tmp_path)
+    assert _run(broker) == [] and _run(broker) == []
+    assert 222 in broker._unexplained_shrinks
+    process = _next_process(broker)
+    if evidence_first:
+        process._load_close_evidence()
+        assert 222 in process._unexplained_shrinks
+    process._apply_adoption_baseline(process._recon)
+    process._load_close_evidence()
+
+    assert _startup_volumes(process) == {222: pytest.approx(10.0)}
+    assert 222 not in process._unexplained_shrinks
+    assert process._translate_exec_event(_own_close_903(price=1.2345)) is None
+    assert _retired(process) == pytest.approx(10.0)
+    assert reports == []
+
+
+@pytest.mark.parametrize('dies_in_settlement', [False, True])
+def __test_confirmed_close_missing_from_history_after_a_restart_lets_no_retired_deal_book__(
+        tmp_path, monkeypatch, dies_in_settlement):
+    """:func:`__test_confirmed_close_missing_from_history_does_not_let_a_retired_deal_book__`
+    with a restart after the answer of the close of L2 confirmed its 10-unit
+    fill (deal 907), also when the process died right after journalling the
+    answer: the next process takes the close's confirmed execution over from
+    the journal, so the 5-unit close the expiry retired (order 600) is still
+    never booked in its place, and 907 is booked whole once it shows."""
+    broker, reports = _expired_two_entry_shrink_broker(tmp_path)
+    record = next(r for r in broker._own_closes if r.order_id == 602)
+    if dies_in_settlement:
+        def dies(*_args, **_kwargs):
+            raise RuntimeError("process died")
+
+        monkeypatch.setattr(broker, '_rejudge_claims', dies)
+        with pytest.raises(RuntimeError):
+            broker._settle_own_close(record, 602, answer_fill=_AnswerFill(
+                deal_id=907, executed_ms=None, closed=10.0), complete=True)
+    else:
+        broker._settle_own_close(record, 602, answer_fill=_AnswerFill(
+            deal_id=907, executed_ms=None, closed=10.0), complete=True)
+    process = _next_process(broker)
+    process._close_dispatch_pine_by_position[222] = '__pyne_partial__L2'
+    process._close_settle_entry_by_position[222] = 'L2'
+    process._apply_adoption_baseline(process._recon)
+    process._load_close_evidence()
+    shift = 120_000
+    for restored in process._own_close_history:
+        restored.sent_ms -= shift
+        if restored.answered_ms is not None:
+            restored.answered_ms -= shift
+        if restored.order_id == 602:
+            restored.sent_ms += 1_000
+    start, end = _shift_expiry(process, shift)
+    retired_ms = start - shift + 1_000
+    close_ms = end - shift - ctrader_reconcile._CLOCK_SKEW_MS + 1_000
+    entries = (
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+               1_700_000_001_000),
+        _timed(_deal(deal_id=902, order_id=112, position_id=222, filled_volume=1000),
+               1_700_000_002_000),
+        _timed(_close_deal(deal_id=908, order_id=600, position_id=222, closed_volume=500),
+               retired_ms))
+    process._wire._deal_res = _deal_res(*entries)
+    process._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    assert [event for _ in range(3) for event in _run(process)] == []
+    assert _retired(process, 'c1') == pytest.approx(5.0)
+    assert _retired(process, 'c2') == pytest.approx(0.0)
+
+    process._wire._deal_res = _deal_res(*entries, _timed(
+        _close_deal(deal_id=907, order_id=602, position_id=222, closed_volume=1000), close_ms))
+    events = [event for _ in range(2) for event in _run(process)]
+
+    assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
+        ('907', '__pyne_partial__L2', pytest.approx(10.0))]
+    assert _retired(process, 'c1') == pytest.approx(5.0)
+    assert _retired(process, 'c2') == pytest.approx(10.0)
+    assert reports == []
+
+
+# === Closes retired without a judgment stay retired =======================
+
+def _later_foreign_close(process) -> None:
+    """Someone closes 5 more of position 222 (order 601), two minutes ago."""
+    process._wire.orders[601] = _closing_order(601)
+    process._wire._deal_res.deal.append(_timed(_close_deal(
+        deal_id=905, order_id=601, position_id=222, closed_volume=500),
+        int(epoch_time() * 1000) - 120_000))
+    process._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+
+@pytest.mark.parametrize('restart', [False, True])
+def __test_close_a_startup_resume_accepted_is_neither_booked_nor_reported_later__(
+        tmp_path, restart):
+    """The startup baseline accepted the operator's close of 10 (deal 903)
+    after a resume, from a snapshot read ten minutes ago. Someone closes 5
+    more later: only that close is reported and retired; the accepted close
+    is neither reported nor taken from the share again."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    accept_missing_before_resume(broker.store_ctx)
+    broker._snapshot_read_started_at = epoch_time() - 600.0
+    broker._apply_adoption_baseline(broker._recon)
+    assert _retired(broker) == pytest.approx(10.0)
+    process = broker
+    if restart:
+        process = _next_process(broker)
+        process._apply_adoption_baseline(process._recon)
+    assert _run(process) == [] and _run(process) == []
+    _later_foreign_close(process)
+
+    for _ in range(3):
+        _run(process)
+    process._flush_external_interventions()
+
+    assert _retired(process) == pytest.approx(15.0)
+    assert [(r[1]['deal_ids'], r[1]['booked_qty']) for r in reports] == [
+        ([905], pytest.approx(5.0))]
+
+
+def __test_pending_shrink_a_later_resume_accepted_covers_its_closes__(tmp_path, monkeypatch):
+    """A process found the shrink ten minutes ago and stopped before judging
+    it; the operator resumed the run, and the next process accepted it.
+    Someone closes 5 more later: only that close is reported and retired."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    found_at = epoch_time() - 600.0
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: found_at)
+    broker._apply_adoption_baseline(broker._recon)
+    monkeypatch.undo()
+    accept_missing_before_resume(broker.store_ctx)
+    process = _next_process(broker)
+    process.operator_resume_ts_ms = int(epoch_time() * 1000)
+    process._apply_adoption_baseline(process._recon)
+    assert _run(process) == [] and _run(process) == []
+    assert len(_store_events(process, 'ctrader_close_accepted_by_resume')) == 1
+    _later_foreign_close(process)
+
+    for _ in range(3):
+        _run(process)
+    process._flush_external_interventions()
+
+    assert _retired(process) == pytest.approx(15.0)
+    assert [(r[1]['deal_ids'], r[1]['booked_qty']) for r in reports] == [
+        ([905], pytest.approx(5.0))]
+
+
+def __test_startup_shrink_judgment_does_not_take_a_close_an_expiry_retired__(tmp_path):
+    """The first shortfall's wait expired and retired it unbound; the process
+    then stops. The next process's startup baseline retires a second
+    shortfall of 5, and the deal history shows the first shortfall's close
+    only now: the startup shrink's judgment does not take it from the share
+    again."""
+    broker, reports = _unexplained_shrink_broker(tmp_path)
+    assert _run(broker) == []
+    broker._shrink_seen_since[222] -= ctrader_reconcile._UNEXPLAINED_SHRINK_WAIT_S
+    assert _run(broker) == [] and _run(broker) == []
+    assert _retired(broker) == pytest.approx(10.0)
+    process = _next_process(broker)
+    process._recon = _recon(positions=[_position(position_id=222, volume=500)])
+    process._apply_adoption_baseline(process._recon)
+    assert _retired(process) == pytest.approx(15.0)
+    process._wire._deal_res = _deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _close_deal_903(price=1.2345))
+
+    events = [event for _ in range(3) for event in _run(process)]
+
+    assert events == []
+    assert process._startup_shrinks == {}
+    assert _retired(process) == pytest.approx(15.0)
+    assert reports == []
+
+
+def __test_startup_baseline_retires_a_shrink_only_with_its_pending_record__(
+        tmp_path, monkeypatch):
+    """The process dies while recording the shrink the startup baseline
+    found: the retirement is not journalled without it, so the next process
+    finds and judges the shrink again."""
+    broker, _reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+
+    def dies(*_args, **_kwargs):
+        raise RuntimeError("process died")
+
+    monkeypatch.setattr(broker, '_record_startup_shrink', dies)
+    with pytest.raises(RuntimeError):
+        broker._apply_adoption_baseline(broker._recon)
+
+    assert _retired(broker) == 0.0
+    process = _next_process(broker)
+    process._apply_adoption_baseline(process._recon)
+    assert _startup_volumes(process) == {222: pytest.approx(10.0)}
+
+
+def __test_resume_acceptance_retires_a_shrink_only_with_its_coverage__(
+        tmp_path, monkeypatch):
+    """Two entries share the shrunk position, so the first settled pass
+    accepts the operator's close; the process dies while journalling the
+    closes' coverage: the retirement is not journalled without it."""
+    broker, _reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker.store_ctx.upsert_order('c3', qty=10.0, filled_qty=10.0)
+    _seed_position(broker, 'c4', position_id=222, qty=10.0)
+    accept_missing_before_resume(broker.store_ctx)
+    broker._apply_adoption_baseline(broker._recon)
+
+    def dies(*_args, **_kwargs):
+        raise RuntimeError("process died")
+
+    monkeypatch.setattr(broker, '_journal_close_coverage', dies)
+    with pytest.raises(RuntimeError):
+        for _ in range(3):
+            _run(broker)
+
+    assert _retired(broker) + _retired(broker, 'c4') == 0.0
+
+
+def __test_resume_acceptance_whose_debit_failed_is_applied_by_the_next_pass__(
+        tmp_path, monkeypatch):
+    """Two entries share the shrunk position; the first settled pass accepts
+    the operator's close, but its debit fails after the closes' coverage was
+    written. The pass rolls back whole, in the journal and in this process:
+    the next settled pass of the same process applies the acceptance, its
+    coverage and the retirement together, with no shortfall wait."""
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker.store_ctx.upsert_order('c3', qty=10.0, filled_qty=10.0)
+    _seed_position(broker, 'c4', position_id=222, qty=10.0)
+    accept_missing_before_resume(broker.store_ctx)
+    broker._apply_adoption_baseline(broker._recon)
+
+    def debit_fails(*_args, **_kwargs):
+        raise RuntimeError('debit failed')
+
+    monkeypatch.setattr(broker, '_retire_partial_close_exposure', debit_fails)
+    with pytest.raises(RuntimeError, match='debit failed'):
+        for _ in range(3):
+            _run(broker)
+    monkeypatch.undo()
+
+    assert 222 in broker._resume_accepted_positions
+    assert 222 not in broker._closes_covered_until
+    assert 222 not in broker._resume_accepted_until
+    assert _store_events(broker, 'ctrader_close_accepted_by_resume') == []
+
+    for _ in range(3):
+        _run(broker)
+    broker._flush_external_interventions()
+
+    assert reports == []
+    assert _retired(broker) + _retired(broker, 'c4') == pytest.approx(10.0)
+    assert len(_store_events(broker, 'ctrader_close_accepted_by_resume')) == 1
+    assert 222 not in broker._unexplained_shrinks
+    assert broker._resume_accepted_until[222] == broker._closes_covered_until[222]
+
+
+def __test_startup_baseline_whose_write_failed_leaves_no_coverage_in_memory__(
+        tmp_path, monkeypatch):
+    """The startup baseline retires the shrink an operator resume accepted,
+    but its audit write fails: the retirement and the closes' coverage roll
+    back in the journal, and this process holds no coverage the journal does
+    not."""
+    broker, _reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    accept_missing_before_resume(broker.store_ctx)
+
+    def audit_fails(*_args, **_kwargs):
+        raise RuntimeError('audit failed')
+
+    monkeypatch.setattr(broker, '_note_accepted_by_resume', audit_fails)
+    with pytest.raises(RuntimeError, match='audit failed'):
+        broker._apply_adoption_baseline(broker._recon)
+
+    assert _retired(broker) == 0.0
+    assert 222 not in broker._closes_covered_until
+    assert 222 not in broker._resume_accepted_until
+    assert broker._coverage_journalled == {}
+
+
+def __test_close_evidence_merged_inside_a_rolled_back_judgment_stays_merged__(tmp_path):
+    """An earlier process journalled its close of position 222 as order 602.
+    The next process first merges that evidence inside a judgment that rolls
+    back: the merge is kept, so the close still counts as the run's own."""
+    broker = _ReconcileBroker(_recon())
+    _open(tmp_path, broker)
+    record = broker._open_own_close(222, 10.0)
+    broker._settle_own_close(record, 602)
+    process = _next_process(broker)
+
+    with pytest.raises(RuntimeError, match='judgment failed'):
+        with process._judgment_span():
+            process._load_close_evidence()
+            raise RuntimeError('judgment failed')
+
+    process._load_close_evidence()
+    assert [r.order_id for r in process._own_close_history] == [602]
+
+
+def __test_shared_position_audit_of_a_rolled_back_transfer_is_written_by_its_retry__(
+        tmp_path):
+    """A second entry linked to position 222 inside a transaction that rolls
+    back (an adopted-leg takeover that failed): the audit of the shared
+    position is rolled back with it, and the retry writes it once."""
+    broker = _ReconcileBroker(_recon())
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=10.0)
+    broker.store_ctx.add_ref('c3', 'position_id', '222')
+    _seed_position(broker, 'c4', position_id=222, qty=10.0)
+
+    with pytest.raises(RuntimeError, match='transfer failed'):
+        with broker._judgment_span():
+            broker._link_position_ref('c4', 222)
+            raise RuntimeError('transfer failed')
+    assert _store_events(broker, 'ctrader_position_id_shared') == []
+
+    broker._link_position_ref('c4', 222)
+    assert len(_store_events(broker, 'ctrader_position_id_shared')) == 1
+
+
+def __test_own_fill_taken_before_the_answer_is_journalled_with_it__(tmp_path):
+    """A fill of the close (order 602) arrived before the answer named that
+    order: the answer journals it as executed, so a restarted process knows
+    the 4 units the close executed."""
+    broker = _ReconcileBroker(_recon())
+    _open(tmp_path, broker)
+    record = broker._open_own_close(222, 10.0)
+    broker._record_claim(record, _claim(602, fill_qty=4.0))
+
+    broker._settle_own_close(record, 602)
+
+    assert record.executed == pytest.approx(4.0)
+    assert record.complete, "the claimed fill was the order's final one"
+    process = _next_process(broker)
+    process._load_close_evidence()
+    restored = next(r for r in process._own_close_history if r.order_id == 602)
+    assert restored.executed == pytest.approx(4.0)
+    assert restored.executed_deals == {952}
+    assert restored.complete
+
+
+def __test_close_coverage_journal_keeps_one_record_per_position__(tmp_path):
+    # Every rise of a position's watermark is journalled, yet the run keeps
+    # only the latest record of each position: the journal and its read at a
+    # restart grow with the positions, never with the passes of the run.
+    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+    _open(tmp_path, broker)
+    for step in range(50):
+        broker._cover_closes(222, 1_700_000_100.0 + step)
+        broker._cover_closes(333, 1_700_000_200.0 + step, accepted=True)
+
+    records = list(broker.store_ctx.iter_events_by_kind_for_run_id(
+        ctrader_reconcile._CLOSE_COVERAGE_EVENT))
+    assert len(records) == 2
+
+    restarted = _restarted_process(tmp_path, broker, _recon(), _deal_res())
+    restarted._load_close_evidence()
+    assert restarted._closes_covered_until[222] == (
+        int((1_700_000_100.0 + 49) * 1000) - ctrader_reconcile._CLOCK_SKEW_MS)
+    assert restarted._closes_covered_until[333] == (
+        int((1_700_000_200.0 + 49) * 1000) - ctrader_reconcile._CLOCK_SKEW_MS)
+    assert restarted._resume_accepted_until[333] == restarted._closes_covered_until[333]
+    assert 222 not in restarted._resume_accepted_until
