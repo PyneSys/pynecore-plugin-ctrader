@@ -52,6 +52,15 @@ Row commission booked          ``filled_qty`` (commission is booked with   journ
                                the fill) minus row extras                  executions beyond the cursor and
                                ``fee_unbooked``                            the listed ranges, never a deal
                                                                            the cursor counts
+Fills journaled, not yet       ``ctrader_fill_delivery`` events, written   journalled; a fill without the
+taken by the engine            with the journal write holding the fill,    engine's receipt is delivered
+                               dropped once the engine's receipt shows     again, marked journaled before
+                                                                           the restart
+Close fills of a vanished      ``ctrader_vanished_close_fills`` events,    journalled; delivered again by the
+row's judgment                 written with the deals judged, dropped      next judgment of a row still live
+                               when the verdict retires the rows
+Commission delivered without   ``ctrader_fee_delivery`` events, written    journalled; delivered again until
+its fill                       with the ``fee_unbooked`` ranges it takes   the receipt accounts it
 Fill de-dup deal ids           memory (``_seen_deal_ids``)                 not needed: the push stream never
                                                                            redelivers an earlier connection's
                                                                            fills; a share replay's ``seen``
@@ -59,6 +68,10 @@ Fill de-dup deal ids           memory (``_seen_deal_ids``)                 not n
 Judged closing deals, origins  ``ctrader_close_judged`` events             journalled
 Own closes sent, what each     ``ctrader_own_close`` events, written on    journalled
 executed, completion           send, answer, refusal and every own fill
+Outcome of a sent close        ``ctrader_close`` row under the close's     journalled; a live row is ended by
+                               client order id, written with the record    the pass from the record and the
+                               before the send; ``confirmed`` /            close order's status
+                               ``rejected`` events
 External-close reports         report pending / done events                journalled
 Startup shrinks                startup shrink pending / done events        journalled
 Covered-until watermark        memory + ``ctrader_close_coverage`` event   journalled
@@ -86,7 +99,7 @@ from functools import partial
 from itertools import combinations
 from dataclasses import dataclass, field, replace
 from time import monotonic, time as epoch_time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, AsyncIterator, cast
 
 from pynecore.core.broker.disappearance import (
@@ -98,11 +111,13 @@ from pynecore.core.broker.disappearance import (
 from pynecore.core.broker.exceptions import BrokerError
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.models import (
+    FEE_EVENT_TYPE,
     ExchangeOrder,
     LegType,
     OrderEvent,
     OrderStatus,
     OrderType,
+    QuarantineKind,
 )
 from pynecore.core.broker.store_helpers import PENDING_DISPATCH_STATES
 from pynecore.core.broker.sync_engine import FILL_RECOVERY_HOLD_S
@@ -119,11 +134,15 @@ from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .protection import (
     _CLOCK_SKEW_MS,
+    _CLOSE_ROW_STATE,
+    _FILLED_THEN_CLOSED_EVENT,
     _ENTRY_ROW_STATES,
     _OWN_CLOSE_EVENT,
     _VOLUME_TOL,
     CloseOrigin,
     _accepted_by_resume,
+    _close_record_outcome,
+    _ended_close_verdict,
     _foreign_claims_taken,
     _OwnClose,
     _PositionDeal,
@@ -200,15 +219,89 @@ _CLOSE_COVERAGE_EVENT = 'ctrader_close_coverage'
 #: Journal event of the close fills the judgment of a vanished row recovered
 #: for its position, with the position's live rows at that judgment
 #: (:meth:`~_ReconcileMixin._settle_vanished_close`). A keyed event, one per
-#: position, written in the transaction that records the deals judged.
+#: position, written in the transaction that records the deals judged, and
+#: dropped in the one that retires the position's rows
+#: (:meth:`~_ReconcileMixin._closed_position_siblings`).
 _VANISHED_CLOSE_EVENT = 'ctrader_vanished_close_fills'
 
-#: Row extra listing the ``[from, to]`` unit ranges of the row's fill cursor
-#: that a snapshot-only reconcile booked without their commission (the deal
-#: history could not cover them). Commission is otherwise booked with the
+#: Row extra listing the ``[from, to, fill id]`` unit ranges of the row's fill
+#: cursor that a snapshot-only reconcile booked without their commission (the
+#: deal history could not cover them), each with the fill id the booking
+#: carried (:func:`_snapshot_fill_id`). Commission is otherwise booked with the
 #: fill that advances the cursor, so a recovery charges exactly the executions
-#: beyond the cursor plus these ranges, and clears the ranges it charged.
+#: beyond the cursor plus these ranges, and clears the ranges it charged. The
+#: commission of a range is delivered as a fee event of the range's fill id,
+#: so it reaches the trade that booking opened, never the trade of a later
+#: slice of the same deal; it leaves the ranges in the same transaction.
 _FEE_UNBOOKED_EXTRA = 'fee_unbooked'
+
+#: Row extra: the commission the fee events of each snapshot-booked fill
+#: delivered so far (fill id -> total). A fee event carries a fill's total
+#: commission, and a range can be charged in parts (a deal covering only part
+#: of it), so its next fee event carries this total plus the new part.
+_FEE_RANGED_EXTRA = 'fee_ranged'
+
+
+def _snapshot_fill_id(client_order_id: str, end: float) -> str:
+    """The fill id of an entry slice a snapshot-only reconcile booked.
+
+    The slice names no deal; it is identified by its row and the cumulative
+    fill it ends at, which no other slice of the row shares.
+
+    :param client_order_id: The entry row.
+    :param end: The row's cumulative fill after the slice (units).
+    """
+    return f'{client_order_id}:snapshot:{raw_volume(end)}'
+
+
+def _range_terms(client_order_id: str, entry) -> tuple[float, float, str]:
+    """``(from, to, fill id)`` of a ``fee_unbooked`` range.
+
+    A range journaled without its fill id is given the id of a slice ending
+    where it ends (:func:`_snapshot_fill_id`).
+    """
+    start, end = float(entry[0]), float(entry[1])
+    fill_id = entry[2] if len(entry) > 2 and entry[2] else _snapshot_fill_id(
+        client_order_id, end)
+    return start, end, str(fill_id)
+
+
+def _charge_ranged_fees(
+        extras: Mapping, charges: Mapping[str, float], ranges_left: Sequence,
+) -> tuple[dict[str, float], dict[str, float] | None]:
+    """The fee totals of snapshot-booked fills after a charge of their ranges.
+
+    :param extras: The row's extras before the charge.
+    :param charges: Fill id -> the commission of its range charged now.
+    :param ranges_left: The ``fee_unbooked`` ranges left after the charge.
+    :return: ``(fill id -> the total its fee event carries, the
+        ``fee_ranged`` extra to write)``; the extra keeps only the fills a
+        range is still left for, ``None`` when none is.
+    """
+    totals = {str(key): float(value)
+              for key, value in (extras.get(_FEE_RANGED_EXTRA) or {}).items()}
+    charged: dict[str, float] = {}
+    for fill_id, fee in charges.items():
+        if fee:
+            totals[fill_id] = charged[fill_id] = totals.get(fill_id, 0.0) + fee
+    open_ids = {str(entry[2]) for entry in ranges_left if len(entry) > 2}
+    kept = {key: value for key, value in totals.items() if key in open_ids}
+    return charged, kept or None
+
+
+@dataclass(frozen=True)
+class _RecoveredCommission:
+    """The commission a recovered entry fill books
+    (:meth:`_ReconcileMixin._recovered_commission`)."""
+    #: Deal id -> the commission of its part beyond the cursor.
+    fees: dict[int, float]
+    #: The deal ids beyond the cursor not applied yet.
+    new_ids: set[int]
+    #: Fill id of a snapshot booking -> the total commission its fee event carries.
+    ranged: dict[str, float]
+    #: The extras patch of the ranges and totals left; ``None`` when the row
+    #: lists no range.
+    patch: dict | None
 
 #: Disappearance grace window (seconds). A bot-owned row stamped
 #: ``missing_pending_since`` (vanished from BOTH ``order[]`` and ``position[]``)
@@ -236,7 +329,8 @@ class _DealBridgeResult:
     :ivar avg_price: The volume-weighted execution price across the deals, or
         ``None`` when nothing matched.
     :ivar conclusive: ``True`` only when the whole window was read without a
-        transport error (so a no-fill result deterministically means no fill).
+        transport error (so a no-fill result deterministically means no fill)
+        and every fill of the order it holds carries a price.
     :ivar closed_cents: Volume (cents) closed on this order's position over the
         window, summed from every deal's ``closePositionDetail.closedVolume``
         (closedVolume-primary closure evidence). ``0`` when nothing closed.
@@ -369,6 +463,18 @@ class _DealWalk:
             deal_id for deal_id, (position_id, *_rest) in self.closes.items()
             if closed_target is not None and position_id == closed_target)
         closed_cents = sum(self.closes[deal_id][1] for deal_id in closing_ids)
+        # ``executionPrice`` is optional: a fill of the order the history lists
+        # without it cannot be booked (an unpriced fill books nothing), so the
+        # window proves nothing yet and is judged once the deal is priced. The
+        # position's other deals stay volume and identity evidence: a close
+        # among them is booked only once priced
+        # (:meth:`~_ProtectionMixin._judge_recovered_close_deals`).
+        unpriced = sorted(d.dealId for d in fills if d.executionPrice <= 0.0)
+        if unpriced:
+            logger.warning(
+                "cTrader: the deal history lists fills of the order without a price (%s); "
+                "judged once they are priced", unpriced)
+            return _DealBridgeResult(None, 0, None, False)
         return _DealBridgeResult(
             fills[-1] if fills else None, filled_cents, avg_price, True,
             closed_cents, tuple(d.dealId for d in reversed(fills)), closing_ids,
@@ -486,11 +592,12 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 # cTrader keeps the original order in ``order[]`` while assigning a
                 # ``positionId`` after the first partial, so later partials must
                 # still be diffed here.
-                event = await self._reconcile_working_row(
+                events = await self._reconcile_working_row(
                     row, order, open_positions, now_ts)
-                if event is not None:
+                if events:
                     filled_coids.append(row.client_order_id)
-                    yield event
+                    for event in events:
+                        yield event
                 # An edit of the working order made while the stream was
                 # down reaches the bot only through this view.
                 self._observe_working_order(order, read_started_at=read_started_at)
@@ -500,7 +607,13 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 # A fully-filled row whose order has left ``order[]`` is a settled
                 # position: only its disappearance matters, and that is the core
                 # tracker's concern — ``tracked_refs`` maps it to the
-                # ``positions`` namespace for the presence feed below.
+                # ``positions`` namespace for the presence feed below. Only the
+                # commission of a fill a snapshot-only pass booked without it is
+                # still owed.
+                if order_id is not None and extras.get(_FEE_UNBOOKED_EXTRA):
+                    for event in await self._settled_row_range_commission(
+                            row, order_id, str(position_id), now_ts):
+                        yield event
                 continue
             if order_id is None:
                 continue
@@ -536,6 +649,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 open_positions, read_started_at=read_started_at, queue_idle=queue_idle):
             yield event
         await self._judge_ambiguous_close_claims()
+        await self._resolve_close_rows()
 
     def fill_recovery_pending(self, entry_ids: Collection[str]) -> bool:
         """Whether the reconcile pass still owes the engine fills for these entries.
@@ -689,7 +803,9 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 executed = await self._close_order_executed(int(order_id))
                 if executed is None:
                     return None
-                settled += executed
+                proven = payload.get('executed')
+                settled += max(executed, raw_volume(float(proven))
+                               if isinstance(proven, (int, float)) else 0)
                 continue
             volume = payload.get('volume_cents')
             if not isinstance(volume, int):
@@ -730,8 +846,20 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
 
         Filled, rejected, expired and cancelled orders execute no more.
         ``None`` while the venue reports the order accepted (it may execute
-        more) or in any other status, when it reports no such order, or when
-        the lookup failed.
+        more) or in any other status, when it reports no such order, when its
+        answer does not carry the executed volume, or when the lookup failed.
+        """
+        ended = await self._ended_close_order(order_id)
+        return None if ended is None else ended[1]
+
+    async def _ended_close_order(self, order_id: int) -> tuple[int, int | None] | None:
+        """The status and executed volume (centi-units) of an own close order that ended.
+
+        :return: ``(orderStatus, executedVolume)`` of a filled, rejected,
+            expired or cancelled order, the volume ``None`` when the answer
+            does not carry it; ``None`` while the venue reports the order
+            accepted or in any other status, when it reports no such order,
+            or when the lookup failed.
         """
         if self._live_account_id is None:
             return None
@@ -748,7 +876,102 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                                      statuses.ORDER_STATUS_EXPIRED,
                                      statuses.ORDER_STATUS_CANCELLED):
             return None
-        return int(order.executedVolume)
+        return int(order.orderStatus), (
+            int(order.executedVolume) if order.HasField('executedVolume') else None)
+
+    async def _resolve_close_rows(self) -> None:
+        """End the close rows whose outcome the evidence now proves.
+
+        Every live close row (:data:`~pynecore_ctrader.protection._CLOSE_ROW_STATE`)
+        is judged from the close's latest journalled record, whichever process
+        of the run sent it; the same verdict a record of this process gives as
+        it changes (:func:`~pynecore_ctrader.protection._close_record_outcome`).
+        A record that proves nothing yet is completed from the venue:
+
+        * the answer named the close order — that order's status
+          (``ProtoOAOrderDetailsReq``): executed volume proves the close
+          executed; rejected with none, that the venue refused it; cancelled
+          or expired with none, that it ended executing nothing
+          (``'ended_unfilled'``, journaled with the core's ended-unfilled
+          mark); an order still accepted, or a
+          lookup that failed, leaves the row live;
+        * the request was never answered — in flight in this process, the row
+          stays live; sent by a process that is gone, nothing will show what it
+          did (``'send_interrupted'``).
+
+        Each verdict and its writes share a judgment span
+        (:meth:`~_ProtectionMixin._judgment_span`).
+        """
+        store = self.store_ctx
+        if store is None:
+            return
+        rows = [row for row in store.iter_live_orders() if row.state == _CLOSE_ROW_STATE]
+        for row in rows:
+            coid = row.client_order_id
+            payloads = self._close_send_records([coid]) or []
+            outcome: tuple[str, int | None, float] | None
+            if not payloads:
+                outcome = 'no_record', None, 0.0
+            else:
+                # The send the row tracks is the latest one under its id.
+                payload = payloads[-1]
+                raw_order = payload.get('order_id')
+                order_id = int(raw_order) if isinstance(raw_order, int) and raw_order else None
+                executed = payload.get('executed')
+                raw_volume = payload.get('volume_cents')
+                volume_cents = raw_volume if isinstance(raw_volume, int) else None
+                outcome = _close_record_outcome(
+                    refused=bool(payload.get('refused')), order_id=order_id,
+                    executed=float(executed) if isinstance(executed, (int, float)) else 0.0,
+                    answered=payload.get('answered_ms') is not None,
+                    complete=bool(payload.get('complete')),
+                    volume=volume_to_units(volume_cents) if volume_cents is not None else None)
+                if outcome is None and order_id is not None:
+                    outcome = await self._close_order_outcome(
+                        order_id, volume_cents,
+                        proven=float(executed) if isinstance(executed, (int, float)) else 0.0)
+                elif outcome is None and not any(
+                        record.coid == coid and record.answered_ms is None
+                        for record in self._own_closes):
+                    outcome = 'send_interrupted', None, 0.0
+            if outcome is None:
+                continue
+            with self._judgment_span():
+                current = store.get_order(coid)
+                if (current is not None and current.state == _CLOSE_ROW_STATE
+                        and current.closed_ts_ms is None):
+                    self._finish_close_row(current, *outcome)
+
+    async def _close_order_outcome(
+            self, order_id: int, volume_cents: int | None = None, *, proven: float = 0.0,
+    ) -> tuple[str, int | None, float] | None:
+        """The outcome an own close order's venue status proves (:meth:`_resolve_close_rows`).
+
+        A cancelled or expired order that executed part of the close's
+        ``volume_cents`` ended executing that much and no more
+        (``'ended_partially'``); any other executed volume proves the close
+        executed. The executed volume is never taken below ``proven``, and an
+        answer without it proves only that (:func:`_ended_close_verdict`).
+
+        :param order_id: The close's venue order.
+        :param volume_cents: The volume the close was sent for, when recorded.
+        :param proven: Units the close's own fills, matched by its order id,
+            executed.
+        :return: ``(outcome, order_id, executed units)``, or ``None`` while the
+            status proves nothing.
+        """
+        ended = await self._ended_close_order(order_id)
+        if ended is None:
+            return None
+        status, executed_cents = ended
+        statuses = OpenApiModelMessages.ProtoOAOrderStatus
+        if status == statuses.ORDER_STATUS_FILLED:
+            executed = max(
+                volume_to_units(executed_cents) if executed_cents is not None else 0.0, proven)
+            return ('executed', order_id, executed) if executed > _VOLUME_TOL else None
+        return _ended_close_verdict(
+            rejected=status == statuses.ORDER_STATUS_REJECTED, order_id=order_id,
+            executed_cents=executed_cents, proven=proven, volume_cents=volume_cents)
 
     async def _position_history(self, position_id: int, from_ms: int) -> '_DealBridgeResult':
         """Every deal on a position since ``from_ms``, within the pass budget.
@@ -990,10 +1213,12 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                   for deal, cents in parts]
         taken = volume_to_units(replay.taken - retired)
         if rows:
-            events.extend(
-                self._recovered_close_event(rows[0], deal, cents, from_entry=label)
-                for deal, cents, (label, _settle) in booked
-                if deal.deal_id not in self._seen_deal_ids)
+            fills = [self._recovered_close_event(rows[0], deal, cents, from_entry=label)
+                     for deal, cents, (label, _settle) in booked
+                     if deal.deal_id not in self._seen_deal_ids]
+            # Debited below, in this transaction: the record goes with them.
+            self._journal_fill_delivery(fills)
+            events.extend(fills)
         self._seen_deal_ids.update(deal.deal_id for deal, _cents in replay.booked)
         self._cover_closes(position_id, read_started_at)
         debited = 0.0
@@ -1055,6 +1280,21 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         owner = owners[0] if owners is not None and len(owners) == 1 else None
         return owner, owner
 
+    def _recovered_close_coid(self, deal: _PositionDeal) -> str | None:
+        """The client order id of the run's close a recovered closing deal belongs to.
+
+        As on the PUSH path (:meth:`~_ProtectionMixin._own_close_fill_coid`),
+        only the close whose order the venue named the deal's carries its id
+        over: a close of unknown order id whose window holds the deal gives
+        the deal its label (:meth:`_own_close_of_deal`), never its id.
+        ``None`` when no close of the run sent under a client order id is the
+        deal's order.
+        """
+        self._load_close_evidence()
+        record = next((record for record in self._own_close_history
+                       if record.order_id == deal.order_id), None)
+        return record.coid if record is not None else None
+
     def _vanished_close_label(
             self, position_id: int, deal: _PositionDeal, row_entry: str | None,
     ) -> str | None:
@@ -1106,8 +1346,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         :param executed_cents: The order's ``executedVolume``; ``0`` when not read.
         :return: ``True`` while the recovery must wait for a later pass.
         """
-        known = max(int(executed_cents), int((row.extras or {}).get('executed_cents') or 0),
-                    raw_volume(row.filled_qty))
+        known = raw_volume(self._execution_evidence(
+            row, reported=volume_to_units(int(executed_cents))).executed)
         if bridge.filled_cents >= known:
             return False
         self._reread_finished_walk(order_id)
@@ -1966,6 +2206,28 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
     async def _confirm_missing_via_deal_history(
             self, row: 'OrderRow',
     ) -> MissingConfirmation:
+        """Grace-expiry re-verification of a vanished row (:meth:`_missing_verdict`).
+
+        A cancel verdict stands for the order having executed nothing beyond
+        the row's fill cursor: the complete reads behind it (the order's deal
+        history, and its own details where they were asked) are the venue's
+        word on that. It passes the one verdict on the order's execution
+        (:meth:`~_CTraderBase._execution_evidence`) first: an executed volume
+        the venue reported earlier beyond the cursor turns it into FILLED (the
+        fill waits for the deal history), never a zero-fill cancel.
+
+        :param row: The vanished row.
+        """
+        confirmation = await self._missing_verdict(row)
+        if (confirmation.resolution is MissingResolution.CANCELLED
+                and self._execution_evidence(row, reported=row.filled_qty).executed
+                > row.filled_qty + _VOLUME_TOL):
+            return MissingConfirmation(MissingResolution.FILLED)
+        return confirmation
+
+    async def _missing_verdict(
+            self, row: 'OrderRow',
+    ) -> MissingConfirmation:
         """Grace-expiry re-verification against a fresh deal-history read.
 
         The ``missing_pending_since`` stamp records that the row's broker
@@ -2111,21 +2373,33 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         """The verdict on a working order that left the venue without a fill.
 
         The order's own status (``ProtoOAOrderDetailsReq``) tells what ended
-        it. An order that executed (filled, or executed part of its volume)
-        was not cancelled: the deal history does not list its fill yet, and
-        the snapshot bridge promotes it once it does. An order the venue still
+        it. An order that executed (filled, executed part of its volume, or
+        listed with a deal that executed: the answer carries every deal its
+        fills created) was not cancelled: the deal history does not list its
+        fill yet, and the snapshot bridge promotes it once it does. An order the venue still
         reports as accepted is still working. An expired or rejected order
         was ended by the venue, so the cancel carries the venue's reason
         (:meth:`_venue_cancel_reason`) and the tracker applies no policy,
         unless it expired at an expiry the bot never set: someone else's edit,
-        the unexpected cancel the policy handles. A cancelled order, or one
-        the venue reports as not found, was ended by someone the evidence
-        cannot name (:meth:`_unattributed_cancel_reason`). A lookup that
-        failed for now leaves the verdict to a later pass.
+        the unexpected cancel the policy handles. A cancelled order was ended
+        by someone the evidence cannot name (:meth:`_unattributed_cancel_reason`).
+        A lookup that failed for now leaves the verdict to a later pass.
+
+        Two cases are never retired as a zero-fill cancel. A row whose
+        journalled ``executed_cents`` floor exceeds its fill cursor was
+        reported executed by the venue earlier, so it is FILLED: its fill
+        waits for the deal history. An order the venue reports as not found
+        carries no status, executed volume or deal list, so nothing proves it
+        unexecuted: its row stays unresolved and the bot is quarantined
+        (:meth:`_quarantine_undecidable_vanished`) until an operator resume
+        accepts the venue as it stands; only then is it retired as an
+        unattributed cancel.
 
         :param row: The vanished order's journal row.
         :param order_id: The order's id.
         """
+        if self._execution_evidence(row, reported=None).executed > row.filled_qty + _VOLUME_TOL:
+            return MissingConfirmation(MissingResolution.FILLED)
         if self._live_account_id is None:
             return MissingConfirmation(MissingResolution.INCONCLUSIVE)
         try:
@@ -2135,10 +2409,15 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                         ctidTraderAccountId=self._live_account_id, orderId=order_id)))
         except CTraderProtocolError as exc:
             if is_not_found(exc.error_code):
-                return MissingConfirmation(
-                    MissingResolution.CANCELLED,
-                    cancel_reason=self._unattributed_cancel_reason(
-                        row, order_id, status=exc.error_code))
+                if _accepted_by_resume(row):
+                    return MissingConfirmation(
+                        MissingResolution.CANCELLED,
+                        cancel_reason=self._unattributed_cancel_reason(
+                            row, order_id, status=exc.error_code))
+                if order_id not in self._vanished_not_found_warned:
+                    self._vanished_not_found_warned.add(order_id)
+                    self._quarantine_undecidable_vanished(row, order_id, exc.error_code)
+                return MissingConfirmation(MissingResolution.INCONCLUSIVE)
             logger.debug("cTrader vanished-order lookup for %d deferred: %s", order_id, exc)
             return MissingConfirmation(MissingResolution.INCONCLUSIVE)
         except (BrokerError, CTraderWireError, TimeoutError) as exc:
@@ -2147,7 +2426,9 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         order = res.order
         statuses = OpenApiModelMessages.ProtoOAOrderStatus
         status = order.orderStatus
-        if status == statuses.ORDER_STATUS_FILLED or order.executedVolume > 0:
+        if (status == statuses.ORDER_STATUS_FILLED or order.executedVolume > 0
+                or any(deal.filledVolume > 0 and deal.dealStatus in _EXECUTED_DEAL_STATUSES
+                       for deal in res.deal)):
             return MissingConfirmation(MissingResolution.FILLED)
         if status == statuses.ORDER_STATUS_ACCEPTED:
             return MissingConfirmation(MissingResolution.STILL_PRESENT)
@@ -2163,6 +2444,41 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 row, order_id,
                 status=statuses.Name(status) if status in statuses.values() else str(status)))
 
+    def _quarantine_undecidable_vanished(
+            self, row: 'OrderRow', order_id: int, error_code: str,
+    ) -> None:
+        """Quarantine the bot on a vanished order whose execution nothing can decide.
+
+        The venue reports the order as not found, so neither its status, its
+        executed volume nor its deals are known, and a deal history listing no
+        fill may only lag. The row stays unresolved, logged as an ERROR, and
+        the engine's entry-block quarantine (:attr:`quarantine_sink`) is latched: the bot stays alive but opens nothing new, and an
+        operator resume accepts the venue as it stands, after which the row is
+        retired as an unattributed cancel (:meth:`_vanished_order_verdict`).
+
+        :param row: The vanished order's journal row.
+        :param order_id: The order's id.
+        :param error_code: The lookup's not-found error code.
+        """
+        logger.error(
+            "cTrader: bot order %d (%s) left the venue while the order stream missed it, "
+            "and the venue reports it as not found (%s): nothing proves whether it "
+            "executed; the row stays unresolved and the bot is quarantined until an "
+            "operator resume accepts the venue as it stands",
+            order_id, row.client_order_id, error_code)
+        if self.quarantine_sink is None:
+            return
+        # noinspection PyBroadException
+        try:
+            self.quarantine_sink(
+                'vanished_order_not_found',
+                {'order_id': order_id, 'client_order_id': row.client_order_id,
+                 'error_code': error_code, 'pine_entry_id': row.pine_entry_id},
+                kind=QuarantineKind.ENTRY_BLOCK)
+        except Exception:
+            logger.exception(
+                "cTrader: quarantine request for vanished order %d failed", order_id)
+
     def _closed_position_siblings(
             self, row: 'OrderRow', confirmation: MissingConfirmation,
     ) -> list[str]:
@@ -2173,10 +2489,24 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         the PUSH path's ``_mark_position_closed``) — closing only the
         observed row would leave sibling rows live or later mis-stamped
         against a flat broker.
+
+        The tracker asks inside the transaction that retires the row and,
+        with the siblings named here, the position's whole exposure: from
+        then on the position a restart starts from holds the verdict's close
+        fills. Their delivery records
+        (:meth:`~_ProtectionMixin._journal_fill_delivery`) are written here, in
+        that transaction, and the judgment's journal of the fills
+        (:data:`_VANISHED_CLOSE_EVENT`) is dropped: its rows are retired, so no
+        judgment delivers them again, and a fill the engine did not take is
+        delivered again from its record.
         """
+        self._journal_fill_delivery(confirmation.close_events)
         pid_ref = confirmation.position_ref
         if not pid_ref:
             return []
+        if self.store_ctx is not None:
+            self.store_ctx.replace_keyed_events(
+                _VANISHED_CLOSE_EVENT, {}, [f'position:{pid_ref}'])
         return [coid for coid in self._position_live_coids(pid_ref)
                 if coid != row.client_order_id]
 
@@ -2293,36 +2623,40 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
 
     async def _reconcile_working_row(
             self, row, order, open_positions: dict, now_ts: float,
-    ) -> OrderEvent | None:
+    ) -> list[OrderEvent]:
         """Detect partial-fill progress on a still-pending working order.
 
         ``ProtoOAOrder`` carries ``positionId`` once any volume has filled, so a
         partial fill is deterministic from ``order[]`` alone: link the
         ``positionId`` (set-once) and, when the cumulative ``executedVolume`` has
-        grown past the row's recorded ``filled_qty``, emit a partial-fill event.
+        grown past the row's recorded ``filled_qty``, emit the partial fill.
         A working order that is back after a stale-missing stamp clears it.
 
         The snapshot carries no per-execution terms (``executionPrice`` is the
-        order's running average) and no commission, so the event takes both
-        from the order's deal history: the price and the commission of exactly
-        the new executions (:meth:`~_ReconcileMixin._recovered_commission`), which are then
-        marked seen. When the history cannot cover the progress (read failed,
-        or the deals are not listed yet) the fill is still booked on time from
-        the snapshot, without commission, and the row journals the range in
-        ``fee_unbooked`` so a later recovery of this order books its commission.
+        order's running average) and no commission, so the fill is taken from
+        the order's deal history: one event per new execution, with its deal id,
+        price and commission (:meth:`_recovered_entry_fills`), whose deals are
+        then marked seen; their delivery records land with the cursor write.
+        When the history cannot cover the progress (read failed, or the deals
+        are not listed yet) the fill is still booked on time from the snapshot,
+        as one event without commission under a fill id of its own
+        (:func:`_snapshot_fill_id`), and the row journals the range with that
+        id in ``fee_unbooked``, so the commission a later push or recovery of
+        this order finds for it reaches the trade this booking opened. A
+        snapshot that carries no ``executionPrice`` either books nothing: the
+        cursor stays, and the progress is booked once a pass or the push
+        prices it.
         """
         if self.store_ctx is None:
-            return None
+            return []
         extras = row.extras or {}
         if 'missing_pending_since' in extras:
             self._clear_missing_pending(row)
             extras = row.extras or {}
         filled = volume_to_units(order.executedVolume)
         if filled <= row.filled_qty + 1e-9 or filled >= row.qty:
-            return None
+            return []
         fill_qty = filled - row.filled_qty
-        fill_price = order.executionPrice or None
-        fee = 0.0
         # Read the history before the cursor write, so nothing is persisted for
         # an event this pass could still fail to deliver.
         bridge = await self._find_fill_deal(
@@ -2332,47 +2666,65 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                        if bridge.conclusive else None)
         covered: set[int] = set()
         new_ids: set[int] = set()
+        fees: dict[int, float] = {}
+        ranged: dict[str, float] = {}
+        rest_fill_id: str | None = None
         patch: dict = {}
         if delta_price is not None:
-            fill_price = delta_price
             covered = self._deals_covering(bridge.fills, filled)
-            fee, new_ids, ranges_left = self._recovered_commission(row, bridge.fills, fill_qty)
-            if ranges_left is not None:
-                patch[_FEE_UNBOOKED_EXTRA] = ranges_left or None
+            commission = self._recovered_commission(row, bridge.fills, fill_qty)
+            fees, new_ids, ranged = commission.fees, commission.new_ids, commission.ranged
+            patch.update(commission.patch or {})
+        elif not order.executionPrice:
+            # Neither the history nor the snapshot prices the progress: an
+            # event without a price books nothing, so the cursor stays where
+            # the delivered fills put it, and a later pass or the push books
+            # the progress once one of them prices it.
+            logger.debug(
+                "cTrader: fill progress of order %d (%s -> %s units) has no price yet; "
+                "booked once the deal history or the order prices it",
+                order.orderId, row.filled_qty, filled)
+            return []
         else:
             # Booked from the snapshot alone: the cursor now counts executions
-            # whose commission no event carried yet.
+            # whose commission no event carried yet, charged later on the
+            # booking's own fill id.
+            rest_fill_id = _snapshot_fill_id(row.client_order_id, filled)
             patch[_FEE_UNBOOKED_EXTRA] = [
-                *(extras.get(_FEE_UNBOOKED_EXTRA) or ()), [row.filled_qty, filled]]
+                *(extras.get(_FEE_UNBOOKED_EXTRA) or ()),
+                [row.filled_qty, filled, rest_fill_id]]
         position_id: int | None = order.positionId or None
         if position_id and extras.get('position_id') is None:
             patch['position_id'] = position_id
-        DispatchJournal(self.store_ctx).apply_reconcile_outcome(
-            row.client_order_id,
-            ReconcileOutcome(
-                kind='filled',
-                reason='partial_fill_progress',
-                new_state='confirmed',
-                audit_event='reconcile_partial_fill',
-                filled_qty=filled,
-                extras_patch=patch or None,
-                audit_payload={'cumulative': filled, 'previous': row.filled_qty},
-                exchange_order_id=str(order.orderId),
-            ),
-        )
-        if position_id is not None:
-            self._link_position_ref(row.client_order_id, position_id)
+        avg = (open_positions[position_id].price
+               if position_id in open_positions else order.executionPrice)
+        events = self._recovered_entry_fills(
+            row, bridge.fills if delta_price is not None else (), fill_qty, fees,
+            ranged=ranged, event_type='partial', cumulative=filled,
+            exchange_id=str(order.orderId), avg_price=avg or None,
+            fallback_price=order.executionPrice or None, timestamp=now_ts,
+            rest_fill_id=rest_fill_id)
+        with self.store_ctx.transaction():
+            DispatchJournal(self.store_ctx).apply_reconcile_outcome(
+                row.client_order_id,
+                ReconcileOutcome(
+                    kind='filled',
+                    reason='partial_fill_progress',
+                    new_state='confirmed',
+                    audit_event='reconcile_partial_fill',
+                    filled_qty=filled,
+                    extras_patch=patch or None,
+                    audit_payload={'cumulative': filled, 'previous': row.filled_qty},
+                    exchange_order_id=str(order.orderId),
+                ),
+            )
+            if position_id is not None:
+                self._link_position_ref(row.client_order_id, position_id)
+            self._journal_recovered_deliveries(events)
         self._record_reconciled_fill(
             order.orderId, position_id, row.side, fill_qty, bridge.fills, new_ids)
         self._seen_deal_ids.update(covered)
-        avg = (open_positions[position_id].price
-               if position_id in open_positions else order.executionPrice)
-        return self._fill_event(
-            row, event_type='partial', status=OrderStatus.PARTIALLY_FILLED,
-            exchange_id=str(order.orderId), cumulative=filled,
-            fill_qty=fill_qty, avg_price=avg or None,
-            fill_price=fill_price, fee=fee, timestamp=now_ts,
-        )
+        return events
 
     @staticmethod
     def _deals_covering(
@@ -2453,23 +2805,21 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 share_now = self._share_with_recovered_fills(closed_pid, [
                     (entry_row, volume_to_units(entry_bridge.filled_cents))
                     for entry_row, entry_bridge in ((row, bridge), *group)])
+                promoted: list[OrderEvent] = []
                 replay = await self._judge_recovered_close_deals(
                     closed_pid, bridge.position_deals, from_entry=row.pine_entry_id,
                     share_now=share_now, counted=(
                         *bridge.deal_ids,
-                        *(deal_id for _row, other in group for deal_id in other.deal_ids)))
+                        *(deal_id for _row, other in group for deal_id in other.deal_ids)),
+                    settle=partial(self._settle_filled_then_closed, row, bridge, open_positions,
+                                   now_ts, closed_pid, group, share, share_now, promoted))
                 if replay is None:
                     # Who closed the position is not known yet: retire it on a
                     # later pass, once the closing orders could be looked up.
                     return
-                # Closes earlier passes retired without their events, and the
-                # part of an expiry overlap's closes the expiry retired, are
-                # judged but not delivered again: the split a vanished row's
-                # judgment applies.
-                closes = replay.booked if share is None else self._book_expiry_overlap(
-                    closed_pid, replay.booked, bridge.position_deals,
-                    covered_from=self._closes_covered_until.get(closed_pid, 0),
-                    shortfall=share_now)[0]
+                for event in promoted:
+                    yield event
+                return
             for event in self._promote_from_deal(
                     row, bridge, open_positions, now_ts, closes=closes, group=group):
                 yield event
@@ -2486,6 +2836,41 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             patched = dict(extras)
             patched['missing_pending_since'] = now_ts
             self.store_ctx.upsert_order(row.client_order_id, extras=patched)
+
+    def _settle_filled_then_closed(
+            self, row, bridge: '_DealBridgeResult', open_positions: dict, now_ts: float,
+            closed_pid: int, group: Sequence[tuple['OrderRow', '_DealBridgeResult']],
+            share: float | None, share_now: float, promoted: list[OrderEvent],
+            replay: _ShareReplay,
+    ) -> None:
+        """Retire a working order that filled and closed, in the transaction of its closes' judgment.
+
+        The judgment records the closing deals as judged; the retirement, the
+        delivery records of the trade and the deals taken as seen land with it
+        (:meth:`_promote_from_deal`), so a retirement that fails leaves the
+        deals unjudged and the next pass judges and delivers them again.
+        Closes earlier passes retired without their events, and the part of
+        an expiry overlap's closes the expiry retired, are judged but not
+        delivered again: the split a vanished row's judgment applies.
+
+        :param row: The working order's journal row.
+        :param bridge: The order's deal evidence, widened to the position's history.
+        :param open_positions: The snapshot's open positions.
+        :param now_ts: The observation time.
+        :param closed_pid: The closed position.
+        :param group: The other working rows whose orders filled onto the same
+            position, with their deal evidence.
+        :param share: The journal share of the position before the judgment.
+        :param share_now: The share the judgment starts from.
+        :param promoted: Receives the events to deliver.
+        :param replay: The judgment's verdict.
+        """
+        closes = replay.booked if share is None else self._book_expiry_overlap(
+            closed_pid, replay.booked, bridge.position_deals,
+            covered_from=self._closes_covered_until.get(closed_pid, 0),
+            shortfall=share_now)[0]
+        promoted.extend(self._promote_from_deal(
+            row, bridge, open_positions, now_ts, closes=closes, group=group))
 
     def _promote_from_deal(
             self, row, bridge: '_DealBridgeResult', open_positions: dict, now_ts: float,
@@ -2535,22 +2920,28 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             if bridge.closed_cents > 0 and bridge.filled_cents > 0:
                 events = self._filled_then_closed_events(
                     row, bridge, closes, now_ts, group=group)
-                # Record the recovered deals on the shared de-dup channel BEFORE
-                # retiring: cTrader can replay or push an uncorrelated copy of the
-                # same execution after reconnect, and a sibling row sharing this
-                # position is retired off the SAME bridge deals — without this the
-                # PUSH path would re-emit a recovered deal as a fresh fill. The
-                # closing deals usually belong to a DIFFERENT order (native
-                # TP/SL, external close), so they must be seeded explicitly too.
+                # The retirement puts the closes into the position a restart
+                # starts from: their delivery records land with it.
+                with self.store_ctx.transaction():
+                    self._retire_filled_then_closed(
+                        row, deal, position_id, bridge.closed_cents)
+                    for other, other_bridge in group:
+                        self._retire_filled_then_closed(
+                            other, other_bridge.deal, position_id, bridge.closed_cents)
+                    self._journal_recovered_deliveries(events)
+                # Record the recovered deals on the shared de-dup channel once the
+                # retirement committed: cTrader can replay or push an uncorrelated
+                # copy of the same execution after reconnect, and a sibling row
+                # sharing this position is retired off the SAME bridge deals —
+                # without this the PUSH path would re-emit a recovered deal as a
+                # fresh fill. The closing deals usually belong to a DIFFERENT
+                # order (native TP/SL, external close), so they are seeded
+                # explicitly too. A retirement that failed seeds nothing: the next
+                # pass delivers the trade from the same deals.
                 self._seen_deal_ids.update(bridge.deal_ids)
                 self._seen_deal_ids.update(bridge.closing_deal_ids)
                 for other, other_bridge in group:
                     self._seen_deal_ids.update(other_bridge.deal_ids)
-                self._retire_filled_then_closed(
-                    row, deal, position_id, bridge.closed_cents)
-                for other, other_bridge in group:
-                    self._retire_filled_then_closed(
-                        other, other_bridge.deal, position_id, bridge.closed_cents)
                 return events
             return []
         # A working order that vanished after only a PARTIAL fill (residual
@@ -2588,36 +2979,55 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         # ranges a snapshot-only pass booked without it, never a deal the
         # cursor counts (charged by the push path, possibly in an earlier
         # process whose de-dup set is gone).
-        fee, delta_ids, ranges_left = self._recovered_commission(row, bridge.fills, fill_qty)
+        commission = self._recovered_commission(row, bridge.fills, fill_qty)
         emits = bool(new_deal_ids) and fill_qty > 1e-9
         patch: dict = {}
         if link_position:
             patch['position_id'] = position_id
-        if emits and ranges_left is not None:
-            patch[_FEE_UNBOOKED_EXTRA] = ranges_left or None
+        if emits and commission.patch is not None:
+            patch.update(commission.patch)
+        # Each event books the executions it stands for at their own price,
+        # never the whole order's average, which would re-price the part the
+        # cursor already booked. ``avg_price`` (the ExchangeOrder snapshot's
+        # display field) still prefers the open position's broker-reported
+        # average when present.
+        bridge_price = bridge.avg_price or deal.executionPrice or None
+        events = self._recovered_entry_fills(
+            row, bridge.fills, fill_qty, commission.fees, ranged=commission.ranged,
+            event_type='filled', cumulative=cumulative,
+            exchange_id=str(position_id or deal.orderId),
+            avg_price=(open_positions[position_id].price if position_open
+                       else bridge_price) or None,
+            fallback_price=bridge_price,
+            timestamp=(deal.executionTimestamp / 1000.0
+                       if deal.executionTimestamp else now_ts)) if emits else []
         if cumulative > row.filled_qty + 1e-9 or link_position:
-            DispatchJournal(self.store_ctx).apply_reconcile_outcome(
-                row.client_order_id,
-                ReconcileOutcome(
-                    kind='filled',
-                    reason='working_promoted_position',
-                    new_state='confirmed',
-                    audit_event='reconcile_working_promoted',
-                    filled_qty=cumulative,
-                    extras_patch=patch or None,
-                    audit_payload={'deal_id': deal.dealId, 'position_id': position_id},
-                    exchange_order_id=str(position_id or deal.orderId),
-                ),
-            )
-            if link_position:
-                assert position_id is not None
-                self._link_position_ref(row.client_order_id, position_id)
+            # The cursor and the delivery records of the fills it now counts
+            # land together.
+            with self.store_ctx.transaction():
+                DispatchJournal(self.store_ctx).apply_reconcile_outcome(
+                    row.client_order_id,
+                    ReconcileOutcome(
+                        kind='filled',
+                        reason='working_promoted_position',
+                        new_state='confirmed',
+                        audit_event='reconcile_working_promoted',
+                        filled_qty=cumulative,
+                        extras_patch=patch or None,
+                        audit_payload={'deal_id': deal.dealId, 'position_id': position_id},
+                        exchange_order_id=str(position_id or deal.orderId),
+                    ),
+                )
+                if link_position:
+                    assert position_id is not None
+                    self._link_position_ref(row.client_order_id, position_id)
+                self._journal_recovered_deliveries(events)
         if not new_deal_ids:
             # Every recovered deal was already applied by the PUSH path — the
             # cursor / position link are now consistent, so emit nothing.
             return []
         self._record_reconciled_fill(
-            deal.orderId, position_id, row.side, fill_qty, bridge.fills, delta_ids)
+            deal.orderId, position_id, row.side, fill_qty, bridge.fills, commission.new_ids)
         self._seen_deal_ids.update(new_deal_ids)
         if not emits:
             # The recovered deals are new to ``_seen_deal_ids`` (now seeded) but
@@ -2626,36 +3036,11 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             # would yield a zero-qty fill that ``record_fill`` ignores while the
             # engine still runs its post-fill side effects — seed the ids and stop.
             # Their commission is unbooked only for the ranges a snapshot-only
-            # pass booked; ``OrderEvent`` carries a fee only with a fill, so
-            # surface the amount instead (the ranges stay journalled).
-            if fee:
-                logger.warning(
-                    "cTrader order %d: commission %s of the fill ranges %s was not booked "
-                    "(their fill was recovered from the snapshot without history)",
-                    deal.orderId, fee, (row.extras or {}).get(_FEE_UNBOOKED_EXTRA),
-                )
-            return []
-        # ``fill_price`` is what ``BrokerPosition.record_fill`` books the emitted
-        # quantity at, so it is the volume-weighted price of exactly the
-        # executions that quantity stands for — never the whole order's average,
-        # which would re-price the part the cursor already booked.
-        # ``avg_price`` (the ExchangeOrder snapshot's display field) still prefers
-        # the open position's broker-reported average when present.
-        bridge_price = bridge.avg_price or deal.executionPrice or None
-        fill_price = (self._delta_fill_price(bridge.fills, row.filled_qty, fill_qty)
-                      or bridge_price)
-        avg = (open_positions[position_id].price
-               if position_open else bridge_price)
-        status = (OrderStatus.FILLED if cumulative >= row.qty - 1e-9
-                  else OrderStatus.PARTIALLY_FILLED)
-        return [self._fill_event(
-            row, event_type='filled', status=status,
-            exchange_id=str(position_id or deal.orderId), cumulative=cumulative,
-            fill_qty=fill_qty, avg_price=avg or None,
-            fill_price=fill_price, fee=fee,
-            timestamp=(deal.executionTimestamp / 1000.0
-                       if deal.executionTimestamp else now_ts),
-        )]
+            # pass booked: delivered without a fill.
+            return self._range_commission_events(
+                row, bridge.fills, exchange_id=str(position_id or deal.orderId),
+                timestamp=now_ts)
+        return events
 
     def _filled_then_closed_events(
             self, row, bridge: '_DealBridgeResult',
@@ -2683,9 +3068,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         :return: The events, entry fills first.
         """
         deal = bridge.deal
-        entries = [event for event in (
-            self._recovered_entry_event(entry_row, entry_bridge, now_ts)
-            for entry_row, entry_bridge in ((row, bridge), *group)) if event is not None]
+        entries = [event for entry_row, entry_bridge in ((row, bridge), *group)
+                   for event in self._recovered_entry_events(entry_row, entry_bridge, now_ts)]
         entries.sort(key=lambda event: event.timestamp)
         events: list[OrderEvent] = list(entries)
         events.extend(
@@ -2696,37 +3080,32 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             for close, cents in closes if close.deal_id not in self._seen_deal_ids)
         return events
 
-    def _recovered_entry_event(
+    def _recovered_entry_events(
             self, row, bridge: '_DealBridgeResult', now_ts: float,
-    ) -> OrderEvent | None:
-        """The entry fill of a working order the stream never delivered, or ``None``.
+    ) -> list[OrderEvent]:
+        """The entry fill of a working order the stream never delivered, one event per deal.
 
-        The order's recovered cumulative beyond the row's cursor, priced and
-        charged from exactly the executions it stands for
-        (:meth:`~_ReconcileMixin._recovered_commission`); ``None`` when every one of them was
-        applied live already. Read before the deals are seeded into
-        :attr:`_seen_deal_ids`.
+        The order's recovered cumulative beyond the row's cursor, as the
+        executions it stands for (:meth:`_recovered_entry_fills`), each charged
+        its own commission (:meth:`~_ReconcileMixin._recovered_commission`);
+        empty when every one of them was applied live already. Read before the
+        deals are seeded into :attr:`_seen_deal_ids`.
         """
         deal = bridge.deal
         new_ids = {deal_id for deal_id in bridge.deal_ids if deal_id not in self._seen_deal_ids}
         cumulative = min(row.qty, max(row.filled_qty, volume_to_units(bridge.filled_cents)))
         fill_qty = cumulative - row.filled_qty
         if deal is None or not new_ids or fill_qty <= _VOLUME_TOL:
-            return None
-        fee, _delta_ids, _ranges_left = self._recovered_commission(row, bridge.fills, fill_qty)
+            return []
+        commission = self._recovered_commission(row, bridge.fills, fill_qty)
         bridge_price = bridge.avg_price or deal.executionPrice or None
-        return self._fill_event(
-            row, event_type='filled',
-            status=(OrderStatus.FILLED if cumulative >= row.qty - 1e-9
-                    else OrderStatus.PARTIALLY_FILLED),
-            exchange_id=str(deal.positionId or deal.orderId), cumulative=cumulative,
-            fill_qty=fill_qty, avg_price=bridge_price,
-            fill_price=(self._delta_fill_price(bridge.fills, row.filled_qty, fill_qty)
-                        or bridge_price),
-            fee=fee,
+        return self._recovered_entry_fills(
+            row, bridge.fills, fill_qty, commission.fees, ranged=commission.ranged,
+            event_type='filled', cumulative=cumulative,
+            exchange_id=str(deal.positionId or deal.orderId), avg_price=bridge_price,
+            fallback_price=bridge_price,
             timestamp=(deal.executionTimestamp / 1000.0
-                       if deal.executionTimestamp else now_ts),
-        )
+                       if deal.executionTimestamp else now_ts))
 
     async def _unbooked_position_entries(
             self, row, position_id: int, deals: Sequence[_PositionDeal], *,
@@ -2851,41 +3230,240 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             taken += part
         return parts
 
+    async def _settled_row_range_commission(
+            self, row, order_id: int, exchange_id: str, now_ts: float,
+    ) -> list[OrderEvent]:
+        """The commission a settled position row still owes for its snapshot-booked ranges.
+
+        A snapshot-only pass booked part of the row's fill without commission
+        (row extra ``fee_unbooked``). The push of a deal in that range carries
+        its commission
+        (:meth:`~pynecore_ctrader.events._EventStreamMixin._unbooked_commission_events`),
+        and so does the recovery of the order's later progress; when that push
+        never came and the order then filled to the end on a push of its own,
+        the row is a settled position no recovery reads again. Its order's
+        deal history is read on each pass until it covers the ranges, and the
+        commission of the deals in them is delivered as fee events
+        (:meth:`_range_commission_events`). A history still short of the
+        row's fill drops the finished walk, so the next pass reads the whole
+        window again (:meth:`_fill_history_short`).
+
+        :param row: The settled row.
+        :param order_id: Its entry order.
+        :param exchange_id: The id the events' order carries.
+        :param now_ts: The observation time.
+        :return: The fee events; empty while the history does not cover the ranges.
+        """
+        bridge = await self._find_fill_deal(
+            order_id, self._deal_since_ms(row.extras or {}),
+            deadline=self._reconcile_pass_deadline)
+        if not bridge.conclusive or self._fill_history_short(bridge, row, order_id):
+            return []
+        return self._range_commission_events(
+            row, bridge.fills, exchange_id=exchange_id, timestamp=now_ts)
+
+    def _range_commission_events(
+            self, row, fills: tuple[tuple[int, int, int, float, float], ...], *,
+            exchange_id: str, timestamp: float,
+    ) -> list[OrderEvent]:
+        """The commission of the row's ranges a snapshot-only pass booked, as fee events.
+
+        A recovery whose deals the row's cursor already counts delivers no
+        fill, so the commission of the ``fee_unbooked`` ranges the deals cover
+        goes as one fee event per snapshot booking (``event_type`` ``'fee'``,
+        the booking's fill id, the commission charged on it so far;
+        :meth:`_charge_unbooked_ranges`), recorded until the engine accounted
+        it (:meth:`~_ProtectionMixin._journal_fee_delivery`). The records and
+        the ranges left are written in one transaction, so a range is charged
+        either from its records or by a later recovery, never both.
+
+        :param row: The recovered row.
+        :param fills: The order's per-deal terms, oldest first.
+        :param exchange_id: The id the events' order carries.
+        :param timestamp: The observation time.
+        :return: The fee events, oldest booking first.
+        """
+        store = self.store_ctx
+        fresh = store.get_order(row.client_order_id) if store is not None else None
+        if store is None or fresh is None:
+            return []
+        ranged, patch = self._charge_unbooked_ranges(fresh, fills)
+        if patch is None or not ranged:
+            return []
+        events = [self._fee_event(fresh, fill_id, fee, exchange_id=exchange_id,
+                                  timestamp=timestamp)
+                  for fill_id, fee in ranged.items()]
+        with store.transaction():
+            extras = dict(fresh.extras or {})
+            extras.update(patch)
+            store.upsert_order(fresh.client_order_id, extras=extras)
+            for event in events:
+                self._journal_fee_delivery(event)
+        return events
+
+    @staticmethod
+    def _fee_event(row, fill_id: str, fee: float, *, exchange_id: str,
+                   timestamp: float) -> OrderEvent:
+        """A commission of an entry row's fill delivered without the fill (``event_type`` ``'fee'``).
+
+        :param row: The entry row the fill belongs to.
+        :param fill_id: The fill, the event's fill id.
+        :param fee: The fill's total commission (the engine books what its
+            receipt does not account yet).
+        :param exchange_id: The id the event's order carries.
+        :param timestamp: The event time.
+        """
+        return OrderEvent(
+            order=ExchangeOrder(
+                id=exchange_id, symbol=row.symbol, side=row.side, order_type=OrderType.MARKET,
+                qty=row.qty, filled_qty=row.filled_qty,
+                remaining_qty=max(0.0, row.qty - row.filled_qty), price=None, stop_price=None,
+                average_fill_price=None, status=OrderStatus.FILLED, timestamp=timestamp,
+                fee=0.0, fee_currency='', reduce_only=False,
+                client_order_id=row.client_order_id,
+            ),
+            event_type=FEE_EVENT_TYPE, fill_price=None, fill_qty=None, timestamp=timestamp,
+            pine_id=row.pine_entry_id, from_entry=row.from_entry, leg_type=LegType.ENTRY,
+            fee=fee, fill_id=fill_id,
+        )
+
     def _recovered_commission(
             self, row, fills: tuple[tuple[int, int, int, float, float], ...], fill_qty: float,
-    ) -> tuple[float, set[int], list[list[float]] | None]:
+    ) -> '_RecoveredCommission':
         """The commission a recovered fill of a row books, and what it covers.
 
         Commission is booked with the fill that advances the row's cursor, so a
         deal the cursor counts was charged already, in this process or an
         earlier one of the run: the recovered ``fill_qty`` beyond the cursor is
         charged from exactly its executions (less those the push path applied
-        in this process), plus every range of the cursor a snapshot-only
-        reconcile booked without commission (row extra ``fee_unbooked``) that
-        the deals cover in full.
+        in this process), each on its own deal. Every range of the cursor a
+        snapshot-only reconcile booked without commission (row extra
+        ``fee_unbooked``) that the deals cover in full is charged on the fill
+        id of that booking (:meth:`_charge_unbooked_ranges`): the part of a
+        deal straddling the cursor that the booking counts goes to the trade
+        the booking opened.
 
         :param row: The row whose fill is recovered.
         :param fills: The order's per-deal terms, oldest first.
         :param fill_qty: Units of the recovered fill beyond the cursor.
-        :return: ``(commission, the deal ids beyond the cursor not applied yet,
-            the unbooked ranges left)``; the ranges are ``None`` when the row
-            lists none.
         """
         beyond = self._executions_after(fills, row.filled_qty, fill_qty)
         new_ids = {deal_id for deal_id, _part, _price, _fee in beyond
                    if deal_id not in self._seen_deal_ids}
-        fee = sum(part_fee for deal_id, _part, _price, part_fee in beyond if deal_id in new_ids)
-        ranges = (row.extras or {}).get(_FEE_UNBOOKED_EXTRA)
+        fees: dict[int, float] = {}
+        for deal_id, _part, _price, part_fee in beyond:
+            if deal_id in new_ids:
+                fees[deal_id] = fees.get(deal_id, 0.0) + part_fee
+        ranged, patch = self._charge_unbooked_ranges(row, fills)
+        return _RecoveredCommission(fees=fees, new_ids=new_ids, ranged=ranged, patch=patch)
+
+    def _charge_unbooked_ranges(
+            self, row, fills: tuple[tuple[int, int, int, float, float], ...],
+    ) -> tuple[dict[str, float], dict | None]:
+        """Charge the row's snapshot-booked ranges the deals cover in full.
+
+        :param row: The row, as the journal holds it.
+        :param fills: The order's per-deal terms, oldest first.
+        :return: ``(fill id of a snapshot booking -> the total commission its
+            fee event carries, the extras patch of the ranges and totals
+            left)``; the patch is ``None`` when the row lists no range.
+        """
+        extras = row.extras or {}
+        ranges = extras.get(_FEE_UNBOOKED_EXTRA)
         if not ranges:
-            return fee, new_ids, None
-        left: list[list[float]] = []
-        for start, end in ranges:
-            parts = self._executions_after(fills, float(start), float(end) - float(start))
-            if sum(part for _deal_id, part, _price, _fee in parts) < float(end) - float(start) - 1e-9:
-                left.append([float(start), float(end)])
+            return {}, None
+        left: list[list] = []
+        charges: dict[str, float] = {}
+        for entry in ranges:
+            start, end, fill_id = _range_terms(row.client_order_id, entry)
+            parts = self._executions_after(fills, start, end - start)
+            if sum(part for _deal_id, part, _price, _fee in parts) < end - start - 1e-9:
+                left.append([start, end, fill_id])
                 continue
-            fee += sum(part_fee for _deal_id, _part, _price, part_fee in parts)
-        return fee, new_ids, left
+            charges[fill_id] = charges.get(fill_id, 0.0) + sum(
+                part_fee for _deal_id, _part, _price, part_fee in parts)
+        charged, totals = _charge_ranged_fees(extras, charges, left)
+        return charged, {_FEE_UNBOOKED_EXTRA: left or None, _FEE_RANGED_EXTRA: totals}
+
+    def _recovered_entry_fills(
+            self, row, fills: tuple[tuple[int, int, int, float, float], ...], fill_qty: float,
+            fees: Mapping[int, float], *, ranged: Mapping[str, float], event_type: str,
+            cumulative: float, exchange_id: str, avg_price: float | None,
+            fallback_price: float | None, timestamp: float, rest_fill_id: str | None = None,
+    ) -> list[OrderEvent]:
+        """The events of a row's entry fill recovered beyond its cursor: one per deal.
+
+        Each execution the recovered ``fill_qty`` stands for
+        (:meth:`_executions_after`; a deal straddling the cursor contributes
+        only its part) is delivered as the push path delivers it: its deal id
+        as the fill id, at its own price and time, with the commission it
+        books now (``fees``). The engine's fill receipt, the duplicate gate
+        and the delivery records (:meth:`_journal_recovered_deliveries`) then
+        treat a recovered fill and its push copy as the same execution, in this
+        process and after a restart. The commission of the ``fee_unbooked``
+        ranges the deals cover (``ranged``) goes first, as a fee event of each
+        snapshot booking (:meth:`_fee_event`), so it reaches the trade that
+        booking opened. Volume the deals do not cover (the order's cumulative
+        ran ahead of the history) goes last, at ``fallback_price``, under
+        ``rest_fill_id``.
+
+        :param row: The row whose fill is recovered, as it is before the
+            recovery's journal write.
+        :param fills: The order's per-deal terms, oldest first; empty when the
+            history does not cover the fill.
+        :param fill_qty: Units of the recovered fill beyond the cursor.
+        :param fees: Deal id -> the commission its part beyond the cursor
+            books now (:attr:`_RecoveredCommission.fees`).
+        :param ranged: Fill id of a snapshot booking -> the total commission
+            its fee event carries (:attr:`_RecoveredCommission.ranged`).
+        :param event_type: The last fill event's type; the ones before it are
+            ``'partial'``.
+        :param cumulative: The order's cumulative fill after the recovery.
+        :param exchange_id: The id the events' order carries.
+        :param avg_price: The order's average price the events carry.
+        :param fallback_price: The price of volume no deal covers.
+        :param timestamp: The time of an event whose deal carries none.
+        :param rest_fill_id: The fill id of the volume no deal covers: the
+            snapshot booking's (:func:`_snapshot_fill_id`) when it is booked
+            from the order snapshot alone, ``None`` otherwise.
+        :return: The events, fee events first, then the fills in execution order.
+        """
+        executed = {deal_id: executed_ms for executed_ms, deal_id, _c, _p, _f in fills}
+        parts = self._executions_after(fills, row.filled_qty, fill_qty)
+        events: list[OrderEvent] = [
+            self._fee_event(row, fill_id, fee, exchange_id=exchange_id, timestamp=timestamp)
+            for fill_id, fee in ranged.items()]
+        slices: list[tuple[str | None, float, float | None, float, float]] = [
+            (str(deal_id), part, price or fallback_price, fees.get(deal_id, 0.0),
+             executed[deal_id] / 1000.0 if executed.get(deal_id) else timestamp)
+            for deal_id, part, price, _fee in parts]
+        rest = fill_qty - sum(part for _deal_id, part, _price, _fee in parts)
+        if rest > _VOLUME_TOL:
+            slices.append((rest_fill_id, rest, fallback_price, 0.0, timestamp))
+        booked = row.filled_qty
+        for index, (fill_id, qty, price, fee, at) in enumerate(slices):
+            last = index == len(slices) - 1
+            booked = cumulative if last else min(cumulative, booked + qty)
+            events.append(self._fill_event(
+                row, event_type=event_type if last else 'partial',
+                status=(OrderStatus.FILLED if last and cumulative >= row.qty - 1e-9
+                        else OrderStatus.PARTIALLY_FILLED),
+                exchange_id=exchange_id, cumulative=booked, fill_qty=qty,
+                avg_price=avg_price, fill_price=price, fee=fee, timestamp=at,
+                fill_id=fill_id))
+        return events
+
+    def _journal_recovered_deliveries(self, events: Iterable[OrderEvent]) -> None:
+        """Record recovered fills and commissions in the transaction of their journal write.
+
+        The fill events through :meth:`~_ProtectionMixin._journal_fill_delivery`,
+        the fee events through :meth:`~_ProtectionMixin._journal_fee_delivery`.
+        """
+        events = list(events)
+        self._journal_fill_delivery(events)
+        for event in events:
+            if event.event_type == FEE_EVENT_TYPE:
+                self._journal_fee_delivery(event)
 
     def _retire_filled_then_closed(
             self, row, deal, position_id: int, closed_cents: int,
@@ -2928,7 +3506,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 kind='terminal_close',
                 reason='bracket_natural_close_followup',
                 new_state='closed',
-                audit_event='reconcile_filled_then_closed_retired',
+                audit_event=_FILLED_THEN_CLOSED_EVENT,
                 close_row=True,
                 audit_payload={'deal_id': deal.dealId if deal is not None else None,
                                'position_id': position_id,
@@ -2976,7 +3554,10 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         ``True`` only when the whole window was consumed without a transport
         error — a failed or truncated read returns an empty, non-conclusive
         result so the caller never concludes a cancel (or a closure) from
-        missing evidence. A truncated page narrows its sub-window to the oldest
+        missing evidence. A window that lists a fill of the order without
+        ``executionPrice`` is not conclusive either (an unpriced fill books
+        nothing). Its walk is dropped, so the next call reads it whole again,
+        as is the walk of a window holding an unpriced close not judged yet. A truncated page narrows its sub-window to the oldest
         deal timestamp, inclusive, so the deals sharing that timestamp that the
         page cut off are read by the next page (a re-read deal replaces its
         copy by ``dealId``). A page that announces more but cannot narrow the
@@ -3070,7 +3651,16 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     order_id, exc,
                 )
             return _DealBridgeResult(None, 0, None, False)
-        return walk.result(close_position_id)
+        result = walk.result(close_position_id)
+        if not result.conclusive or any(
+                deal.price <= 0.0 and deal.closed > 0
+                and deal.deal_id not in self._judged_close_deals
+                for deal in result.position_deals):
+            # A window holding a fill of the order or a close still to judge
+            # without a price is read whole again, so the price the venue adds
+            # later reaches the evidence.
+            self._deal_walks.pop(order_id, None)
+        return result
 
     def _clear_missing_pending(self, row) -> None:
         """Drop a stale ``missing_pending_since`` breadcrumb (the row came back)."""
@@ -3116,21 +3706,26 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 {'positions': None}, epoch_time()):
             yield event
 
-    @staticmethod
-    def _cancelled_event(row, now_ts: float) -> OrderEvent:
+    def _cancelled_event(self, row, now_ts: float) -> OrderEvent:
         """Build the synthetic cancelled event for a vanished bot-owned row.
 
         Carries the row's Pine identity (``pine_entry_id`` / ``LegType.ENTRY``)
         so the sync engine books the disappearance against the originating
-        entry, exactly as the PUSH path's ``ORDER_CANCELLED`` events do.
+        entry, exactly as the PUSH path's ``ORDER_CANCELLED`` events do. Its
+        executed quantity is known (``filled_qty_known``): the tracker builds
+        it only on a cancel verdict, which a complete deal-history read of the
+        order listing no fill beyond the row's cursor backs
+        (:meth:`_confirm_missing_via_deal_history`); the quantity is the one
+        verdict on the order's execution (:meth:`~_CTraderBase._execution_evidence`).
         """
         order_id = (row.extras or {}).get('order_id')
+        executed = self._execution_evidence(row, reported=row.filled_qty).executed
         return OrderEvent(
             order=ExchangeOrder(
                 id=str(order_id) if order_id else '', symbol=row.symbol,
                 side=row.side, order_type=OrderType.MARKET,
-                qty=row.qty, filled_qty=row.filled_qty,
-                remaining_qty=max(0.0, row.qty - row.filled_qty),
+                qty=row.qty, filled_qty=executed,
+                remaining_qty=max(0.0, row.qty - executed),
                 price=None, stop_price=None, average_fill_price=None,
                 status=OrderStatus.CANCELLED, timestamp=now_ts, fee=0.0,
                 fee_currency='', reduce_only=False,
@@ -3142,9 +3737,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             leg_type=LegType.ENTRY, fee=0.0,
         )
 
-    @staticmethod
     def _recovered_close_event(
-            row: 'OrderRow', deal: _PositionDeal, cents: int, *,
+            self, row: 'OrderRow', deal: _PositionDeal, cents: int, *,
             from_entry: str | None,
     ) -> OrderEvent:
         """Build the close fill of a closing deal the PUSH stream missed.
@@ -3152,7 +3746,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         Shaped like the PUSH path's event for the same execution: a close leg
         labelled ``from_entry`` carrying the deal id as its fill id, for the
         part of the bot's share the deal took, at the deal's price, with the
-        deal's commission prorated to that part.
+        deal's commission prorated to that part, and the client order id of
+        the run's close the deal belongs to (:meth:`_recovered_close_coid`).
 
         :param row: An entry row of the position the deal closed.
         :param deal: The closing deal from the position's deal history.
@@ -3171,6 +3766,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 price=None, stop_price=None, average_fill_price=price,
                 status=OrderStatus.FILLED, timestamp=timestamp, fee=0.0, fee_currency='',
                 reduce_only=True,
+                client_order_id=self._recovered_close_coid(deal),
             ),
             event_type='filled', fill_price=price, fill_qty=qty, timestamp=timestamp,
             from_entry=from_entry, leg_type=LegType.CLOSE, fee=fee,
@@ -3182,12 +3778,16 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             row, *, event_type: str, status: OrderStatus, exchange_id: str,
             cumulative: float, fill_qty: float, avg_price: float | None,
             fill_price: float | None, fee: float, timestamp: float,
+            fill_id: str | None = None,
     ) -> OrderEvent:
         """Build the reconcile-recovered fill event for an entry row.
 
         Carries the row's Pine identity (``pine_entry_id`` / ``LegType.ENTRY``)
         so the sync engine books it against the originating entry, exactly as
         the PUSH path's entry-fill events do.
+
+        :param fill_id: The deal the fill is, when one deal is all of it
+            (:meth:`_recovered_entry_fills`).
         """
         return OrderEvent(
             order=ExchangeOrder(
@@ -3202,7 +3802,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             event_type=event_type,
             fill_price=fill_price, fill_qty=fill_qty, timestamp=timestamp,
             pine_id=row.pine_entry_id, from_entry=row.from_entry,
-            leg_type=LegType.ENTRY, fee=fee,
+            leg_type=LegType.ENTRY, fee=fee, fill_id=fill_id,
             # ``fill_qty`` is the rise of the row's ``filled_qty`` cursor.
             journal_fill_qty=fill_qty,
         )

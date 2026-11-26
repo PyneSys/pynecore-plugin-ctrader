@@ -16,12 +16,15 @@ never silently dropped (the queue is unbounded; a backlog watermark only warns).
 import asyncio
 import logging
 from abc import ABC
-from contextlib import aclosing
+from collections import deque
+from contextlib import aclosing, nullcontext
+from dataclasses import replace
 from time import time as epoch_time
 from typing import AsyncIterator, cast
 
 from pynecore.core.broker.exceptions import BrokerManualInterventionError
 from pynecore.core.broker.models import (
+    FEE_EVENT_TYPE,
     ExchangeOrder,
     LegType,
     OrderEvent,
@@ -33,7 +36,14 @@ from pynecore.core.broker.store_helpers import (
     iter_active_bracket_ownerships,
 )
 
-from .helpers import REQUEST_TIMEOUT, money_value, parse_protocol_id, volume_to_units
+from .helpers import (
+    REQUEST_TIMEOUT,
+    ExecutionEvidence,
+    money_value,
+    parse_protocol_id,
+    reported_executed,
+    volume_to_units,
+)
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .protection import (
@@ -44,6 +54,13 @@ from .protection import (
     _HeldCloseVerdict,
     _ProtectionMixin,
     _ShareBounds,
+    _ended_close_verdict,
+)
+from .reconcile import (
+    _FEE_RANGED_EXTRA,
+    _FEE_UNBOOKED_EXTRA,
+    _charge_ranged_fees,
+    _range_terms,
 )
 from .state import _ORDER_STATUS_MAP, _ORDER_TYPE_MAP
 from .wire import CTraderConnectionError
@@ -117,11 +134,20 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
 
         Every event passes :meth:`~_ProtectionMixin._note_entry_fill_order` on
         its way out, so the journal knows the order in which the engine booked
-        the entry fills.
+        the entry fills; a fill journaled before the restart is not booked
+        again, so it takes no place.
+
+        A fill journaled before its event reaches the engine keeps a delivery
+        record until the engine's receipt shows it taken, and so does a
+        commission delivered without its fill
+        (:meth:`~_ProtectionMixin._journal_fill_delivery`). The fills and
+        commissions an earlier process recorded and the engine never took are
+        delivered first (:meth:`~_ProtectionMixin._take_inherited_deliveries`).
         """
         async with aclosing(self._order_event_stream()) as stream:
             async for event in stream:
-                self._note_entry_fill_order(event)
+                if not event.journaled_before_restart:
+                    self._note_entry_fill_order(event)
                 yield event
 
     async def _order_event_stream(self) -> AsyncIterator[OrderEvent]:
@@ -129,6 +155,8 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         execq = self._exec_events
         if execq is None:
             raise CTraderConnectionError("live event router not started")
+        for event in self._take_inherited_deliveries():
+            yield event
         await self._observe_resume_baseline()
         released = self._released_close_events
         while released:
@@ -137,34 +165,47 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         warned = False
         loop = asyncio.get_running_loop()
         next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
+        # Messages taken off the queue and not translated yet, oldest first.
+        backlog: deque = deque()
         while True:
+            # Close fills released while a message waited were taken before
+            # it: delivered first. A release that failed to journal holds
+            # every later message and reconcile pass back
+            # (:meth:`~_ProtectionMixin._retry_failed_releases`): they would
+            # judge closes against its provisional debits and could deliver
+            # later fills ahead of the fills it holds. It is retried whenever
+            # a message arrives, and on the reconcile cadence.
+            self._retry_failed_releases()
             while released:
                 yield released.popleft()
-            now = loop.time()
-            if now >= next_reconcile_at:
-                async for event in self._run_reconcile_pass():
-                    yield event
-                next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
-                while released:
-                    yield released.popleft()
-                self._flush_external_interventions()
+            blocked = bool(self._failed_releases)
+            if backlog and not blocked:
+                message = backlog.popleft()
+            else:
+                now = loop.time()
+                if not blocked and now >= next_reconcile_at:
+                    async for event in self._run_reconcile_pass():
+                        yield event
+                    next_reconcile_at = loop.time() + _RECONCILE_CADENCE_S
+                    while released:
+                        yield released.popleft()
+                    self._flush_external_interventions()
+                    continue
+                try:
+                    message = await asyncio.wait_for(
+                        execq.get(),
+                        timeout=_RECONCILE_CADENCE_S if blocked else next_reconcile_at - now,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                if not warned and execq.qsize() > _BACKLOG_WATERMARK:
+                    logger.warning(
+                        "cTrader order-event backlog above %d; consumer is lagging",
+                        _BACKLOG_WATERMARK,
+                    )
+                    warned = True
+                backlog.append(message)
                 continue
-            try:
-                message = await asyncio.wait_for(
-                    execq.get(), timeout=next_reconcile_at - now,
-                )
-            except asyncio.TimeoutError:
-                continue
-            if not warned and execq.qsize() > _BACKLOG_WATERMARK:
-                logger.warning(
-                    "cTrader order-event backlog above %d; consumer is lagging",
-                    _BACKLOG_WATERMARK,
-                )
-                warned = True
-            # Close fills released while this message waited were taken
-            # before it: delivered first.
-            while released:
-                yield released.popleft()
             try:
                 event = self._translate_exec_event(message)
             except BrokerManualInterventionError:
@@ -189,13 +230,21 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                     )
                 continue
             if event is not None:
+                # What the translation released or journaled beyond its event
+                # (held close fills taken before the message, the fee events
+                # of earlier bookings the fill charges) goes first.
+                while released:
+                    yield released.popleft()
                 yield event
             self._flush_external_interventions()
 
     async def _run_reconcile_pass(self) -> AsyncIterator[OrderEvent]:
         """Run one reconcile-snapshot pass, isolating transient failures.
 
-        Steps in order: :meth:`_resolve_parked_dispatches` (release the
+        Steps in order: :meth:`~_ProtectionMixin._settle_deliveries` (drop the
+        delivery records the engine's receipts settled, and deliver again a
+        commission the engine refused while it held its fill),
+        :meth:`_resolve_parked_dispatches` (release the
         dispatches the venue never accepted), :meth:`_reconcile_snapshot` (gap-fill missed fills,
         stamp / clear ``missing_pending_since``), then
         :meth:`_emit_unexpected_cancellations` (retire rows missing past the
@@ -227,6 +276,8 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         self._reconcile_pass_deadline = (
                 asyncio.get_running_loop().time() + _RECONCILE_PASS_BUDGET_S)
         try:
+            for event in self._settle_deliveries():
+                yield event
             await self._resolve_parked_dispatches()
             async for event in self._reconcile_snapshot():
                 yield event
@@ -280,11 +331,21 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
 
         order = message.order
         if event_type in ('cancelled', 'rejected') and order.closingOrder:
-            # Nothing more of the bot's close can execute.
+            # Nothing more of the bot's close can execute: the order's own final
+            # executed volume ends the close's row. A message without it that
+            # the close's own fills cannot settle leaves the record open: the
+            # order's status answers it on a later pass.
             for record in self._own_close_history:
                 if record.order_id == order.orderId and not record.complete:
+                    ended = _ended_close_verdict(
+                        rejected=event_type == 'rejected', order_id=order.orderId,
+                        executed_cents=(int(order.executedVolume)
+                                        if order.HasField('executedVolume') else None),
+                        proven=record.executed, volume_cents=record.volume_cents)
+                    if ended is None:
+                        continue
                     record.complete = True
-                    self._journal_own_close(record)
+                    self._journal_own_close(record, ended=ended)
         # A cancel the venue's own mechanics caused (an expiry, a
         # server-initiated cancel) names its reason, so the engine never runs
         # the unexpected-cancel policy for it.
@@ -295,6 +356,45 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                          == OpenApiModelMessages.ProtoOAExecutionType.ORDER_EXPIRED),
                 server_event=message.isServerEvent)
             if event_type == 'cancelled' else None)
+        deal = message.deal if message.HasField('deal') else None
+        judged = (deal is not None and event_type in ('filled', 'partial')
+                  and volume_to_units(deal.filledVolume) > 0.0)
+        # The journal writes a fill makes (the close judged and its debit or
+        # retirement, the entry's raised cursor, the entry row its client order
+        # id recovers) and its delivery record land in one transaction: the
+        # position a restart starts from holds the fill exactly when the record
+        # says the engine may not have it yet. What the process marks done for
+        # the fill (the deal taken as seen, the share effects it settles) is
+        # set inside it too, so a failure rolls all of it back and a reconcile
+        # pass judges the deal from the deal history as one the run never
+        # booked.
+        self._fill_fee_events = []
+        with self._judgment_span() if judged else nullcontext():
+            event = self._translate_order_event(message, event_type, cancel_reason)
+        # Fee events of the fill, journaled with it: delivered ahead of it, so
+        # each reaches the trade of the earlier booking it charges before the
+        # fill opens a trade of its own (after a restart the engine spreads a
+        # fee whose fill it no longer holds over the entry's open trades).
+        self._released_close_events.extend(self._fill_fee_events)
+        self._fill_fee_events = []
+        return event
+
+    def _translate_order_event(
+            self, message, event_type: str, cancel_reason: str | None,
+    ) -> OrderEvent | None:
+        """Translate an execution event of an order lifecycle step into an OrderEvent.
+
+        Runs inside the caller's judgment span when the event is a fill
+        (:meth:`~pynecore_ctrader.protection._ProtectionMixin._judgment_span`).
+
+        :param message: The ``ProtoOAExecutionEvent``.
+        :param event_type: The engine event type its execution type maps to.
+        :param cancel_reason: The reason of a cancel the venue's own mechanics
+            caused, ``None`` otherwise.
+        :return: The mapped :class:`OrderEvent`, or ``None`` when nothing is
+            delivered for it.
+        """
+        order = message.order
         # Snapshot the entry fill cursor BEFORE recovery / fill processing
         # mutates it (e.g. _recover_parked_entry_by_coid sets filled_qty as a
         # side effect), so the ENTRY-fill suppress below can tell a reconcile
@@ -328,10 +428,13 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # the same fill (both carry it; ``_seen_deal_ids`` above drops the
             # second locally), so the engine's duplicate-fill gate keys on it as
             # a final backstop if the local dedup ever misses (e.g. ``deal``
-            # delivered without passing this branch). The cumulative-only
-            # reconcile/bridge paths cannot reproduce a single dealId per emitted
-            # slice and intentionally leave ``fill_id`` unset, relying on the
-            # persisted ``filled_qty`` cursor instead.
+            # delivered without passing this branch). A reconcile pass that
+            # recovers a fill from the deal history delivers it per deal under
+            # the same id (``_ReconcileMixin._recovered_entry_fills``); only
+            # volume it books from an order snapshot alone, which names no
+            # deal, goes under a fill id of its own (``_snapshot_fill_id``),
+            # the persisted ``filled_qty`` cursor guarding the deals it
+            # counts against their push.
             fill_id = str(deal.dealId)
             # Remember the dealId only for a fill we will actually apply, so a
             # malformed delivery (no volume / price, which record_fill ignores)
@@ -388,8 +491,32 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                         'ctrader_own_fill_untracked',
                         exchange_order_id=str(order.orderId) or None, payload=payload)
                 return None
-        is_fill = event_type in ('filled', 'partial') and (fill_qty or 0.0) > 0.0
+        if event_type in ('cancelled', 'rejected'):
+            # The cancel, expiry or rejection of an order part of which executed
+            # carries that part: the core keeps the protection of a partly
+            # executed entry. The quantity is the one verdict on the order's
+            # execution (:meth:`~_CTraderBase._execution_evidence`): a message
+            # older than a fill the journal counts or than an executed volume
+            # the venue reported earlier never reports less, and one without
+            # the order's executed volume proves nothing about execution
+            # (``filled_qty_known`` ``False``; the row stays live, so the
+            # reconcile pass ends it with the venue's evidence once the order
+            # left the snapshot). The fill cursor stays as it is, so the fill
+            # still books.
+            evidence = self._terminal_execution_evidence(order, prior_entry_filled)
+            exch_order = replace(
+                exch_order, filled_qty=max(exch_order.filled_qty, evidence.executed),
+                remaining_qty=max(
+                    0.0, exch_order.qty - max(exch_order.filled_qty, evidence.executed)),
+                filled_qty_known=evidence.known)
         closing = self._is_closing_fill(order, deal)
+        if leg_type is LegType.CLOSE and closing and exch_order.client_order_id is None:
+            # A close the run sent carries no client order id on the wire:
+            # its fill names the id the close was sent under.
+            close_coid = self._own_close_fill_coid(order.orderId, order.positionId)
+            if close_coid is not None:
+                exch_order = replace(exch_order, client_order_id=close_coid)
+        is_fill = event_type in ('filled', 'partial') and (fill_qty or 0.0) > 0.0
         filled_view: OpenApiModelMessages.ProtoOAPosition | None = None
         close_origin: CloseOrigin | None = None
         held_claim: _ClaimedFill | None = None
@@ -452,9 +579,8 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # a malformed slice (no volume / price) must neither advance the
             # cursor (it would desync the watermark and suppress a corrected
             # redelivery) nor be suppressed by it.
-            if (prior_entry_filled is not None
-                    and volume_to_units(order.executedVolume)
-                    <= prior_entry_filled + 1e-9):
+            executed = volume_to_units(order.executedVolume)
+            if prior_entry_filled is not None and executed <= prior_entry_filled + 1e-9:
                 # A reconcile working-row pass already counted this entry-fill
                 # cumulative straight from ``order.executedVolume`` (the cursor
                 # was ahead at event entry). That path cannot enumerate deals, so
@@ -462,8 +588,26 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                 # only catches a PUSH-vs-PUSH replay. Re-emitting the slice would
                 # double-apply it in ``record_fill``. The dealId is now in
                 # ``_seen_deal_ids`` (added above), so any later copy of this
-                # same deal is caught by that guard too.
-                return None
+                # same deal is caught by that guard too. Only the commission
+                # a snapshot-only pass booked the slice without is delivered.
+                fee_events = self._unbooked_commission_events(
+                    order, deal, exch_order, fee=fee, fee_currency=fee_currency,
+                    timestamp=timestamp, pine_id=pine_id)
+                self._fill_fee_events.extend(fee_events[1:])
+                return fee_events[0] if fee_events else None
+            if (prior_entry_filled is not None and deal is not None
+                    and executed - (fill_qty or 0.0) < prior_entry_filled - 1e-9):
+                # The deal straddles the cursor: its executions below it were
+                # booked already (a snapshot-only pass counted them). Only the
+                # part above the cursor is booked, with its share of the
+                # deal's commission; the share of the part below goes to the
+                # snapshot booking that counted it, delivered ahead of this fill.
+                deal_qty = fill_qty or 0.0
+                fill_qty = executed - prior_entry_filled
+                self._fill_fee_events.extend(self._unbooked_commission_events(
+                    order, deal, exch_order, fee=fee, fee_currency=fee_currency,
+                    timestamp=timestamp, pine_id=pine_id))
+                fee = fee * fill_qty / deal_qty
             self._advance_fill_cursor(order)
             if message.HasField('position'):
                 self._absorb_fill_protection(message.position, closed_volume=closing)
@@ -506,7 +650,8 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # also retire its working-order row, or the venue-cancelled order
             # stays live in the store. The helper leaves a partially filled
             # entry's row live (its position side is still open exposure).
-            self._retire_cancelled_working_order(order.orderId, cancel_reason=cancel_reason)
+            self._retire_cancelled_working_order(
+                order.orderId, executed=reported_executed(order), cancel_reason=cancel_reason)
         if filled_view is not None:
             # After the link above: the bare mark and the guarded levels are
             # kept on the entry row that holds the position, so they survive
@@ -530,11 +675,84 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # unit of ``fill_qty`` (``volume_to_units``).
             journal_fill_qty=fill_qty,
         )
+        self._journal_fill_delivery([event])
         if held_claim is not None:
             # Taken for an own close in flight: its answer releases it.
             held_claim.event = event
             return None
         return event
+
+    def _unbooked_commission_events(
+            self, order, deal, exch_order: ExchangeOrder, *, fee: float, fee_currency: str,
+            timestamp: float, pine_id: str | None,
+    ) -> list[OrderEvent]:
+        """The commission of entry slices a snapshot-only reconcile booked without it.
+
+        The reconcile working-row pass counts a fill straight from the order's
+        cumulative when the deal history cannot cover it yet, and books it
+        without commission, journalling the cursor range in the row's
+        ``fee_unbooked`` ranges with the booking's fill id. A push of a deal
+        inside such a range is not booked again, but it carries the deal's
+        commission: the part of the deal's execution range the ranges hold is
+        taken off them, and that part of the commission is delivered as a fee
+        event of the booking's fill id (``event_type`` ``'fee'``, the total
+        charged on it so far), so it reaches the trade the booking opened. Each
+        is recorded until the engine accounted it
+        (:meth:`~_ProtectionMixin._journal_fee_delivery`). All writes share the
+        caller's transaction, so the commission is charged either from the
+        record or by a later recovery from the ranges, never both.
+
+        :param order: The push's ``ProtoOAOrder``.
+        :param deal: The push's ``ProtoOADeal``.
+        :param exch_order: The order as the event carries it.
+        :param fee: The deal's commission.
+        :param fee_currency: Its currency.
+        :param timestamp: The deal's execution time.
+        :param pine_id: The entry the order belongs to.
+        :return: The fee events, oldest booking first; empty when no range
+            holds the deal or it carries no commission.
+        """
+        store = self.store_ctx
+        if store is None or deal is None or not fee or not order.orderId:
+            return []
+        row = store.find_by_ref('order_id', str(order.orderId))
+        extras = (row.extras or {}) if row is not None else {}
+        ranges = extras.get(_FEE_UNBOOKED_EXTRA)
+        qty = volume_to_units(deal.filledVolume)
+        if row is None or not ranges or qty <= 0.0:
+            return []
+        end = volume_to_units(order.executedVolume)
+        start = end - qty
+        left: list[list] = []
+        charges: dict[str, float] = {}
+        for entry in ranges:
+            low, high, fill_id = _range_terms(row.client_order_id, entry)
+            part_low, part_high = max(low, start), min(high, end)
+            if part_high - part_low <= 1e-9:
+                left.append([low, high, fill_id])
+                continue
+            charges[fill_id] = charges.get(fill_id, 0.0) + fee * min(
+                1.0, (part_high - part_low) / qty)
+            if part_low - low > 1e-9:
+                left.append([low, part_low, fill_id])
+            if high - part_high > 1e-9:
+                left.append([part_high, high, fill_id])
+        if not charges:
+            return []
+        charged, totals = _charge_ranged_fees(extras, charges, left)
+        events = [
+            OrderEvent(
+                order=exch_order, event_type=FEE_EVENT_TYPE, fill_price=None, fill_qty=None,
+                timestamp=timestamp, pine_id=pine_id, from_entry=None, leg_type=LegType.ENTRY,
+                fee=total, fee_currency=fee_currency, fill_id=fill_id)
+            for fill_id, total in charged.items()]
+        patched = dict(extras)
+        patched[_FEE_UNBOOKED_EXTRA] = left or None
+        patched[_FEE_RANGED_EXTRA] = totals
+        store.upsert_order(row.client_order_id, extras=patched)
+        for event in events:
+            self._journal_fee_delivery(event)
+        return events
 
     def _order_from_proto(self, order) -> ExchangeOrder:
         """Build an :class:`ExchangeOrder` snapshot from a ``ProtoOAOrder``."""
@@ -1060,6 +1278,29 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         row = self.store_ctx.find_by_ref('order_id', str(order.orderId))
         return row.filled_qty if row is not None else None
 
+    def _terminal_execution_evidence(
+            self, order, cursor: float | None,
+    ) -> ExecutionEvidence:
+        """The execution a terminal message of an order proves (:meth:`~_CTraderBase._execution_evidence`).
+
+        The message's own executed volume, together with the entry row's
+        journal: its fill cursor as snapshot before this event (``cursor``,
+        :meth:`_entry_fill_cursor`) and the executed volume the venue
+        reported earlier. A closing order has no entry row; its message
+        alone is the evidence.
+
+        :param order: The event's order.
+        :param cursor: The row's fill cursor snapshot; ``None`` when no row is
+            resolvable.
+        """
+        reported = reported_executed(order)
+        if order.closingOrder:
+            return self._execution_evidence(None, reported=reported)
+        row = None
+        if self.store_ctx is not None and order.orderId:
+            row = self.store_ctx.find_by_ref('order_id', str(order.orderId))
+        return self._execution_evidence(row, reported=reported, cursor=cursor or 0.0)
+
     def _advance_fill_cursor(self, order) -> None:
         """Advance the entry row's durable ``filled_qty`` to the PUSH cumulative.
 
@@ -1167,19 +1408,27 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             self.store_ctx.close_order(coid)
 
     def _order_error_to_event(self, error) -> OrderEvent | None:
-        """Translate a ``ProtoOAOrderErrorEvent`` into a rejected OrderEvent."""
+        """Translate a ``ProtoOAOrderErrorEvent`` into a rejected OrderEvent.
+
+        The error carries no executed volume, so the event's quantity is what
+        the journal proves (:meth:`~_CTraderBase._execution_evidence`), a lower
+        bound (``filled_qty_known`` ``False``): it never proves the order
+        unexecuted. The row stays live; the reconcile
+        pass ends it from the venue's evidence.
+        """
         if self.store_ctx is None or not error.orderId:
             return None
         row = self.store_ctx.find_by_ref('order_id', str(error.orderId))
         if row is None:
             return None
+        evidence = self._execution_evidence(row, reported=None)
         exch = ExchangeOrder(
             id=str(error.orderId), symbol=row.symbol, side=row.side,
-            order_type=OrderType.MARKET, qty=row.qty, filled_qty=row.filled_qty,
-            remaining_qty=max(0.0, row.qty - row.filled_qty), price=None,
+            order_type=OrderType.MARKET, qty=row.qty, filled_qty=evidence.executed,
+            remaining_qty=max(0.0, row.qty - evidence.executed), price=None,
             stop_price=None, average_fill_price=None, status=OrderStatus.REJECTED,
             timestamp=epoch_time(), fee=0.0, fee_currency='', reduce_only=False,
-            client_order_id=row.client_order_id,
+            client_order_id=row.client_order_id, filled_qty_known=evidence.known,
         )
         return OrderEvent(
             order=exch, event_type='rejected', fill_price=None, fill_qty=None,

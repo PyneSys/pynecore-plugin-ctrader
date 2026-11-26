@@ -194,6 +194,7 @@ write leaves while a queued report waits for its delivery.
 import asyncio
 import logging
 import math
+import sqlite3
 import time
 import uuid
 from abc import ABC
@@ -212,21 +213,33 @@ from pynecore.core.broker.exceptions import (
     BrokerError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    JournalWriteError,
     UnexpectedCancelError,
     VenueWritesQuarantinedError,
 )
-from pynecore.core.broker.models import CANCEL_REASON_VENUE_REJECTED, LegType, OrderEvent
+from pynecore.core.broker.models import (
+    CANCEL_REASON_VENUE_REJECTED,
+    ExchangeOrder,
+    LegType,
+    OrderEvent,
+    OrderStatus,
+    OrderType,
+)
 from pynecore.core.broker.protection_guard import (
     PROTECTION_LEVELS_EXTRA,
     ProtectionLevelGuard,
     ProtectionLevels,
 )
 from pynecore.core.broker.store_helpers import (
+    CLOSE_ENDED_PARTIALLY_EVENT,
+    CLOSE_ENDED_UNFILLED_EVENT,
+    CLOSE_EXECUTED_QTY_KEY,
     STATE_CANCEL_PENDING,
     STATE_CLOSING,
     STATE_CONFIRMED,
     STATE_DISPOSITION_UNKNOWN,
     STATE_SERVER_REF_SEEN,
+    mark_rejected,
 )
 from pynecore.types.strategy import (
     ADOPTED_STARTUP_EXTRA_KEY,
@@ -265,6 +278,33 @@ _SHARE_EFFECT_TTL_S = 60.0
 #: Journal event of one close the run sent, written at each state change.
 _OWN_CLOSE_EVENT = 'ctrader_own_close'
 
+#: ``orders.state`` of the journal row of a close
+#: :meth:`~_ExecutionMixin.execute_close` sends, written under the close's
+#: client order id in the transaction that journals the close record, before
+#: the request goes out. The row is live while the close's outcome is open,
+#: and it ends with what the venue evidence proves (:meth:`_ProtectionMixin._finish_close_row`):
+#: ``confirmed`` with a ``confirmed`` journal event once the close's own fills
+#: cover its whole volume or its order's final status shows it executed,
+#: ``confirmed`` with the core's ended-partially mark
+#: (:data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_PARTIALLY_EVENT`) once
+#: the venue ended its order after a part, ``rejected`` once the venue refused it,
+#: closed in this state with the core's ended-unfilled mark
+#: (:data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_UNFILLED_EVENT`) once
+#: the venue ended its order with nothing executed, and closed in this state,
+#: with a :data:`_CLOSE_UNRESOLVED_EVENT`, when no evidence shows whether it
+#: executed and none will. The row holds no venue order id,
+#: position link, fill or Pine identity, so no journal walk takes it for an
+#: order or a position of the bot's.
+_CLOSE_ROW_STATE = 'ctrader_close'
+
+#: Extras key of a close row: ``{'position_id', 'volume_cents'}``, and once it
+#: ended, ``'outcome'`` with ``'order_id'`` and ``'executed'`` (units) or
+#: ``'reason'``.
+_CLOSE_ROW_EXTRA = 'ctrader_close'
+
+#: Audit of a close row ended with no evidence of whether the close executed.
+_CLOSE_UNRESOLVED_EVENT = 'ctrader_close_unresolved'
+
 #: Journal event naming closing deals whose origin was decided.
 _CLOSE_JUDGED_EVENT = 'ctrader_close_judged'
 
@@ -281,7 +321,23 @@ _JUDGMENT_STATE = (
     '_unexplained_shrinks', '_shrink_covered_from', '_closes_covered_until',
     '_resume_accepted_until', '_expiry_overlaps', '_coverage_journalled',
     '_startup_shrinks', '_resume_accepted_positions', '_shared_position_logged',
+    '_inherited_deliveries',
 )
+
+#: Journal event of one fill the run journaled before the engine took it, keyed
+#: by ``fill:<fill id>`` (:meth:`~_ProtectionMixin._journal_fill_delivery`):
+#: written in the transaction of the journal write that puts the fill into the
+#: position a restart starts from, and kept until the engine's receipt shows the
+#: fill taken (:meth:`~pynecore.core.broker.storage.RunContext.fill_delivered`).
+#: A later process of the run delivers a fill it holds no receipt of again,
+#: marked journaled before the restart.
+_FILL_DELIVERY_EVENT = 'ctrader_fill_delivery'
+
+#: Journal event of one commission delivered without its fill (an
+#: ``event_type`` ``'fee'`` event), keyed by ``fee:<fill id>``
+#: (:meth:`~_ProtectionMixin._journal_fee_delivery`): kept until the engine's
+#: receipt of the fill accounts the whole commission.
+_FEE_DELIVERY_EVENT = 'ctrader_fee_delivery'
 
 #: Journal event of one queued manual-close report, written before its deals
 #: are marked judged, so a report a dead process never delivered is replayed.
@@ -326,6 +382,11 @@ _CLOSE_UNATTRIBUTED_EVENT = 'ctrader_close_unattributed'
 
 #: Audit of a close of the bot's position an operator resume accepted.
 _CLOSE_ACCEPTED_BY_RESUME_EVENT = 'ctrader_close_accepted_by_resume'
+
+#: Audit of an entry row a reconcile pass or the startup recovery retired
+#: because its order filled and the position it opened closed while the stream
+#: was down, written with the retirement under the row's client order id.
+_FILLED_THEN_CLOSED_EVENT = 'reconcile_filled_then_closed_retired'
 
 #: Audit of volume a fill taken for the bot's own close booked although the
 #: bot's share did not lose it: taken off the fill's held event and given back
@@ -790,6 +851,23 @@ class _PositionDeal:
         return self.filled - self.closed
 
 
+class _UnpricedCloseDeferred(Exception):
+    """A recovered close judgment that must wait for its closes' prices.
+
+    Raised inside the judgment's store transaction
+    (:meth:`~_ProtectionMixin._judgment_span`) so the judgment rolls back:
+    a close of the bot's share the deal history lists without
+    ``executionPrice`` cannot be delivered as a fill (an unpriced fill books
+    nothing), and judging it now would retire the share it took without one.
+
+    :ivar deal_ids: The unpriced deals the judgment would deliver.
+    """
+
+    def __init__(self, deal_ids: list[int]) -> None:
+        super().__init__(deal_ids)
+        self.deal_ids = deal_ids
+
+
 @dataclass(slots=True)
 class _ShareReplay:
     """Verdict of :func:`_replay_share_closes`.
@@ -820,6 +898,7 @@ def _replay_share_closes(
         seen: Container[int],
         venue_now: int,
         share_now: int,
+        share_low_now: int | None = None,
 ) -> _ShareReplay:
     """Replay a position's deals in execution order against the bot's share.
 
@@ -834,7 +913,10 @@ def _replay_share_closes(
     the deals after it, and only a deal whose lower bound proves the venue went
     below the share is reported. Either way the verdict carries what the
     pending deals of every origin took of the share: exactly, or its proven
-    lower bound.
+    lower bound. An own close that may have executed without its deal in the
+    window lowers the share's lower bound (``share_low_now``) and rules out
+    the exact replay: the window does not hold the whole life of the
+    position then.
 
     :param deals: Every deal on the position in the window, in execution order.
     :param pending: The origin of every closing deal to judge, by deal id.
@@ -843,15 +925,19 @@ def _replay_share_closes(
     :param seen: Deal ids whose fill the journal already counts.
     :param venue_now: The volume (cents) the position holds now.
     :param share_now: The bot's journal share (cents) now.
+    :param share_low_now: The least the bot's share (cents) may be now: the
+        journal share less what the bot's own closes may have executed beyond
+        the window's deals; ``share_now`` when ``None``.
     :return: The verdict.
     """
+    share_low = share_now if share_low_now is None else min(share_now, share_low_now)
     after: dict[int, int] = {}
     venue = venue_now
     for deal in reversed(deals):
         after[deal.deal_id] = max(0, venue)
         venue += deal.closed - deal.opened
     replay = _ShareReplay()
-    exact = venue == 0 and all(
+    exact = share_low == share_now and venue == 0 and all(
         deal.deal_id in pending or deal.deal_id in judged
         for deal in deals if deal.closed > 0)
     if exact:
@@ -888,7 +974,7 @@ def _replay_share_closes(
         judged_after = sum(d.closed for d in later if d.closed > 0 and d.deal_id not in pending)
         unseen_own_before = sum(d.opened for d in earlier
                                 if d.opened > 0 and own_opening(d) and d.deal_id not in seen)
-        low = max(0, share_now - own_after - taken_high)
+        low = max(0, share_low - own_after - taken_high)
         high = max(0, share_now - seen_own_after + judged_after + unseen_own_before - taken_low)
         remaining = max(0, after[deal.deal_id] - deal.opened)
         if origin is CloseOrigin.OWN:
@@ -1040,6 +1126,56 @@ def _nothing_to_amend(exc: BaseException) -> bool:
             and 'nothing to amend' in str(cause).lower())
 
 
+def _delivery_payload(event: OrderEvent) -> dict:
+    """The journal payload of a delivered event, read back by :func:`_delivered_event`."""
+    order = event.order
+    return {
+        'order': {
+            'id': order.id, 'symbol': order.symbol, 'side': order.side,
+            'order_type': str(order.order_type), 'qty': order.qty,
+            'filled_qty': order.filled_qty, 'remaining_qty': order.remaining_qty,
+            'price': order.price, 'stop_price': order.stop_price,
+            'average_fill_price': order.average_fill_price, 'status': str(order.status),
+            'timestamp': order.timestamp, 'reduce_only': order.reduce_only,
+            'client_order_id': order.client_order_id,
+        },
+        'event_type': event.event_type, 'fill_price': event.fill_price,
+        'fill_qty': event.fill_qty, 'timestamp': event.timestamp, 'pine_id': event.pine_id,
+        'from_entry': event.from_entry,
+        'leg_type': str(event.leg_type) if event.leg_type is not None else None,
+        'fee': event.fee, 'fee_currency': event.fee_currency, 'fill_id': event.fill_id,
+        'journal_fill_qty': event.journal_fill_qty,
+    }
+
+
+def _delivered_event(payload: Mapping) -> OrderEvent | None:
+    """The event a :func:`_delivery_payload` stands for; ``None`` for a malformed one."""
+    try:
+        order = payload['order']
+        leg_type = payload['leg_type']
+        return OrderEvent(
+            order=ExchangeOrder(
+                id=str(order['id']), symbol=str(order['symbol']), side=str(order['side']),
+                order_type=OrderType(order['order_type']), qty=float(order['qty']),
+                filled_qty=float(order['filled_qty']),
+                remaining_qty=float(order['remaining_qty']), price=order['price'],
+                stop_price=order['stop_price'],
+                average_fill_price=order['average_fill_price'],
+                status=OrderStatus(order['status']), timestamp=float(order['timestamp']),
+                fee=0.0, fee_currency='', reduce_only=bool(order['reduce_only']),
+                client_order_id=order['client_order_id'],
+            ),
+            event_type=str(payload['event_type']), fill_price=payload['fill_price'],
+            fill_qty=payload['fill_qty'], timestamp=float(payload['timestamp']),
+            pine_id=payload['pine_id'], from_entry=payload['from_entry'],
+            leg_type=LegType(leg_type) if leg_type is not None else None,
+            fee=float(payload['fee']), fee_currency=str(payload['fee_currency']),
+            fill_id=str(payload['fill_id']), journal_fill_qty=payload['journal_fill_qty'],
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _snapshot_contents(roots: Iterable[object]) -> list[tuple[object, object]]:
     """The contents of every mutable object reachable from ``roots``, one level deep.
 
@@ -1098,6 +1234,88 @@ def _restore_contents(saved: list[tuple[object, object]]) -> None:
         else:
             for name, value in cast(dict[str, object], contents).items():
                 object.__setattr__(obj, name, value)
+
+
+def _close_record_outcome(
+        *, refused: bool, order_id: int | None, executed: float, answered: bool,
+        complete: bool, volume: float | None,
+) -> tuple[str, int | None, float] | None:
+    """The outcome a close's own record proves, for its journal row.
+
+    The record is the close's latest state (:class:`_OwnClose`, as this
+    process holds it or as the journal does). ``executed`` counts only fills
+    matched to the close by its order id once the answer named that order, so
+    with the order known, own fills covering the whole requested volume, or
+    the order's final fill (``complete``), prove the close executed. A part of
+    the volume on an order still working proves nothing yet: the order may
+    execute more, or the venue may end it after that part. A venue cancel or
+    reject of the order ends the row from the order's own final figures in the
+    transaction that marks the record complete (:func:`_ended_close_verdict`),
+    so a record complete with a part executed and its row still live was
+    completed by its final fill. Without the order, the answer was lost: no
+    fill can ever be matched to the close, so nothing will show whether it
+    executed.
+
+    :param refused: The venue provably refused the close.
+    :param order_id: The close's venue order, once the answer named it.
+    :param executed: Units of the close's own fills seen by its order id.
+    :param answered: The venue answered the close, or its answer was lost.
+    :param complete: Nothing more of the close can execute
+        (:attr:`_OwnClose.complete`).
+    :param volume: Units the close asked for; ``None`` when not recorded.
+    :return: ``(outcome, order_id, executed)`` for
+        :meth:`_ProtectionMixin._finish_close_row`, or ``None`` when the record
+        proves nothing yet (the close is in flight, or answered and its working
+        order has not shown the whole volume executed).
+    """
+    if refused:
+        return 'refused', order_id, 0.0
+    if order_id is not None:
+        if executed > _VOLUME_TOL and (
+                complete or (volume is not None and executed >= volume - _VOLUME_TOL)):
+            return 'executed', order_id, executed
+        return None
+    return ('answer_lost', None, 0.0) if answered else None
+
+
+def _ended_close_verdict(
+        *, rejected: bool, order_id: int, executed_cents: int | None, proven: float,
+        volume_cents: int | None,
+) -> tuple[str, int | None, float] | None:
+    """The outcome of an own close order the venue cancelled, expired or rejected.
+
+    From the order's own final executed volume, never below what the close's
+    own fills already proved executed: none executed is a refusal (rejected)
+    or an end with nothing executed (cancelled or expired); a part of the
+    close's volume is an end after that part (``'ended_partially'``); the
+    whole volume, or a volume the close did not record, is an execution. A
+    message without the order's executed volume proves only that the close
+    executed in whole when its own fills cover the whole volume; otherwise it
+    proves nothing (fills of the order may not have reached the bot), and the
+    row waits for a message that carries the volume.
+
+    :param rejected: The venue rejected the order.
+    :param order_id: The close's venue order.
+    :param executed_cents: The order's final executed volume (centi-units);
+        ``None`` when the message does not carry it.
+    :param proven: Units the close's own fills, matched by its order id,
+        executed (:attr:`_OwnClose.executed`).
+    :param volume_cents: The volume the close was sent for, when recorded.
+    :return: ``(outcome, order_id, executed units)`` for
+        :meth:`_ProtectionMixin._finish_close_row`, or ``None`` when the
+        message proves nothing.
+    """
+    if executed_cents is None:
+        if (volume_cents is not None and proven > _VOLUME_TOL
+                and proven >= volume_to_units(volume_cents) - _VOLUME_TOL):
+            return 'executed', order_id, proven
+        return None
+    executed = max(volume_to_units(executed_cents), proven)
+    if executed <= _VOLUME_TOL:
+        return ('refused' if rejected else 'ended_unfilled'), order_id, 0.0
+    if volume_cents is not None and executed < volume_to_units(volume_cents) - _VOLUME_TOL:
+        return 'ended_partially', order_id, executed
+    return 'executed', order_id, executed
 
 
 class _ProtectionMixin(_CTraderBase, ABC):
@@ -2265,6 +2483,45 @@ class _ProtectionMixin(_CTraderBase, ABC):
         return sum(record.unresolved() for record in self._own_close_history
                    if record.position_id == position_id)
 
+    def _own_close_missing_from(self, position_id: int, deals: Sequence[_PositionDeal]) -> float:
+        """Units the journal share may count above the bot's real share while a shortfall waits.
+
+        While a shortfall of the position waits for the close that explains it
+        (:attr:`~_CTraderBase._unexplained_shrinks`), the journal keeps
+        counting the shortfall, and an own close that executed unseen may hold
+        more of the share than the venue shows missing (another party's
+        exposure on a NETTING position hides the rest). Each of the run's
+        closes of the position answered since the wait's watermark
+        (:attr:`~_CTraderBase._shrink_covered_from`; the passes before it
+        retired an earlier one) counts its unresolved volume
+        (:meth:`_OwnClose.unresolved`) less what its deals in ``deals`` it has
+        not counted yet closed: matched by its order once the answer named it,
+        else by the position and time it claims
+        (:meth:`_OwnClose.claims_recovered`). Without a running wait the
+        journal share is the share the passes reconciled, and nothing counts.
+
+        :param deals: The deals of the position's history read now.
+        """
+        if position_id not in self._unexplained_shrinks:
+            return 0.0
+        watermark = self._shrink_covered_from.get(position_id, 0)
+        missing = 0.0
+        for record in self._own_close_history:
+            if (record.position_id != position_id or record.answered_ms is None
+                    or record.answered_ms < watermark):
+                continue
+            unresolved = record.unresolved()
+            if unresolved <= _VOLUME_TOL:
+                continue
+            shown = volume_to_units(sum(
+                deal.closed for deal in deals
+                if deal.closed > 0 and deal.deal_id not in record.executed_deals and (
+                    deal.order_id == record.order_id if record.order_id is not None
+                    else record.claims_recovered(position_id, deal.order_id,
+                                                 deal.executed_ms))))
+            missing += max(0.0, unresolved - shown)
+        return missing
+
     def _entries_in_flight(self, rows: Sequence['OrderRow']) -> dict[str, float]:
         """Signed volumes of the own entries in flight that may still add to a position.
 
@@ -2675,27 +2932,69 @@ class _ProtectionMixin(_CTraderBase, ABC):
     def _open_own_close(
             self, position_id: int, volume: float | None = None, *,
             coid: str | None = None, volume_cents: int | None = None,
+            row: tuple[str, str] | None = None,
     ) -> _OwnClose:
         """Record a close of ``position_id`` this run is about to send.
 
         The record claims PUSH fills until its grace ends, and stays in
-        :attr:`_own_close_history` for judging recovered closes. It is
+        :attr:`~_CTraderBase._own_close_history` for judging recovered closes. It is
         journalled before the request is written, so a send without a journal
-        record never reached the wire.
+        record never reached the wire; the process tracks it only once the
+        journal holds it.
 
         :param position_id: The position the close reduces.
         :param volume: The volume (units) the close asks for, when known.
         :param coid: The client order id the close is sent under.
         :param volume_cents: The volume (centi-units) of the request.
+        :param row: ``(symbol, side)`` of the close's journal row
+            (:data:`_CLOSE_ROW_STATE`), written with the record in one
+            transaction under ``coid``; ``None`` writes no row.
+        :raises JournalWriteError: When the row and the record could not be
+            journalled: nothing was written, and the close is not sent.
         """
         record = _OwnClose(position_id=position_id, sent_ms=int(epoch_time() * 1000),
                            volume=volume, coid=coid, volume_cents=volume_cents,
                            from_entry=self._close_dispatch_pine_by_position.get(position_id),
                            settle_entry=self._close_settle_entry_by_position.get(position_id))
+        if row is None or self.store_ctx is None or coid is None:
+            self._journal_own_close(record)
+        else:
+            self._journal_close_row(record, symbol=row[0], side=row[1])
         self._own_closes.append(record)
         self._own_close_history.append(record)
-        self._journal_own_close(record)
         return record
+
+    def _journal_close_row(self, record: _OwnClose, *, symbol: str, side: str) -> None:
+        """Write a close's journal row and its record before the request goes out.
+
+        One transaction: the row (:data:`_CLOSE_ROW_STATE`) under the close's
+        client order id and the record (:meth:`_journal_own_close`). A row a
+        refused or ended earlier send left under the same id is reopened for
+        this send. A storage failure rolls both back and is raised as
+        :class:`~pynecore.core.broker.exceptions.JournalWriteError`: the close
+        was not sent, and no row of it exists.
+
+        :param record: The close about to be sent; its ``coid`` is set.
+        :param symbol: The instrument the close trades.
+        :param side: The side of the close order.
+        """
+        store = self.store_ctx
+        coid = record.coid
+        assert store is not None and coid is not None
+        try:
+            with store.transaction():
+                existing = store.get_order(coid)
+                if existing is not None and existing.closed_ts_ms is not None:
+                    store.reopen_order(coid)
+                store.upsert_order(
+                    coid, symbol=symbol, side=side,
+                    qty=volume_to_units(record.volume_cents or 0), filled_qty=0.0,
+                    state=_CLOSE_ROW_STATE,
+                    extras={_CLOSE_ROW_EXTRA: {'position_id': record.position_id,
+                                               'volume_cents': record.volume_cents}})
+                self._journal_own_close(record)
+        except sqlite3.Error as exc:
+            raise JournalWriteError("close", exc) from exc
 
     def _settle_own_close(
             self, record: _OwnClose, order_id: int | None, *,
@@ -2842,6 +3141,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
     def _release_held_claims(
             self, record: _OwnClose, claims: Sequence[_ClaimedFill],
             cuts: Sequence[tuple[_ClaimedFill, float]] | None = None,
+            *, retry: bool = False,
     ) -> None:
         """Deliver the events of the fills an own close took while it was in flight.
 
@@ -2861,16 +3161,32 @@ class _ProtectionMixin(_CTraderBase, ABC):
         had been pending (:meth:`_reattributed_identity`): its event gets that
         label, and what it still debits from the journal moves to the rows of
         that settlement entry. A fill of a close whose outcome stays unknown
-        keeps the close's identity. Once any released fill's quantity or
+        keeps the close's identity. The client order id is never lent with the
+        label: each released event carries the id of the close the answer
+        proves its order to be (:meth:`_released_claim_coid`), and the
+        delivery record of an event whose id changed is written again. Once any released fill's quantity or
         settlement entry changed, the journal debits of all of them are taken
         again in release order (:meth:`_replay_claim_debits`), as the engine
         settles their events.
+
+        A storage failure of those journal writes rolls them back, and the
+        fills are put back as they were held, their events included: nothing
+        of the release is lost or half applied. The release is kept with the
+        verdict it was judged by and retried before the stream delivers
+        anything else (:meth:`_retry_failed_releases`). Releases are applied
+        in the order they were judged: one judged while an earlier one is
+        still pending waits behind it, held as it is.
 
         :param claims: The fills the close took, as they were before judging.
         :param cuts: The volume to take off each claim's event, once the
             close's fills are judged (:meth:`_rejudge_claims`); ``None`` when
             the close's outcome is unknown.
+        :param retry: Whether this is the pending release at the head of
+            the queue being retried (:meth:`_retry_failed_releases`).
         """
+        if self._failed_releases and not retry:
+            self._failed_releases.append((record, list(claims), cuts))
+            return
         cut_of = {id(claim): cut for claim, cut in cuts or ()}
         total_cut = 0.0
         restored = 0.0
@@ -2878,32 +3194,66 @@ class _ProtectionMixin(_CTraderBase, ABC):
         settle_share = False
         replay = False
         delivered: list[tuple[_ClaimedFill, OrderEvent]] = []
-        for claim in claims:
-            event = claim.event
-            if event is None:
-                continue
-            claim.event = None
-            released = True
-            settle_share = settle_share or claim.settles_share
-            booked = event.fill_qty or 0.0
-            cut = min(cut_of.get(id(claim), 0.0), booked)
-            total_cut += cut
-            if cut > _VOLUME_TOL:
-                restored += self._restore_retired_exposure(record.position_id, claim, cut)
-                replay = True
-            disproved = (cuts is not None and not claim.venue
-                         and not any(own is claim for own in record.claims))
-            if disproved:
-                from_entry, settle_entry = self._reattributed_identity(record.position_id, claim)
-                replay = replay or (settle_entry != claim.settle_entry and bool(claim.retired))
-                claim.settle_entry = settle_entry
-                claim.from_entry = from_entry
-                event = replace(event, from_entry=from_entry)
-            if booked - cut > _VOLUME_TOL:
-                event = replace(event, fill_qty=booked - cut) if cut > 0.0 else event
-                delivered.append((claim, event))
-        if replay:
-            self._replay_claim_debits([claim for claim, _event in delivered], record.position_id)
+        withdrawn: list[str] = []
+        revised: list[OrderEvent] = []
+        store = self.store_ctx
+        saved = _snapshot_contents(claims)
+        # The debits given back and taken again, and the delivery records of the
+        # fills they concern, land together: the record of a fill always holds
+        # what the position a restart starts from booked for it.
+        try:
+            with store.transaction() if store is not None else nullcontext():
+                for claim in claims:
+                    event = claim.event
+                    if event is None:
+                        continue
+                    claim.event = None
+                    released = True
+                    settle_share = settle_share or claim.settles_share
+                    booked = event.fill_qty or 0.0
+                    cut = min(cut_of.get(id(claim), 0.0), booked)
+                    total_cut += cut
+                    if cut > _VOLUME_TOL:
+                        restored += self._restore_retired_exposure(record.position_id, claim, cut)
+                        replay = True
+                    disproved = (cuts is not None and not claim.venue
+                                 and not any(own is claim for own in record.claims))
+                    if disproved:
+                        from_entry, settle_entry = self._reattributed_identity(
+                            record.position_id, claim)
+                        replay = replay or (
+                            settle_entry != claim.settle_entry and bool(claim.retired))
+                        claim.settle_entry = settle_entry
+                        claim.from_entry = from_entry
+                        event = replace(event, from_entry=from_entry)
+                    coid = self._released_claim_coid(
+                        record, claim, event.order.client_order_id, judged=cuts is not None)
+                    recoded = coid != event.order.client_order_id
+                    if recoded:
+                        event = replace(event, order=replace(event.order, client_order_id=coid))
+                    if booked - cut > _VOLUME_TOL:
+                        if cut > 0.0:
+                            event = replace(event, fill_qty=booked - cut,
+                                            journal_fill_qty=booked - cut)
+                        if cut > 0.0 or disproved or recoded:
+                            revised.append(event)
+                        delivered.append((claim, event))
+                    elif event.fill_id:
+                        # Given back to the journal whole: nothing of it is delivered.
+                        withdrawn.append(event.fill_id)
+                if replay:
+                    self._replay_claim_debits(
+                        [claim for claim, _event in delivered], record.position_id)
+                self._forget_fill_delivery(withdrawn)
+                self._journal_fill_delivery(revised)
+        except sqlite3.Error as exc:
+            _restore_contents(saved)
+            self._failed_releases.append((record, list(claims), cuts))
+            logger.error(
+                "cTrader: releasing the fills held for the own close of position %d "
+                "failed to journal (%s); retried before the next event",
+                record.position_id, exc)
+            return
         self._released_close_events.extend(event for _claim, event in delivered)
         if total_cut > _VOLUME_TOL:
             logger.warning(
@@ -2923,6 +3273,22 @@ class _ProtectionMixin(_CTraderBase, ABC):
         if released and self._exec_events is not None:
             # Wakes the stream, which delivers the events before the next message.
             self._exec_events.put_nowait(_RELEASE_WAKEUP)
+
+    def _retry_failed_releases(self) -> None:
+        """Release again the held close fills whose release failed to journal.
+
+        Each is released with the verdict it was judged by
+        (:meth:`_release_held_claims`), in the order they were judged. The
+        first one that fails again stops the round: it and every release
+        behind it are kept, in that order, for the next try, so a later
+        release never overtakes an earlier one.
+        """
+        pending, self._failed_releases = self._failed_releases, []
+        for index, (record, claims, cuts) in enumerate(pending):
+            self._release_held_claims(record, claims, cuts, retry=True)
+            if self._failed_releases:
+                self._failed_releases.extend(pending[index + 1:])
+                return
 
     def _restore_retired_exposure(
             self, position_id: int, claim: _ClaimedFill, qty: float, *,
@@ -3039,7 +3405,10 @@ class _ProtectionMixin(_CTraderBase, ABC):
             # included.
             self._vacate_position(position_id)
 
-    def _journal_own_close(self, record: _OwnClose, *, refused: bool = False) -> None:
+    def _journal_own_close(
+            self, record: _OwnClose, *, refused: bool = False,
+            ended: tuple[str, int | None, float] | None = None,
+    ) -> None:
         """Persist the state of one own close for a restarted process.
 
         Journalled when it is sent, answered or refused, and again whenever
@@ -3047,22 +3416,138 @@ class _ProtectionMixin(_CTraderBase, ABC):
         changes: the judgment of an expiry's overlap counts a close confirmed
         filled whose deal the history does not show yet
         (:meth:`~_ReconcileMixin._post_expiry_close_pending`).
+
+        A close with a live journal row (:data:`_CLOSE_ROW_STATE`) has the row
+        ended in the same transaction once the record proves its outcome
+        (:func:`_close_record_outcome`), or with ``ended`` when the venue
+        ended the close's order (:func:`_ended_close_verdict`).
+
+        :param ended: The outcome the venue's end of the close order proves,
+            from the order's own final figures.
         """
-        if self.store_ctx is None:
+        store = self.store_ctx
+        if store is None:
             return
-        self.store_ctx.log_event(
-            _OWN_CLOSE_EVENT, client_order_id=record.coid,
-            exchange_order_id=str(record.position_id),
-            payload={'key': record.key, 'position_id': record.position_id,
-                     'sent_ms': record.sent_ms, 'order_id': record.order_id,
-                     'answered_ms': record.answered_ms, 'refused': refused,
-                     'from_entry': record.from_entry,
-                     'settle_entry': record.settle_entry,
-                     'coid': record.coid, 'volume_cents': record.volume_cents,
-                     'executed': record.executed,
-                     'executed_deals': sorted(record.executed_deals),
-                     'complete': record.complete},
-        )
+        with store.transaction():
+            store.log_event(
+                _OWN_CLOSE_EVENT, client_order_id=record.coid,
+                exchange_order_id=str(record.position_id),
+                payload={'key': record.key, 'position_id': record.position_id,
+                         'sent_ms': record.sent_ms, 'order_id': record.order_id,
+                         'answered_ms': record.answered_ms, 'refused': refused,
+                         'from_entry': record.from_entry,
+                         'settle_entry': record.settle_entry,
+                         'coid': record.coid, 'volume_cents': record.volume_cents,
+                         'executed': record.executed,
+                         'executed_deals': sorted(record.executed_deals),
+                         'complete': record.complete},
+            )
+            if record.coid is None:
+                return
+            row = store.get_order(record.coid)
+            if row is None or row.state != _CLOSE_ROW_STATE or row.closed_ts_ms is not None:
+                return
+            outcome = ended if ended is not None else _close_record_outcome(
+                refused=refused, order_id=record.order_id, executed=record.executed,
+                answered=record.answered_ms is not None, complete=record.complete,
+                volume=(volume_to_units(record.volume_cents)
+                        if record.volume_cents is not None else None))
+            if outcome is not None:
+                self._finish_close_row(row, *outcome)
+
+    def _finish_close_row(
+            self, row: 'OrderRow', outcome: str, order_id: int | None = None,
+            executed: float = 0.0,
+    ) -> None:
+        """End a close's journal row (:data:`_CLOSE_ROW_STATE`) with its proven outcome.
+
+        One transaction (joining the caller's):
+
+        * ``'executed'`` — the close's own fills cover its whole volume, or
+          its order's final status shows it executed ``executed`` units: the
+          row lands ``confirmed`` and a ``confirmed``
+          event names the close's client order id. The row carries no fill
+          quantity: the close's fills reach the engine as close fills, and no
+          journal walk may take the row for an entry's exposure;
+        * ``'refused'`` — the venue refused the close, nothing executed: the
+          row lands ``rejected``;
+        * ``'ended_partially'`` — the venue reports the close order cancelled
+          or expired after executing ``executed`` units, less than the close:
+          the row lands ``confirmed`` with the core's ended-partially mark
+          (:data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_PARTIALLY_EVENT`,
+          the executed units in the row's quantity unit), which the core reads
+          as the leg re-arming for the rest;
+        * ``'ended_unfilled'`` — the venue reports the close order cancelled
+          or expired with zero executed volume: nothing of it executed and
+          nothing can, so the row is closed in its state with the core's
+          ended-unfilled mark
+          (:data:`~pynecore.core.broker.store_helpers.CLOSE_ENDED_UNFILLED_EVENT`),
+          which the core reads as safe to re-arm;
+        * ``'answer_lost'``, ``'send_interrupted'``, ``'no_record'`` — no
+          evidence shows whether the close executed, and none will: the row is
+          closed in its state with an ERROR and a
+          :data:`_CLOSE_UNRESOLVED_EVENT`.
+
+        :param row: The live close row.
+        :param outcome: The verdict (:func:`_close_record_outcome`).
+        :param order_id: The close's venue order, when known.
+        :param executed: Units the close executed, for ``'executed'``.
+        """
+        store = self.store_ctx
+        assert store is not None
+        coid = row.client_order_id
+        extras = dict(row.extras or {})
+        detail = dict(extras.get(_CLOSE_ROW_EXTRA) or {})
+        detail['outcome'] = outcome
+        detail['order_id'] = order_id
+        if outcome in ('executed', 'ended_partially'):
+            detail['executed'] = executed
+        extras[_CLOSE_ROW_EXTRA] = detail
+        with store.transaction():
+            if outcome == 'executed':
+                store.upsert_order(coid, state=STATE_CONFIRMED, extras=extras)
+                store.log_event(
+                    'confirmed', client_order_id=coid,
+                    exchange_order_id=str(order_id) if order_id else None,
+                    payload={'executed': executed, 'order_id': order_id,
+                             'position_id': detail.get('position_id')})
+                store.close_order(coid)
+                return
+            if outcome == 'refused':
+                store.upsert_order(coid, extras=extras)
+                mark_rejected(store, coid=coid)
+                store.log_event(
+                    'rejected', client_order_id=coid,
+                    exchange_order_id=str(order_id) if order_id else None,
+                    payload={'order_id': order_id, 'position_id': detail.get('position_id')})
+                return
+            if outcome == 'ended_partially':
+                store.upsert_order(coid, state=STATE_CONFIRMED, extras=extras)
+                store.log_event(
+                    CLOSE_ENDED_PARTIALLY_EVENT, client_order_id=coid,
+                    exchange_order_id=str(order_id) if order_id else None,
+                    payload={CLOSE_EXECUTED_QTY_KEY: executed, 'order_id': order_id,
+                             'position_id': detail.get('position_id')})
+                store.close_order(coid)
+                return
+            if outcome == 'ended_unfilled':
+                store.upsert_order(coid, extras=extras)
+                store.log_event(
+                    CLOSE_ENDED_UNFILLED_EVENT, client_order_id=coid,
+                    exchange_order_id=str(order_id) if order_id else None,
+                    payload={'order_id': order_id, 'position_id': detail.get('position_id')})
+                store.close_order(coid)
+                return
+            store.upsert_order(coid, extras=extras)
+            store.log_event(
+                _CLOSE_UNRESOLVED_EVENT, client_order_id=coid,
+                exchange_order_id=str(order_id) if order_id else None,
+                payload={'reason': outcome, 'order_id': order_id,
+                         'position_id': detail.get('position_id')})
+            store.close_order(coid)
+        logger.error(
+            "cTrader: close %s of position %s ended without evidence of whether it "
+            "executed (%s)", coid, detail.get('position_id'), outcome)
 
     def _load_close_evidence(self) -> None:
         """Merge the own closes and judged deals earlier processes of the run journalled.
@@ -3108,6 +3593,9 @@ class _ProtectionMixin(_CTraderBase, ABC):
                     executed_deals={int(deal_id) for deal_id in payload.get('executed_deals') or ()
                                     if isinstance(deal_id, int)},
                     complete=bool(payload.get('complete')),
+                    coid=payload['coid'] if isinstance(payload.get('coid'), str) else None,
+                    volume_cents=(int(payload['volume_cents'])
+                                  if isinstance(payload.get('volume_cents'), int) else None),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -3206,6 +3694,54 @@ class _ProtectionMixin(_CTraderBase, ABC):
              if record.order_id is None
              and record.claims_recovered(position_id, deal.order_id, deal.executed_ms)),
             None)
+
+    def _own_close_fill_coid(self, order_id: int, position_id: int) -> str | None:
+        """The client order id a closing PUSH fill of the run's own close carries.
+
+        ``ProtoOAClosePositionReq`` has no client-order-id field, so the venue
+        echoes none on the close's fills; the id the close was sent under (the
+        ``coid`` :meth:`~pynecore_ctrader.execution._ExecutionMixin.close_leg`
+        or :meth:`~pynecore_ctrader.execution._ExecutionMixin.execute_close`
+        received) is kept on its own-close record, which is
+        journalled before the request and reloaded by a restarted process. The
+        core tells which close a fill reports by it (a netting close from a
+        strategy close, a defensive or surplus correction from the rest), so
+        a fill carries it only when the venue named the close's order as the
+        fill's: the close whose order id is ``order_id``. A fill a close in
+        flight takes before its order id is known carries none; it gets the
+        id once the answer proves the close's order is the fill's
+        (:meth:`_release_held_claims`).
+
+        :return: The close's ``coid``; ``None`` when no close of the run whose
+            order is ``order_id`` was sent under one.
+        """
+        record = self._own_close_of_order(order_id, position_id)
+        return record.coid if record is not None else None
+
+    def _released_claim_coid(
+            self, record: _OwnClose, claim: _ClaimedFill, current: str | None, *,
+            judged: bool,
+    ) -> str | None:
+        """The client order id the event of a released held fill carries.
+
+        A fill held for a close in flight is delivered with the id of the
+        close the answer proves its order to be: ``record``'s own when the
+        venue named the fill's order as the close's, another close of the
+        run's when that one's order filled it, none when no close of the run
+        did. A release whose close outcome stays unknown (no order id) proves
+        nothing, so the event keeps what the push gave it
+        (:meth:`_own_close_fill_coid`), as does a venue close.
+
+        :param current: The id the held event carries.
+        :param judged: Whether the close's answer (or refusal) judged the
+            claims.
+        """
+        if not judged or claim.venue:
+            return current
+        if record.order_id is not None and claim.order_id == record.order_id:
+            return record.coid
+        other = self._own_close_of_order(claim.order_id, record.position_id)
+        return other.coid if other is not None else None
 
     def _own_close_wildcard(self, position_id: int) -> _OwnClose | None:
         """A close of this run on the position whose order id is not known yet."""
@@ -3559,8 +4095,10 @@ class _ProtectionMixin(_CTraderBase, ABC):
             :attr:`_ShareReplay.taken` their sum. Empty when nothing was left
             to judge (the deals were judged earlier, or the position's
             external close was reported already). ``None`` when an order
-            lookup failed for now: nothing was judged, and ``settle`` is not
-            called.
+            lookup failed for now, or when a close of the bot's share the
+            verdict would deliver has no price in the history yet
+            (:class:`_UnpricedCloseDeferred`): nothing was judged, and
+            ``settle`` is not called.
         """
         if position_id in self._external_close_reported:
             return self._settle_close_judgment(_ShareReplay(), settle)
@@ -3581,13 +4119,24 @@ class _ProtectionMixin(_CTraderBase, ABC):
                     return None
                 by_order[deal.order_id] = origin
             origins[deal.deal_id] = origin
-        with self._judgment_span():
-            replay = self._apply_close_judgment(
-                position_id, deals, pending, origins, from_entry=from_entry,
-                venue_now=venue_now, share_now=share_now, counted=counted,
-                own_orders=own_orders)
-            if settle is not None:
-                settle(replay)
+        try:
+            with self._judgment_span():
+                replay = self._apply_close_judgment(
+                    position_id, deals, pending, origins, from_entry=from_entry,
+                    venue_now=venue_now, share_now=share_now, counted=counted,
+                    own_orders=own_orders)
+                unpriced = sorted(deal.deal_id for deal, _cents in replay.booked
+                                  if deal.price <= 0.0
+                                  and deal.deal_id not in self._seen_deal_ids)
+                if unpriced:
+                    raise _UnpricedCloseDeferred(unpriced)
+                if settle is not None:
+                    settle(replay)
+        except _UnpricedCloseDeferred as deferred:
+            logger.warning(
+                "cTrader: closes of the bot's share on position %d lack a price in the "
+                "deal history (%s); judged once they are priced", position_id, deferred.deal_ids)
+            return None
         return replay
 
     @contextmanager
@@ -3625,6 +4174,193 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 settle(replay)
         return replay
 
+    def _journal_fill_delivery(self, events: Iterable[OrderEvent]) -> None:
+        """Record fills whose journal write lands in the current transaction, until the engine takes them.
+
+        Called in the transaction of the journal write that puts each fill into
+        the position a restart starts from (a raised fill cursor, a debit, a
+        retirement), so a record exists exactly when that write does
+        (:data:`_FILL_DELIVERY_EVENT`). A fill the engine takes gets its
+        receipt, and :meth:`_settle_deliveries` drops the record then; a later
+        process finds the records of the fills still without one
+        (:meth:`_take_inherited_deliveries`). Only a fill the engine gives a
+        receipt counts: one with a fill id, a quantity and a price.
+
+        :param events: The fill events about to be delivered.
+        """
+        store = self.store_ctx
+        if store is None:
+            return
+        self._inherited_delivery_keys()
+        values = {
+            f'fill:{event.fill_id}': _delivery_payload(event)
+            for event in events
+            if (event.fill_id and event.event_type in ('filled', 'partial')
+                and (event.fill_qty or 0.0) > 0.0 and (event.fill_price or 0.0) > 0.0)}
+        if values:
+            store.replace_keyed_events(_FILL_DELIVERY_EVENT, values)
+
+    def _forget_fill_delivery(self, fill_ids: Iterable[str]) -> None:
+        """Drop the delivery records of fills that will not be delivered after all.
+
+        :param fill_ids: Fills whose journal write was given back, so the
+            position a restart starts from does not hold them.
+        """
+        removed = [f'fill:{fill_id}' for fill_id in fill_ids]
+        if removed and self.store_ctx is not None:
+            self.store_ctx.replace_keyed_events(_FILL_DELIVERY_EVENT, {}, removed)
+
+    def _journal_fee_delivery(self, event: OrderEvent) -> None:
+        """Record a commission delivered without its fill, until the engine accounted it.
+
+        Called in the transaction that takes the commission off the journal's
+        unbooked commission, so it is delivered from the record, or charged by
+        a recovery from the journal, never both (:data:`_FEE_DELIVERY_EVENT`).
+
+        :param event: The fee event (``event_type`` ``'fee'``): its ``fee`` is
+            the fill's whole commission.
+        """
+        if self.store_ctx is not None and event.fill_id:
+            self._inherited_delivery_keys()
+            self.store_ctx.replace_keyed_events(
+                _FEE_DELIVERY_EVENT, {f'fee:{event.fill_id}': _delivery_payload(event)})
+
+    def _inherited_delivery_keys(self) -> set[str]:
+        """The keys of the delivery records earlier processes of the run left.
+
+        Read once, before this process writes a record of its own
+        (:meth:`_journal_fill_delivery`, :meth:`_journal_fee_delivery`) or
+        first starts its event stream, whichever comes first: every record
+        found then was written by an earlier process.
+        """
+        keys = self._inherited_deliveries
+        if keys is None:
+            keys = set()
+            if self.store_ctx is not None:
+                keys.update(self.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT))
+                keys.update(self.store_ctx.keyed_events_for_run_id(_FEE_DELIVERY_EVENT))
+            self._inherited_deliveries = keys
+        return keys
+
+    def _fee_accounted(self, event: OrderEvent) -> bool:
+        """Whether the engine's receipt of a fee event's fill accounts its whole commission."""
+        assert self.store_ctx is not None and event.fill_id is not None
+        receipt = self.store_ctx.fill_receipt(event.fill_id)
+        return (receipt is not None
+                and abs(receipt.fee - event.fee) <= 1e-9 * max(1.0, abs(event.fee)))
+
+    def _take_inherited_deliveries(self) -> list[OrderEvent]:
+        """The fills and commissions earlier processes of the run delivered and the engine never took.
+
+        Taken once per process, when the event stream first starts, and only
+        the records an earlier process wrote (:meth:`_inherited_delivery_keys`):
+        never set the mark on a fill this process journaled. A fill record
+        whose fill the engine took
+        (:meth:`~pynecore.core.broker.storage.RunContext.fill_delivered`) is
+        dropped; any other fill is delivered again marked
+        :attr:`~OrderEvent.journaled_before_restart`:
+        its journal write put it into the position this process started with,
+        so the engine records its receipt and books nothing, and the record is
+        dropped once the receipt shows (:meth:`_settle_deliveries`). A
+        commission record is dropped once the receipt accounts the whole
+        commission, and delivered again otherwise: the engine books only what
+        it has not accounted yet.
+
+        :return: The events to deliver first, in the order they were recorded.
+        """
+        store = self.store_ctx
+        if store is None or self._deliveries_inherited:
+            return []
+        self._deliveries_inherited = True
+        inherited = self._inherited_delivery_keys()
+        events: list[OrderEvent] = []
+        taken: list[str] = []
+        for key, payload in store.keyed_events_for_run_id(_FILL_DELIVERY_EVENT).items():
+            if key not in inherited:
+                continue
+            event = _delivered_event(payload)
+            if event is None or store.fill_delivered(cast(str, event.fill_id)):
+                taken.append(key)
+            else:
+                events.append(replace(self._with_proven_close_coid(event),
+                                      journaled_before_restart=True))
+        if taken:
+            store.replace_keyed_events(_FILL_DELIVERY_EVENT, {}, taken)
+        accounted: list[str] = []
+        for key, payload in store.keyed_events_for_run_id(_FEE_DELIVERY_EVENT).items():
+            if key not in inherited:
+                continue
+            event = _delivered_event(payload)
+            if event is None or self._fee_accounted(event):
+                accounted.append(key)
+            else:
+                events.append(event)
+        if accounted:
+            store.replace_keyed_events(_FEE_DELIVERY_EVENT, {}, accounted)
+        return events
+
+    def _with_proven_close_coid(self, event: OrderEvent) -> OrderEvent:
+        """An inherited close fill with the client order id its order proves.
+
+        A fill held for a close in flight is journaled without an id; the
+        close's answer journals the close's order id before the release
+        rewrites the fill's delivery record with the id
+        (:meth:`_release_held_claims`). A process that stopped between the two
+        left the record without it, though the journal proves whose fill it
+        is: the run's close whose order the venue named as the fill's order
+        (order ids are unique on the account), as on the push path
+        (:meth:`_own_close_fill_coid`).
+
+        :param event: A fill event read back from its delivery record.
+        :return: The event, carrying the proven id when it had none.
+        """
+        if event.leg_type is not LegType.CLOSE or event.order.client_order_id is not None:
+            return event
+        try:
+            order_id = int(event.order.id)
+        except ValueError:
+            return event
+        self._load_close_evidence()
+        coid = next((record.coid for record in self._own_close_history
+                     if order_id and record.order_id == order_id), None)
+        if coid is None:
+            return event
+        return replace(event, order=replace(event.order, client_order_id=coid))
+
+    def _settle_deliveries(self) -> list[OrderEvent]:
+        """Drop the delivery records the engine settled; the commissions to deliver again.
+
+        A fill record goes once the engine's receipt shows the fill taken. A
+        commission record goes once the receipt accounts the whole commission.
+        One the engine refused because it held the fill for the venue's verdict
+        is delivered again once, after the fill was taken
+        (:attr:`~_CTraderBase._fees_resent`); a commission no trade could
+        take waits for the next process.
+
+        :return: The fee events to deliver again.
+        """
+        store = self.store_ctx
+        if store is None:
+            return []
+        taken = [key for key, payload in store.keyed_events_for_run_id(_FILL_DELIVERY_EVENT).items()
+                 if (event := _delivered_event(payload)) is None
+                 or store.fill_delivered(cast(str, event.fill_id))]
+        if taken:
+            store.replace_keyed_events(_FILL_DELIVERY_EVENT, {}, taken)
+        accounted: list[str] = []
+        again: list[OrderEvent] = []
+        for key, payload in store.keyed_events_for_run_id(_FEE_DELIVERY_EVENT).items():
+            event = _delivered_event(payload)
+            if event is None or self._fee_accounted(event):
+                accounted.append(key)
+            elif (store.fill_delivered(cast(str, event.fill_id))
+                  and event.fill_id not in self._fees_resent):
+                self._fees_resent.add(cast(str, event.fill_id))
+                again.append(event)
+        if accounted:
+            store.replace_keyed_events(_FEE_DELIVERY_EVENT, {}, accounted)
+        return again
+
     def _apply_close_judgment(
             self, position_id: int, deals: Sequence[_PositionDeal],
             pending: Sequence[_PositionDeal], origins: Mapping[int, CloseOrigin], *,
@@ -3652,7 +4388,9 @@ class _ProtectionMixin(_CTraderBase, ABC):
                 own_opening=lambda deal: (deal.order_id in own_orders
                                           or self._is_own_entry_order(deal.order_id)),
                 seen=self._seen_deal_ids | set(counted), venue_now=raw_volume(venue_now),
-                share_now=raw_volume(share))
+                share_now=raw_volume(share),
+                share_low_now=raw_volume(max(
+                    0.0, share - self._own_close_missing_from(position_id, deals))))
         accepted_until = self._resume_accepted_until.get(position_id, 0)
         if accepted_until:
             # An operator resume accepted the closes executed before it, as

@@ -67,17 +67,18 @@ from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
 from pynecore.core.broker.parked_dispatch import ParkedOutcome, ParkedVerdict
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
+    EXTRAS_KEY_REJECTED_ON_ABSENCE,
     PENDING_DISPATCH_STATES,
     find_pending_dispatch,
 )
 from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
 
 from ._base import _UNKNOWN_DISPATCH_TTL_S
-from .helpers import REQUEST_TIMEOUT, parse_protocol_id, volume_to_units
+from .helpers import REQUEST_TIMEOUT, parse_protocol_id, reported_executed, volume_to_units
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
-from .protection import _PositionDeal, _accepted_by_resume
-from .reconcile import _SINCE_ANCHOR_SKEW_MS, _ReconcileMixin
+from .protection import _VOLUME_TOL, _PositionDeal, _accepted_by_resume
+from .reconcile import _SINCE_ANCHOR_SKEW_MS, _VANISHED_CLOSE_EVENT, _ReconcileMixin
 from .wire import CTraderWireError
 
 logger = logging.getLogger(__name__)
@@ -385,8 +386,13 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         # expiry — retire it. A terminal status with positive ``executedVolume``
         # is a LIMIT/STOP that partially filled before the residual was cancelled
         # / expired: that fill is a live (possibly closed) position, so it must be
-        # classified through the deal bridge below, never zero-filled away.
-        if order.orderStatus in _TERMINAL_ORDER_STATUSES and not order.executedVolume:
+        # classified through the deal bridge below, never zero-filled away. A
+        # reported zero the row's journal contradicts (a fill its cursor counts,
+        # or the ``executed_cents`` floor of an earlier read that saw the order
+        # execute) is no proof either (:meth:`~_CTraderBase._execution_evidence`).
+        terminal = order.orderStatus in _TERMINAL_ORDER_STATUSES
+        if terminal and self._execution_evidence(
+                row, reported=reported_executed(order)).proven_unexecuted:
             self._retire_recovered_terminal(row, order)
             return False
         # ACCEPTED / FILLED (or a partially-filled terminal) — the order landed.
@@ -395,6 +401,21 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         # during the gap, retire the row (``confirmed`` != live exposure; the
         # engine adoption owns the size).
         bridge = await self._find_fill_deal(order.orderId, from_ms)
+        if terminal and not order.executedVolume and not bridge.filled_cents:
+            # A terminal order that does not report its executed volume (or
+            # reports a zero its floor contradicts) proves nothing about
+            # execution, and a deal history that lists no fill
+            # of it yet may only lag the order's status. The row stays pending
+            # with its refs: the reconcile pass judges the vanished order once
+            # its grace has passed, from a fresh read of its whole window and
+            # the order's own details (:meth:`~_ReconcileMixin._vanished_order_verdict`).
+            self._record_recovered_refs(
+                row, order_id=order.orderId, position_id=order.positionId or None,
+                submitted_at_ms=(order.utcLastUpdateTimestamp
+                                 or int(epoch_time() * 1000)),
+                executed_cents=0,
+            )
+            return False
         position_id = (order.positionId
                        or (bridge.deal.positionId if bridge.deal else 0)
                        or None)
@@ -720,15 +741,22 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                         found = await self._find_order_by_coid(
                             coid, self._recovery_lower_bound_ms(row))
                         if found.order is None:
-                            return ParkedVerdict(ParkedOutcome.ABSENT if found.conclusive
-                                                 else ParkedOutcome.INCONCLUSIVE)
+                            return ParkedVerdict(
+                                ParkedOutcome.ABSENT
+                                if found.conclusive and not self._absence_disproved(row)
+                                else ParkedOutcome.INCONCLUSIVE)
                         order = found.order
             except Exception as exc:  # noqa: BLE001 - read failure is inconclusive evidence
                 logger.warning(
                     "cTrader parked dispatch lookup for coid %s failed: %s", coid, exc)
                 return ParkedVerdict(ParkedOutcome.INCONCLUSIVE)
             status = OpenApiModelMessages.ProtoOAOrderStatus.Name(order.orderStatus)
-            if order.orderStatus in _TERMINAL_ORDER_STATUSES and not order.executedVolume:
+            # Refused only on the venue's word that nothing executed; a terminal
+            # order without its executed volume lands with its refs, and the
+            # reconcile pass ends its row from the order's deal history.
+            if (order.orderStatus in _TERMINAL_ORDER_STATUSES
+                    and self._execution_evidence(
+                        row, reported=reported_executed(order)).proven_unexecuted):
                 return ParkedVerdict(
                     ParkedOutcome.REFUSED, order_id=str(order.orderId), status=status)
             # Only an earlier process's send can have filled before the
@@ -928,8 +956,20 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         absence, not proven non-delivery — the strategy re-derives exposure from
         the adopted net broker state) only after a minutes-scale TTL, so a
         merely-slow history-indexing window never abandons a row that did land.
+        The ``rejected`` row is flagged as rejected on an absence
+        (:data:`~pynecore.core.broker.store_helpers.EXTRAS_KEY_REJECTED_ON_ABSENCE`),
+        as the core's parked-dispatch resolver flags its own, so no reader
+        takes it for a venue refusal
+        (:func:`~pynecore.core.broker.store_helpers.is_proven_refusal`). A row
+        whose venue order an earlier read identified, or whose journal holds
+        execution (:meth:`~_CTraderBase._execution_evidence`), is never
+        abandoned on the coid's absence.
         """
         if self.store_ctx is None:
+            return
+        if self._absence_disproved(row):
+            # The row stays pending with its refs, and the reconcile pass
+            # judges it from the order's own deals and status.
             return
         age_s = epoch_time() - (row.created_ts_ms / 1000.0)
         if age_s < _ABANDON_TTL_S:
@@ -948,9 +988,25 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                 audit_event='recovered_abandoned_unknown',
                 close_row=True,
                 audit_payload={'age_s': round(age_s, 1), 'state': row.state},
+                extras_patch={EXTRAS_KEY_REJECTED_ON_ABSENCE: True},
             ),
         )
         self._clear_intent_anchor(row)
+
+    def _absence_disproved(self, row) -> bool:
+        """Whether the journal disproves a coid's absence from the venue's history.
+
+        An earlier read identified the row's venue order (its ``order_id``
+        ref), or the journal holds execution of it
+        (:meth:`~_CTraderBase._execution_evidence`): the order reached the
+        venue, so a complete order-history read without the coid proves
+        nothing about it. Every absence-based retirement of a row asks this
+        first: the startup TTL abandon (:meth:`_maybe_abandon_unknown`) and
+        the runtime parked lookup (:meth:`_resolve_parked_dispatches`), which
+        then answers inconclusive instead of absent.
+        """
+        return ((row.extras or {}).get('order_id') is not None
+                or self._execution_evidence(row, reported=None).executed > _VOLUME_TOL)
 
     def _clear_intent_anchor(self, row) -> None:
         """Delete the envelope + parked verifications of a terminally-retired row.
@@ -1195,27 +1251,74 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             # ``_reconcile_snapshot`` deal-history bridge can promote it, so
             # leave it pending for that evidence-gated resolution.
             return False
+        judged_before: list[_PositionDeal] = []
         if position_id is not None and order_id is not None:
             if _accepted_by_resume(row):
                 self._note_accepted_by_resume(
                     parse_protocol_id(position_id, field='position_id'),
                     client_order_id=row.client_order_id, volume=None)
             elif not await self._judge_orphan_close(row, order_id, position_id):
-                return False
-        self.store_ctx.log_event(
-            'startup_orphan_retired', client_order_id=row.client_order_id,
-            exchange_order_id=ref,
-            payload={'state': row.state, 'order_id': order_id,
-                     'position_id': position_id},
-        )
-        self.store_ctx.close_order(row.client_order_id)
-        # The envelope anchor survives ``close_order``; without this delete
-        # the next dispatch of the same Pine intent reuses the stale
-        # ``bar_ts_ms`` and regenerates the SAME coid onto the just-closed
-        # row, hiding the fresh entry from ``iter_live_orders``.
-        if row.intent_key:
-            self.store_ctx.record_complete(row.intent_key)
+                judged_before = self._closes_judged_before_restart(
+                    row, parse_protocol_id(position_id, field='position_id'))
+                if not judged_before:
+                    return False
+        with self.store_ctx.transaction():
+            self.store_ctx.log_event(
+                'startup_orphan_retired', client_order_id=row.client_order_id,
+                exchange_order_id=ref,
+                payload={'state': row.state, 'order_id': order_id,
+                         'position_id': position_id,
+                         'judged_before_restart': [deal.deal_id for deal in judged_before]},
+            )
+            self.store_ctx.close_order(row.client_order_id)
+            # The envelope anchor survives ``close_order``; without this delete
+            # the next dispatch of the same Pine intent reuses the stale
+            # ``bar_ts_ms`` and regenerates the SAME coid onto the just-closed
+            # row, hiding the fresh entry from ``iter_live_orders``.
+            if row.intent_key:
+                self.store_ctx.record_complete(row.intent_key)
+            if position_id is not None and not self._position_live_coids(str(position_id)):
+                # The rows an earlier judgment of the vanished position named
+                # are retired: no judgment delivers its close fills any more.
+                self.store_ctx.replace_keyed_events(
+                    _VANISHED_CLOSE_EVENT, {}, [f'position:{position_id}'])
+        self._seen_deal_ids.update(deal.deal_id for deal in judged_before)
         return True
+
+    def _closes_judged_before_restart(self, row, position_id: int) -> list[_PositionDeal]:
+        """The closes an earlier process judged for a vanished row, when they explain its position.
+
+        A judgment of the row's vanished position journals the close fills it
+        found with the position's live rows (:data:`_VANISHED_CLOSE_EVENT`);
+        the process may stop before the disappearance tracker applies the
+        verdict. Those deals were read from the venue's deal history and
+        judged then, and a position that is gone takes no deal after it, so
+        when they took the whole exposure the journal still holds on the
+        position, they explain the row's disappearance without a new read:
+        the startup recovery retires it before the engine compares the venue
+        with the journal. The engine's startup adoption owns the position
+        size, as for every startup orphan.
+
+        :param row: The vanished row.
+        :param position_id: Its position, absent from the startup snapshot.
+        :return: The judged closing deals; empty when no judgment named the
+            row or its closes do not take the whole exposure.
+        """
+        assert self.store_ctx is not None
+        closes = self._undelivered_vanished_closes(position_id, row.client_order_id)
+        if not closes:
+            return []
+        on_position = set(self._position_live_coids(str(position_id)))
+        exposure = sum(
+            self._row_exposure(live) for live in self.store_ctx.iter_live_orders()
+            if live.client_order_id in on_position)
+        if volume_to_units(sum(cents for _deal, cents, _label in closes)) < exposure - _VOLUME_TOL:
+            return []
+        logger.info(
+            "cTrader startup: row %s of vanished position %d is retired from the closes "
+            "%s an earlier process judged", row.client_order_id, position_id,
+            [deal.deal_id for deal, _cents, _label in closes])
+        return [deal for deal, _cents, _label in closes]
 
     async def _judge_orphan_close(self, row, order_id, position_id) -> bool:
         """Judge who closed an orphan's position, from its deal history.

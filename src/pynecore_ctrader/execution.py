@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, NoReturn, cast
 
 from pynecore.core.broker.exceptions import (
     BracketAttachAfterFillRejectedError,
+    BrokerError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
     ExchangeRateLimitError,
@@ -60,11 +61,14 @@ from pynecore.core.broker.one_way_emulator import close_leg_row_client_order_id
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
+    LEDGER_ROW_STATES,
+    STATE_REJECTED,
     create_entry_order_row,
     mark_disposition_unknown,
     mark_rejected,
 )
 from pynecore.core.plugin import override
+from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
 
 from .exceptions import (
     CTraderBrokerError,
@@ -74,9 +78,11 @@ from .exceptions import (
     map_protocol_error,
 )
 from .helpers import (
+    ExecutionEvidence,
     parse_protocol_id,
     quantize_volume,
     raw_volume,
+    reported_executed,
     round_price,
     volume_to_units,
 )
@@ -84,7 +90,10 @@ from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .models import _SymbolRules
 from .protection import (
+    _CLOSE_ROW_STATE,
+    _FILLED_THEN_CLOSED_EVENT,
     _OWN_ORDER_TERMS_EXTRA,
+    _VOLUME_TOL,
     _AnswerFill,
     _ProtectionMixin,
     _nothing_to_amend,
@@ -96,10 +105,12 @@ from .wire import (
     CTraderProtocolError,
     CTraderRequestSentConnectionError,
     CTraderTimeoutError,
+    CTraderWireError,
 )
 
 if TYPE_CHECKING:
     from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
+    from pynecore.core.broker.storage import OrderRow
 
 _SIDE_TO_TRADE_SIDE = {
     'buy': OpenApiModelMessages.ProtoOATradeSide.BUY,
@@ -317,8 +328,12 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                 raise mapped from cause
             self._surface_correlated_fill(message)
             return message
-        raise ExchangeOrderRejectedError(
-            f"cTrader {context}: unexpected response {type(message).__name__}"
+        # The request was written and the answer is no verdict on it: the
+        # venue may hold the order.
+        raise OrderDispositionUnknownError(
+            f"cTrader {context}: unexpected response {type(message).__name__}; "
+            f"disposition unknown",
+            client_order_id=coid, predecessor_cancel_ids=predecessor_cancel_ids,
         )
 
     def _surface_correlated_fill(self, message: OpenApiMessages.ProtoOAExecutionEvent) -> None:
@@ -1110,7 +1125,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
 
     async def _send_own_close(
             self, req: OpenApiMessages.ProtoOAClosePositionReq, *,
-            coid: str, context: str,
+            coid: str, context: str, row: tuple[str, str] | None = None,
     ) -> OpenApiMessages.ProtoOAExecutionEvent:
         """Send one position close, recording it as this run's own close.
 
@@ -1122,9 +1137,15 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         nothing was executed. Any other failure — a timeout, a drop after the
         write, an unexpected response, a cancellation — may have executed the
         close: its outcome is unknown.
+
+        :param row: ``(symbol, side)`` of the close's journal row, written with
+            the record before the request (:meth:`_open_own_close`); the record
+            ends it once its outcome is proven.
+        :raises JournalWriteError: When the record could not be journalled:
+            the close was not sent.
         """
         record = self._open_own_close(req.positionId, volume_to_units(req.volume),
-                                      coid=coid, volume_cents=req.volume)
+                                      coid=coid, volume_cents=req.volume, row=row)
         try:
             event = await self._dispatch_order(req, coid=coid, context=context)
         except BaseException as exc:
@@ -1369,6 +1390,21 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         same non-halting treatment with its own reason — the position may
         still hold size, so the engine re-evaluates against the next
         snapshot instead of retiring the close.
+
+        The close is journalled persist-first: a row under its client order id
+        (:data:`~pynecore_ctrader.protection._CLOSE_ROW_STATE`) is written with
+        its own-close record before the request goes out, and ends with what
+        the evidence proves — ``confirmed`` with a ``confirmed`` event once the
+        close's own fills cover its whole volume or its order's final status
+        shows it executed, ``rejected`` once the
+        venue refused it, the core's ended-unfilled or ended-partially mark
+        once the venue ended the order with nothing or only part of it
+        executed, closed without any of them when nothing ever will show
+        whether it executed. That row is what the engine settles a held
+        partial-bracket close from after an unknown outcome or a restart. A
+        failed persist-first write raises
+        :class:`~pynecore.core.broker.exceptions.JournalWriteError` with
+        nothing sent and no row left.
         """
         intent = envelope.intent
         assert isinstance(intent, CloseIntent)
@@ -1392,7 +1428,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                     ctidTraderAccountId=self._live_account_id,
                     positionId=position_id, volume=volume,
                 ),
-                coid=coid, context="close",
+                coid=coid, context="close", row=(intent.symbol, intent.side),
             )
         except ExchangeOrderRejectedError as exc:
             # The position closed between the lookup and the close landing
@@ -1460,9 +1496,18 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         leave the old broker-side bracket live to close the position later
         against Pine's state.
 
-        Idempotent: a missing live row, no open position, or a ``*_NOT_FOUND``
-        from the exchange (already filled / cancelled) is a benign no-op
-        returning ``True``.
+        Idempotent: a missing live row or no open position is a benign no-op
+        returning ``True``. ``True`` lets the core tear the entry's tracking
+        down, so an entry cancel answered as cancelled, or with ``*_NOT_FOUND``
+        (already filled / cancelled; the order's final status then supplies
+        its executed volume), returns it only once
+        :meth:`~_CTraderBase._execution_evidence` has the venue's word on the
+        order's final executed volume and shows all of it booked (or proves
+        none): an execution the journal has not booked yet, or a final volume
+        the venue did not name, returns ``False`` (still pending), and the
+        core asks again once the event that carries it was booked or the
+        reconcile pass ended the row. Any other answer (filled, partly
+        filled) is no landed cancel and returns ``False`` too.
         """
         intent = envelope.intent
         assert isinstance(intent, CancelIntent)
@@ -1476,6 +1521,8 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         order_id = self._find_working_order_id(intent.pine_id)
         if order_id is None:
             return True
+        row = (self.store_ctx.find_by_ref('order_id', str(order_id))
+               if self.store_ctx is not None else None)
         try:
             event = await self._dispatch_order(
                 OpenApiMessages.ProtoOACancelOrderReq(
@@ -1486,7 +1533,19 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         except ExchangeOrderRejectedError as exc:
             if isinstance(exc.__cause__, CTraderProtocolError) and is_not_found(
                     exc.__cause__.error_code):
-                return True
+                # The order is gone, but the answer names nothing it
+                # executed: the order's final status supplies the venue's
+                # word, and the journal must have booked all of it.
+                if row is None or self.store_ctx is None:
+                    return True
+                ended = await self._ended_close_order(order_id)
+                fresh = self.store_ctx.get_order(row.client_order_id)
+                return not self._execution_evidence(
+                    fresh if fresh is not None else row,
+                    reported=(volume_to_units(ended[1])
+                              if ended is not None and ended[1] is not None else None),
+                    cursor=row.filled_qty,
+                ).awaits_execution
             raise
         # ``ORDER_CANCEL_REJECTED`` (a cancel/modify race where the working
         # order was not cancelled) is reported as a non-error execution event,
@@ -1498,9 +1557,20 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                 == OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCEL_REJECTED):
             return False
         if event.executionType == OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED:
-            self._retire_cancelled_working_order(order_id)
+            evidence = await self._cancelled_answer_evidence(order_id, event, row)
+            self._retire_cancelled_working_order(
+                order_id, executed=reported_executed(event.order))
             self._surface_correlated_cancel(event)
-        return True
+            # ``True`` lets the core tear the entry's tracking down; an
+            # execution the journal has not booked yet, or one nothing rules
+            # out, keeps it (``False``) until the event that carries it is
+            # booked (:attr:`~pynecore_ctrader.helpers.ExecutionEvidence.awaits_execution`).
+            return not evidence.awaits_execution
+        # Any other answer (the order filled, partly filled, or changed) is no
+        # landed cancel: a fill it carries was only queued for the event
+        # stream (:meth:`_surface_correlated_fill`), and the entry's tracking
+        # must still route it. The core asks again once the order ended.
+        return False
 
     async def _clear_exit_bracket(
             self, intent: CancelIntent, envelope: DispatchEnvelope,
@@ -1535,12 +1605,28 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         dispositions that the bool-only :meth:`execute_cancel` cannot, so this
         override drives the sync engine's cancel-tentative state machine
         precisely.
+
+        The cancel aims at the entry's latest order (:meth:`_cancel_target_row`).
+        Only one the journal still holds working — a live row with its venue
+        order id and volume left unfilled — is sent a cancel. Its answer
+        decides: cancelled with nothing executed, executed (filled, or its rest
+        cancelled after the answer or the journal shows part of it executed),
+        or, on a venue that no longer knows the
+        order, the journal verdict of an ended order. Any
+        other target, a probe after a restart included, is answered from the
+        journal and the venue's positions alone
+        (:meth:`_ended_order_cancel_outcome`), never by a guess.
         """
         intent = envelope.intent
         assert isinstance(intent, CancelIntent)
-        order_id = self._find_working_order_id(intent.pine_id)
-        if order_id is None:
+        target = self._cancel_target_row(intent.pine_id)
+        if target is None:
             return CancelDispositionOutcome.UNKNOWN
+        order_id_raw = (target.extras or {}).get('order_id')
+        if (target.closed_ts_ms is not None or order_id_raw is None
+                or target.filled_qty >= target.qty - _VOLUME_TOL):
+            return await self._ended_order_cancel_outcome(target)
+        order_id = parse_protocol_id(order_id_raw, field='order_id')
         try:
             event = await self._dispatch_order(
                 OpenApiMessages.ProtoOACancelOrderReq(
@@ -1551,15 +1637,29 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         except ExchangeOrderRejectedError as exc:
             cause = exc.__cause__
             if isinstance(cause, CTraderProtocolError) and is_not_found(cause.error_code):
-                # Order is gone, but the event channel will reveal whether it
-                # filled or cancelled — keep the tentative armed.
-                return CancelDispositionOutcome.UNKNOWN
+                # The order is gone: only what the journal and the venue's
+                # positions prove decides; anything else keeps the tentative
+                # armed until the event channel or a reconcile pass shows it.
+                return await self._ended_order_cancel_outcome(target)
             raise
         exec_type = event.executionType
         if exec_type == OpenApiModelMessages.ProtoOAExecutionType.ORDER_CANCELLED:
-            self._retire_cancelled_working_order(order_id)
+            # A confirmed cancel is one that executed nothing: the core then
+            # drops the entry's protection. Execution the answer or the journal
+            # proves keeps the parent (its executed part is an open position
+            # to protect). An answer without the executed volume is completed
+            # from the order's final status; one that proves neither leaves
+            # the probe to ask again (the venue no longer knowing the order
+            # hands it to the journal and position verdict).
+            evidence = await self._cancelled_answer_evidence(order_id, event, target)
+            if not evidence.known and evidence.executed <= _VOLUME_TOL:
+                return CancelDispositionOutcome.UNKNOWN
+            self._retire_cancelled_working_order(
+                order_id, executed=reported_executed(event.order))
             self._surface_correlated_cancel(event)
-            return CancelDispositionOutcome.CANCEL_CONFIRMED
+            if evidence.proven_unexecuted:
+                return CancelDispositionOutcome.CANCEL_CONFIRMED
+            return CancelDispositionOutcome.ALREADY_FILLED
         if exec_type == OpenApiModelMessages.ProtoOAExecutionType.ORDER_FILLED:
             return CancelDispositionOutcome.ALREADY_FILLED
         # ``ORDER_CANCEL_REJECTED`` says only that the cancel request was
@@ -1572,6 +1672,179 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         # so the cancel-tentative stays armed and a later fill / cancel signal
         # resolves the disposition.
         return CancelDispositionOutcome.UNKNOWN
+
+    async def _cancelled_answer_evidence(
+            self, order_id: int, event: OpenApiMessages.ProtoOAExecutionEvent,
+            row: 'OrderRow | None',
+    ) -> ExecutionEvidence:
+        """The execution an ``ORDER_CANCELLED`` answer to a cancel proves.
+
+        An answer without the order's executed volume is completed from the
+        order's final status (the cancel event the stream delivers then
+        carries it too). The journal is read as it stands after the awaits: a
+        fill the stream booked while the cancel was in flight counts as
+        execution, and so does the executed volume the venue reported
+        earlier (:meth:`~_CTraderBase._execution_evidence`).
+
+        :param order_id: The cancelled order.
+        :param event: The cancel's answer.
+        :param row: The order's journal row as read before the cancel was
+            sent; ``None`` when no row tracks it.
+        """
+        if not event.order.HasField('executedVolume'):
+            ended = await self._ended_close_order(order_id)
+            if ended is not None and ended[1] is not None:
+                event.order.executedVolume = ended[1]
+        fresh = (self.store_ctx.get_order(row.client_order_id)
+                 if self.store_ctx is not None and row is not None else None)
+        return self._execution_evidence(
+            fresh if fresh is not None else row, reported=reported_executed(event.order),
+            cursor=row.filled_qty if row is not None else 0.0)
+
+    def _cancel_target_row(self, pine_id: str) -> 'OrderRow | None':
+        """The journal row of the order a cancel of entry ``pine_id`` aims at.
+
+        The entry's latest order the journal holds working (a live row with its
+        venue order id and volume left unfilled), which the cancel must reach;
+        without one, the entry's most recently created order row across every
+        process of the run: a live row of this process (a restart re-homes the
+        live rows) or a row closed by any process. Rows that hold no entry
+        order of the entry's are left out: the engine's ledger rows, close
+        rows, exit-side rows (``from_entry`` set) and startup-adopted
+        positions.
+
+        :param pine_id: The cancelled entry's Pine id.
+        :return: The row, or ``None`` when the journal holds no order of the
+            entry.
+        """
+        store = self.store_ctx
+        if store is None:
+            return None
+        target: 'OrderRow | None' = None
+        working: 'OrderRow | None' = None
+        for row in [*store.iter_orders_closed_since_for_run_id(0), *store.iter_live_orders()]:
+            if (row.pine_entry_id != pine_id or row.from_entry is not None
+                    or row.state in LEDGER_ROW_STATES or row.state == _CLOSE_ROW_STATE
+                    or (row.extras or {}).get(ADOPTED_STARTUP_EXTRA_KEY)):
+                continue
+            if target is None or row.created_ts_ms >= target.created_ts_ms:
+                target = row
+            if (row.closed_ts_ms is None and (row.extras or {}).get('order_id') is not None
+                    and row.filled_qty < row.qty - _VOLUME_TOL
+                    and (working is None or row.created_ts_ms >= working.created_ts_ms)):
+                working = row
+        return working if working is not None else target
+
+    async def _ended_order_cancel_outcome(self, row: 'OrderRow') -> CancelDispositionOutcome:
+        """The cancel outcome the evidence proves for an entry order no cancel is sent to.
+
+        The one verdict for an order that is not working any more as far as
+        the journal knows, or that the venue no longer knows, whether the
+        process probing it placed the order or a restart re-armed the cancel:
+
+        * filled, and its row closed — the order filled and the position it
+          opened has closed since: the journal closes a filled entry row only
+          once its exposure is gone (:attr:`CancelDispositionOutcome.FILLED_AND_CLOSED`).
+          So does a row a reconcile pass or the startup recovery retired as
+          filled then closed while the stream was down
+          (:meth:`_filled_then_closed_on_record`), whose fill cursor the
+          retirement leaves as it was;
+        * filled, row live — :meth:`_filled_entry_outcome`;
+        * closed with nothing filled, the venue's end of it journalled (a
+          cancel, or a reject) and no executed volume the venue reported
+          earlier (:meth:`~_CTraderBase._execution_evidence`) — the order
+          ended without a fill (:attr:`CancelDispositionOutcome.CANCEL_CONFIRMED`);
+        * anything else — a live row with nothing filled (still working, or
+          ended in a way no record shows yet, or a send whose outcome is
+          unknown), or a row closed without a recorded end — proves nothing
+          (:attr:`CancelDispositionOutcome.UNKNOWN`).
+
+        :param row: The order's row (:meth:`_cancel_target_row`).
+        """
+        filled = row.filled_qty > _VOLUME_TOL
+        if row.closed_ts_ms is not None:
+            if filled or self._filled_then_closed_on_record(row):
+                return CancelDispositionOutcome.FILLED_AND_CLOSED
+            # The journalled end is the venue's word that nothing executed.
+            if self._execution_evidence(
+                    row, reported=0.0 if self._ended_unfilled_on_record(row) else None,
+            ).proven_unexecuted:
+                return CancelDispositionOutcome.CANCEL_CONFIRMED
+            return CancelDispositionOutcome.UNKNOWN
+        if not filled:
+            return CancelDispositionOutcome.UNKNOWN
+        return await self._filled_entry_outcome(row)
+
+    def _filled_then_closed_on_record(self, row: 'OrderRow') -> bool:
+        """Whether the journal records a row retired as filled then closed.
+
+        The ``reconcile_filled_then_closed_retired`` event under the row's
+        client order id, written with the retirement once the deal history
+        showed the order's fill and the close of the position it opened
+        (:meth:`~pynecore_ctrader.reconcile._ReconcileMixin._retire_filled_then_closed`).
+        """
+        store = self.store_ctx
+        assert store is not None
+        coid = row.client_order_id
+        return any(
+            event_coid == coid
+            for _intent, event_coid, _ref, _payload in store.iter_events_by_kind_for_run_id(
+                _FILLED_THEN_CLOSED_EVENT))
+
+    def _ended_unfilled_on_record(self, row: 'OrderRow') -> bool:
+        """Whether the journal records the venue ending a row's order without a fill.
+
+        A ``cancelled`` event (the venue's cancel of the order, answered or
+        pushed), a ``rejected`` event of a row the venue refused, or the
+        recovery's ``recovered_in_flight_rejected`` (the venue reported the
+        order rejected, cancelled or expired) under the row's client order id.
+        A row closed any other way, an abandoned dispatch whose absence was
+        only inferred among them, proves no end.
+        """
+        store = self.store_ctx
+        assert store is not None
+        coid = row.client_order_id
+        kinds = ['cancelled']
+        if row.state == STATE_REJECTED:
+            kinds += ['rejected', 'recovered_in_flight_rejected']
+        return any(
+            event_coid == coid
+            for kind in kinds
+            for _intent, event_coid, _ref, _payload in store.iter_events_by_kind_for_run_id(kind))
+
+    async def _filled_entry_outcome(self, row: 'OrderRow') -> CancelDispositionOutcome:
+        """The cancel outcome of an entry order that filled while its row is live.
+
+        The position the fill opened must show on the venue for the order to
+        count as filled with its position open
+        (:attr:`CancelDispositionOutcome.ALREADY_FILLED`); a position the
+        snapshot no longer lists closed in a way the journal has not judged
+        yet, which only the reconcile pass decides
+        (:attr:`CancelDispositionOutcome.UNKNOWN`), and so does a row that
+        links no position.
+
+        :param row: The entry order's live row.
+        :raises OrderDispositionUnknownError: When the venue snapshot could not
+            be read: the probe got no answer.
+        """
+        raw = (row.extras or {}).get('position_id')
+        if raw is None:
+            return CancelDispositionOutcome.UNKNOWN
+        position_id = parse_protocol_id(raw, field='position_id')
+        try:
+            snapshot = await self._reconcile()
+        except (BrokerError, CTraderWireError, TimeoutError) as exc:
+            raise OrderDispositionUnknownError(
+                f"cTrader cancel probe of {row.client_order_id}: the positions "
+                f"snapshot could not be read ({exc})",
+                client_order_id=row.client_order_id, cause=exc,
+            ) from exc
+        open_position = any(
+            position.positionId == position_id and position.positionStatus
+            == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
+            for position in snapshot.position)
+        return (CancelDispositionOutcome.ALREADY_FILLED if open_position
+                else CancelDispositionOutcome.UNKNOWN)
 
     # --- modify (atomic amend) --------------------------------------------
 

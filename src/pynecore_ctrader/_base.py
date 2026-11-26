@@ -280,11 +280,35 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: execution events to ``_exec_events`` (consumed by ``watch_orders``).
         self._spot_events: asyncio.Queue | None = None
         self._exec_events: asyncio.Queue | None = None
-        #: Engine events of closing fills an own close took while it was in
-        #: flight, released once it was answered and delivered by
-        #: ``watch_orders`` ahead of the next message. See
-        #: ``_ProtectionMixin._release_held_claims``.
+        #: Engine events delivered by ``watch_orders`` ahead of the event the
+        #: message being translated returns and of the next message: the
+        #: closing fills an own close took while it was in flight, released
+        #: once it was answered (``_ProtectionMixin._release_held_claims``),
+        #: and the fee events a translated fill journaled with it beyond the
+        #: one it returns.
         self._released_close_events: 'deque[OrderEvent]' = deque()
+        #: The fee events the message being translated journaled beyond the
+        #: event it returns; moved to ``_released_close_events`` once its
+        #: journal writes committed.
+        self._fill_fee_events: list[OrderEvent] = []
+        #: Releases of held close fills whose journal writes failed, and the
+        #: ones judged behind them, in the order they were judged, with the
+        #: verdict each was judged by: ``(own close, its claims, cuts)``,
+        #: retried before the stream delivers anything else
+        #: (``_ProtectionMixin._retry_failed_releases``).
+        self._failed_releases: list[tuple[Any, list[Any], list[tuple[Any, float]] | None]] = []
+        #: Whether this process took over the fill and commission delivery
+        #: records earlier processes of the run left
+        #: (``_ProtectionMixin._take_inherited_deliveries``): done once, when
+        #: the event stream first starts.
+        self._deliveries_inherited = False
+        #: Keys of the delivery records earlier processes of the run left, read
+        #: before this process writes one (``_ProtectionMixin._inherited_delivery_keys``).
+        self._inherited_deliveries: set[str] | None = None
+        #: Fill ids whose commission was delivered again once the engine took
+        #: the fill (``_ProtectionMixin._settle_deliveries``): at most once
+        #: per process.
+        self._fees_resent: set[str] = set()
         self._event_router_task: asyncio.Task | None = None
         #: Deal ids already surfaced to ``watch_orders``. A correlated fill the
         #: dispatch path re-injects (``send_request`` consumes the wire copy) and
@@ -366,6 +390,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self._close_evidence_store: 'RunContext | None' = None
         #: Closing orders whose failed lookup was already warned about.
         self._close_lookup_warned: set[int] = set()
+        #: Vanished working orders the venue reported as not found, already
+        #: logged as an ERROR while their rows wait for an operator resume.
+        self._vanished_not_found_warned: set[int] = set()
         #: Manual-close reports waiting for the stream to yield their fill
         #: event (or the reconcile pass that recovered them to end), as
         #: ``(reason, context, client_order_id, exchange_order_id, key)``.
@@ -1777,8 +1804,58 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
                 payload={'fifo_head_coid': existing.client_order_id},
             )
 
+    @staticmethod
+    def _executed_floor_cents(row: 'OrderRow') -> int:
+        """The executed volume (cents) the venue already reported for a row's order.
+
+        The row's journalled ``executed_cents`` floor
+        (:meth:`~pynecore_ctrader.recovery._RecoveryMixin._record_recovered_refs`):
+        never lowered and never a fill cursor. The venue's ``executedVolume``
+        never shrinks, so a later read reporting less, or nothing, does not prove
+        the order unexecuted: no zero-fill retirement runs while it is positive.
+
+        :param row: The order's journal row.
+        :return: The floor in cTrader centi-units; ``0`` when none was recorded.
+        """
+        return int((row.extras or {}).get('executed_cents') or 0)
+
+    def _execution_evidence(
+            self, row: 'OrderRow | None', *, reported: float | None, cursor: float = 0.0,
+    ) -> helpers.ExecutionEvidence:
+        """The one verdict on how much of an entry order executed.
+
+        Every path that reports, journals or acts on an entry order having
+        executed nothing (a terminal event's quantity, a cancel disposition, a
+        zero-fill retirement of a row, a refused parked dispatch, a vanished
+        order's cancel verdict) asks this. The order executed at least the
+        largest of: the venue's word (``reported``), the row's fill cursor
+        (and any newer ``cursor`` the caller read), and the executed volume
+        the venue reported for it earlier (:meth:`_executed_floor_cents`).
+        Nothing executed is proven only when the venue's word is part of it and
+        all of them are zero
+        (:attr:`~pynecore_ctrader.helpers.ExecutionEvidence.proven_unexecuted`).
+        The cursor is never moved: what it does not count yet still books when
+        its fill arrives.
+
+        :param row: The order's journal row; ``None`` when no row of the run
+            tracks it.
+        :param reported: The order's executed volume (units) on the venue's
+            own word: a message carrying ``executedVolume``
+            (:func:`~pynecore_ctrader.helpers.reported_executed`), or a
+            complete read of the order's own deals. ``None`` when the evidence
+            at hand does not carry it.
+        :param cursor: A fill cursor the caller read separately (units), such
+            as the row's cursor before an event mutated it.
+        """
+        booked = max(cursor, row.filled_qty) if row is not None else cursor
+        executed = max(reported or 0.0, booked)
+        if row is not None:
+            executed = max(executed, helpers.volume_to_units(self._executed_floor_cents(row)))
+        return helpers.ExecutionEvidence(
+            executed=executed, known=reported is not None, booked=booked)
+
     def _retire_cancelled_working_order(
-            self, order_id: int, *, cancel_reason: str | None = None,
+            self, order_id: int, *, executed: float | None, cancel_reason: str | None = None,
     ) -> None:
         """Close the BrokerStore working-order row of a confirmed cancel.
 
@@ -1794,35 +1871,46 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         A partially filled entry whose unfilled residual is cancelled keeps a
         live position under its row (the fill side is still open exposure that
         later close / reconcile events must reverse-map), so a row carrying fills
-        is left live for the position-close / reconcile path to retire. A missing
+        is left live for the position-close / reconcile path to retire. So is a
+        row whose cancel message shows execution its cursor has not counted yet
+        (the fill push is still on its way), that omits the order's executed
+        volume, or whose :meth:`_executed_floor_cents` an earlier read raised:
+        the row is retired only when :meth:`_execution_evidence` proves the
+        order ended with nothing executed; the reconcile pass judges any other. A missing
         row (persistence off, or already retired by a concurrent reconcile pass)
         is a benign no-op; :meth:`close_order` is itself idempotent, so a later
         duplicate signal cannot double-count.
 
-        Also writes a durable ``'cancelled'`` audit event alongside the close
-        (mirroring the Capital.com confirmed-cancel convention): the generic
+        Also writes a durable ``'cancelled'`` audit event in the close's
+        transaction (mirroring the Capital.com confirmed-cancel convention): the generic
         ``order_closed`` row cannot be told apart from a fill-driven close, so
         without it the durable log carries no cancellation terminal at all for
         a synchronously acknowledged cancel — a run audit sees the cancel
         reach the venue with no local terminal progression.
 
         :param order_id: The broker ``orderId`` of the cancelled working order.
+        :param executed: The order's executed volume (units) the cancel message
+            reports (:func:`~pynecore_ctrader.helpers.reported_executed`);
+            ``None`` when it does not carry one.
         :param cancel_reason: The venue's own cause of the cancel, when it
             named one; recorded on the audit event.
         """
         if self.store_ctx is None or not order_id:
             return
         row = self.store_ctx.find_by_ref('order_id', str(order_id))
-        if row is None or row.filled_qty > 1e-9:
+        if row is None or not self._execution_evidence(row, reported=executed).proven_unexecuted:
             return
-        self.store_ctx.close_order(row.client_order_id)
-        self.store_ctx.log_event(
-            'cancelled',
-            client_order_id=row.client_order_id,
-            exchange_order_id=str(order_id),
-            intent_key=row.intent_key,
-            payload={'cancel_reason': cancel_reason} if cancel_reason is not None else None,
-        )
+        # One transaction: a row closed by a cancel always carries the
+        # ``'cancelled'`` evidence a restarted cancel probe settles it from.
+        with self.store_ctx.transaction():
+            self.store_ctx.close_order(row.client_order_id)
+            self.store_ctx.log_event(
+                'cancelled',
+                client_order_id=row.client_order_id,
+                exchange_order_id=str(order_id),
+                intent_key=row.intent_key,
+                payload={'cancel_reason': cancel_reason} if cancel_reason is not None else None,
+            )
 
     # --- assembled feature surface -----------------------------------------
 
@@ -1853,6 +1941,9 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
     @abstractmethod
     async def _recover_in_flight_submissions(self) -> None: ...
+
+    @abstractmethod
+    async def _ended_close_order(self, order_id: int) -> tuple[int, int | None] | None: ...
 
     @abstractmethod
     async def _resolve_parked_dispatches(self) -> None: ...

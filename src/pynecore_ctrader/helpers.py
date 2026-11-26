@@ -11,6 +11,7 @@ Hosts, ports and the OAuth endpoints are taken from the official Spotware
 constants mirror its ``TcpProtocol`` (``Int32StringReceiver``).
 """
 import os
+from dataclasses import dataclass
 from typing import cast
 
 #: Protobuf API hosts. Demo and live are fully separate systems.
@@ -182,6 +183,53 @@ def volume_to_units(volume: int) -> float:
     :return: The quantity in traded units.
     """
     return volume / VOLUME_SCALE
+
+
+def reported_executed(order) -> float | None:
+    """The executed volume (units) a ``ProtoOAOrder`` reports, ``None`` when it omits it.
+
+    ``executedVolume`` is an optional field: an order message without it says
+    nothing about what executed, so it never stands for zero.
+
+    :param order: The ``ProtoOAOrder``.
+    """
+    return volume_to_units(order.executedVolume) if order.HasField('executedVolume') else None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionEvidence:
+    """What the evidence on record proves an entry order executed.
+
+    Built only by :meth:`~pynecore_ctrader._base._CTraderBase._execution_evidence`,
+    the one place that combines the venue's word with the journal.
+
+    :ivar executed: Units proven executed (traded units); never below the
+        journal's fill cursor or the executed volume the venue reported earlier.
+    :ivar known: The venue's own word on the order's executed volume was part
+        of the evidence (a message carrying ``executedVolume``, or a complete
+        read of the order's own deals).
+    :ivar booked: Units the journal's fill cursor counts (traded units).
+    """
+    executed: float
+    known: bool
+    booked: float
+
+    @property
+    def proven_unexecuted(self) -> bool:
+        """Whether the evidence proves that nothing of the order executed."""
+        return self.known and self.executed < 0.5 / VOLUME_SCALE
+
+    @property
+    def awaits_execution(self) -> bool:
+        """Whether execution the journal has not booked is proven or may exist.
+
+        Execution proven beyond the fill cursor waits for its fill; without
+        the venue's word on the order's final executed volume, more of it may
+        have executed than the journal booked, whatever it booked so far.
+        Either way, nothing that protects the order's execution may be torn
+        down yet.
+        """
+        return not self.known or self.executed >= self.booked + 0.5 / VOLUME_SCALE
 
 
 def round_price(price: float, digits: int) -> float:

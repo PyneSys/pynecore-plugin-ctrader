@@ -3,10 +3,13 @@
 """
 import asyncio
 import logging
+from dataclasses import replace
 from time import time as epoch_time
+from types import SimpleNamespace
 
 import pytest
 
+from pynecore import lib
 from pynecore.core.broker.exceptions import BrokerManualInterventionError, UnexpectedCancelError
 from pynecore.core.broker.disappearance import (
     MISSING_ACCEPTED_BY_RESUME_EXTRA,
@@ -14,9 +17,13 @@ from pynecore.core.broker.disappearance import (
 )
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REJECTED,
+    FEE_EVENT_TYPE,
     VENUE_DRIVEN_CANCEL_REASONS,
+    ExchangeOrder,
     LegType,
+    OrderEvent,
     OrderStatus,
+    OrderType,
     QuarantineKind,
 )
 from pynecore.core.broker.position import BrokerPosition
@@ -34,6 +41,8 @@ from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
 from pynecore_ctrader.models import _SymbolRules
 from pynecore_ctrader.protection import (
+    _FEE_DELIVERY_EVENT,
+    _FILL_DELIVERY_EVENT,
     CloseOrigin,
     _AnswerFill,
     _ClaimedFill,
@@ -454,11 +463,13 @@ def __test_reconcile_vanished_working_sums_multiple_fill_deals__(tmp_path):
 
     events = _run(broker)
 
-    assert len(events) == 1
-    ev = events[0]
-    assert ev.event_type == 'filled'
-    assert ev.order.status.name == 'FILLED'
-    assert ev.fill_qty == qty
+    # One event per deal, as the push stream delivers them: the receipts and
+    # the duplicate gate key on the deal ids.
+    assert [(e.event_type, e.order.status.name, e.fill_id, e.fill_qty) for e in events] == [
+        ('partial', 'PARTIALLY_FILLED', '903', pytest.approx(volume_to_units(1200))),
+        ('filled', 'FILLED', '904', pytest.approx(volume_to_units(800)))]
+    assert sum(e.fill_qty for e in events) == pytest.approx(qty)
+    assert [e.journal_fill_qty for e in events] == [e.fill_qty for e in events]
     row = broker.store_ctx.get_order('c9')
     assert row is not None
     assert row.filled_qty == qty
@@ -543,12 +554,500 @@ def __test_reconcile_snapshot_booked_partial_commission_recovered_once__(
 
     events = _run(broker)
 
-    assert len(events) == 1
-    ev = events[0]
-    assert ev.fill_price == 2.0
-    assert ev.fee == 8.0
+    # The residual's own deal is its fill, with its own commission; the first
+    # deal, which the cursor counts, delivers its commission as a fee event
+    # of the snapshot booking that counted it.
+    assert booked.fill_id == 'c11:snapshot:1000'
+    assert [(e.event_type, e.fill_id, e.fill_qty, e.fee) for e in events] == [
+        (FEE_EVENT_TYPE, 'c11:snapshot:1000', None, pytest.approx(3.0)),
+        ('filled', '921', pytest.approx(partial), pytest.approx(5.0))]
+    assert events[1].fill_price == 2.0
+    assert sum(e.fee for e in events) == pytest.approx(8.0)
     row = broker.store_ctx.get_order('c11')
     assert row is not None and not (row.extras or {}).get('fee_unbooked')
+
+
+def __test_reconcile_unpriced_snapshot_progress_waits_for_a_price__(tmp_path):
+    """Neither the history nor the snapshot prices the progress: nothing is
+    booked and the cursor stays, so the push at the same cumulative books it."""
+    broker = _ReconcileBroker(
+        _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                              position_id=222, price=0.0)]),
+        deal_res=_deal_res(),
+    )
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=volume_to_units(2000))
+
+    assert _run(broker) == []
+    row = broker.store_ctx.get_order('c11')
+    assert row is not None and row.filled_qty == 0.0
+    assert not (row.extras or {}).get('fee_unbooked')
+
+    push = __test_helper_entry_push(
+        deal_id=930, executed=1000, filled=1000, price=1.0, commission=300)
+    event = broker._translate_exec_event(push)
+    assert event is not None and event.event_type == 'partial'
+    assert event.fill_qty == pytest.approx(volume_to_units(1000))
+    assert event.fill_price == 1.0 and event.fill_id == '930'
+    assert broker.store_ctx.get_order('c11').filled_qty == pytest.approx(10.0)
+
+
+def __test_helper_entry_push(*, deal_id, executed, filled, price, commission, volume=2000):
+    """A push of entry order 111 (``volume`` cents, position 222) executing ``filled`` cents."""
+    order = _order(order_id=111, volume=volume, executed=executed, position_id=222, price=price)
+    final = executed >= volume
+    if final:
+        order.orderStatus = _model.ProtoOAOrderStatus.ORDER_STATUS_FILLED
+    deal = _deal(deal_id=deal_id, order_id=111, position_id=222, filled_volume=filled,
+                 price=price)
+    deal.commission = commission
+    event = _oa.ProtoOAExecutionEvent(
+        executionType=(_model.ProtoOAExecutionType.ORDER_FILLED if final
+                       else _model.ProtoOAExecutionType.ORDER_PARTIAL_FILL))
+    event.order.CopyFrom(order)
+    event.deal.CopyFrom(deal)
+    return event
+
+
+#: The two deals of entry order 111: 10 units at 1.0 (commission 3.0), then
+#: 10 at 2.0 (commission 5.0).
+__test_helper_DEAL_A = dict(deal_id=920, executed=1000, filled=1000, price=1.0, commission=300)
+__test_helper_DEAL_B = dict(deal_id=921, executed=2000, filled=1000, price=2.0, commission=500)
+
+
+def __test_helper_close_long(qty: float) -> OrderEvent:
+    """The fill of a close of ``qty`` units of the ``long`` entry at 2.5."""
+    return OrderEvent(
+        order=ExchangeOrder(
+            id='close-1', symbol='EURUSD', side='sell', order_type=OrderType.MARKET, qty=qty,
+            filled_qty=qty, remaining_qty=0.0, price=None, stop_price=None,
+            average_fill_price=2.5, status=OrderStatus.FILLED, timestamp=1.0, fee=0.0,
+            fee_currency='', reduce_only=True),
+        event_type='filled', fill_price=2.5, fill_qty=qty, timestamp=1.0, from_entry='long',
+        leg_type=LegType.CLOSE, fill_id='close-1', journal_fill_qty=qty)
+
+
+def __test_helper_commission_run(tmp_path, *, snapshot_first: bool) -> dict:
+    """Entry order 111 fills in two deals and the position is closed.
+
+    With ``snapshot_first`` the reconcile pass books the first deal from the
+    snapshot while the deal history is empty (without its commission), before
+    either push arrives; otherwise both pushes book their deals with their own
+    commissions. Every event is booked by a sync engine of the run, and the
+    commission event of the first deal is delivered twice.
+    """
+    broker = _ReconcileBroker(_recon(orders=[_order(order_id=111, volume=2000)]),
+                              deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=volume_to_units(2000))
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    broker._recon = _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                                          position_id=222, price=1.0)])
+    if snapshot_first:
+        (booked,) = _run(broker)
+        assert booked.fee == 0.0
+        __test_helper_book(engine, [booked])
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    first = broker._translate_exec_event(__test_helper_entry_push(**__test_helper_DEAL_A))
+    assert first is not None
+    __test_helper_book(engine, [first, first])
+    broker._recon = _recon(positions=[_position(position_id=222, volume=2000)])
+    second = broker._translate_exec_event(__test_helper_entry_push(**__test_helper_DEAL_B))
+    assert second is not None
+    __test_helper_book(engine, [second])
+    open_commission = engine._position.open_commission
+    broker._recon = _recon()
+    __test_helper_book(engine, [__test_helper_close_long(20.0)])
+    return {'first': first, 'open_commission': open_commission,
+            'netprofit': engine._position.netprofit,
+            'commissions': [t.commission for t in engine._position.closed_trades],
+            'broker': broker}
+
+
+def __test_commission_of_a_snapshot_booked_fill_reaches_the_books_like_the_fill_s_own__(
+        tmp_path, monkeypatch):
+    """The first deal of an entry was booked from the snapshot without its
+    commission; its push is not booked again but delivers the deal's
+    commission as a fee event, twice. The books end where they end when both
+    pushes carry their commissions on their fills: the same commission and the
+    same net profit. The commission is taken off the row's unbooked ranges, so
+    no recovery charges it again, and its record goes once the receipt
+    accounts it."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    baseline = __test_helper_commission_run(tmp_path / 'baseline', snapshot_first=False)
+    run = __test_helper_commission_run(tmp_path / 'snapshot', snapshot_first=True)
+
+    first = run['first']
+    assert first.event_type == FEE_EVENT_TYPE and first.fill_id == 'c11:snapshot:1000'
+    assert first.fee == pytest.approx(3.0) and first.fill_qty is None
+    assert baseline['open_commission'] == pytest.approx(8.0)
+    assert run['open_commission'] == pytest.approx(baseline['open_commission'])
+    assert run['netprofit'] == pytest.approx(baseline['netprofit'])
+    assert sum(run['commissions']) == pytest.approx(sum(baseline['commissions']))
+    broker = run['broker']
+    row = broker.store_ctx.get_order('c11')
+    assert row is not None and not (row.extras or {}).get('fee_unbooked')
+    receipt = broker.store_ctx.fill_receipt('c11:snapshot:1000')
+    assert receipt is not None and receipt.fee == pytest.approx(3.0)
+    assert broker._settle_deliveries() == []
+    assert broker.store_ctx.keyed_events_for_run_id(_FEE_DELIVERY_EVENT) == {}
+
+
+def __test_commission_of_a_snapshot_booked_fill_its_order_s_recovery_finds_is_booked_once__(
+        tmp_path, monkeypatch):
+    """The first deal was booked from the snapshot without its commission and
+    the residual was cancelled while its push never came: the vanished order's
+    recovery finds the deal, which the cursor already counts. No fill is
+    delivered, its commission is, as a fee event of the deal, and only once."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker = _ReconcileBroker(_recon(orders=[_order(order_id=111, volume=2000)]),
+                              deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=volume_to_units(2000))
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    broker._recon = _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                                          position_id=222, price=1.0)])
+    __test_helper_book(engine, _run(broker))
+    assert engine._position.open_commission == 0.0
+    first = _deal(deal_id=920, order_id=111, position_id=222, filled_volume=1000, price=1.0)
+    first.commission = 300
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    broker._wire._deal_res = _deal_res(first)
+
+    events = _run(broker)
+    __test_helper_book(engine, [*events, *events])
+
+    assert [(e.event_type, e.fill_id, e.fee) for e in events] == [
+        (FEE_EVENT_TYPE, 'c11:snapshot:1000', pytest.approx(3.0))]
+    assert engine._position.size == pytest.approx(10.0)
+    assert engine._position.open_commission == pytest.approx(3.0)
+    row = broker.store_ctx.get_order('c11')
+    assert row is not None and not (row.extras or {}).get('fee_unbooked')
+    assert broker._settle_deliveries() == []
+    assert broker.store_ctx.keyed_events_for_run_id(_FEE_DELIVERY_EVENT) == {}
+
+
+@pytest.mark.parametrize('engine_booked', [False, True], ids=['before-engine', 'after-engine'])
+def __test_commission_event_a_process_died_on_is_booked_once_after_a_restart__(
+        tmp_path, monkeypatch, engine_booked):
+    """The process delivered the first deal's commission as a fee event and
+    died: before its engine booked it, or after (the receipt accounts it).
+    The next process delivers the commission again only in the first case; the
+    engine books it onto the entry's adopted trade once, however often it is
+    delivered, and the record goes once the receipt accounts it."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker = _ReconcileBroker(_recon(orders=[_order(order_id=111, volume=2000)]),
+                              deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=volume_to_units(2000))
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    broker._recon = _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                                          position_id=222, price=1.0)])
+    (booked,) = _run(broker)
+    __test_helper_book(engine, [booked])
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    fee = broker._translate_exec_event(__test_helper_entry_push(**__test_helper_DEAL_A))
+    assert fee is not None and fee.event_type == FEE_EVENT_TYPE
+    if engine_booked:
+        __test_helper_book(engine, [fee])
+        assert engine._position.open_commission == pytest.approx(3.0)
+    # The process dies here.
+    process = _next_process(broker)
+    restarted = __test_helper_engine(process)
+    restarted.reconcile()
+    assert restarted._position.size == pytest.approx(10.0)
+
+    redelivered = __test_helper_stream_start(process)
+    __test_helper_book(restarted, [*redelivered, *redelivered])
+
+    assert [(e.event_type, e.fill_id) for e in redelivered] == (
+        [] if engine_booked else [(FEE_EVENT_TYPE, 'c11:snapshot:1000')])
+    # The adopted trade carries the commission once either way: from the
+    # receipt the earlier process wrote, or from the fee event delivered again.
+    assert restarted._position.open_commission == pytest.approx(3.0)
+    receipt = process.store_ctx.fill_receipt('c11:snapshot:1000')
+    assert receipt is not None and receipt.fee == pytest.approx(3.0)
+    assert process._settle_deliveries() == []
+    assert process.store_ctx.keyed_events_for_run_id(_FEE_DELIVERY_EVENT) == {}
+    assert __test_helper_stream_start(_next_process(process)) == []
+
+
+def __test_helper_recovered_entry_run(tmp_path, *, straddle: bool):
+    """A working entry of order 111 filled while the stream was down; a pass recovers it.
+
+    Without ``straddle`` the order (20 units) filled in two deals, 920 (10 at
+    1.0, commission 3.0) then 921 (10 at 2.0, commission 5.0), both unseen.
+    With ``straddle`` the order (10 units) filled in one deal, 930 (commission
+    4.0), whose first 5 units a snapshot-only pass booked without commission
+    before the history listed the deal: the deal straddles the cursor.
+    Every event before the recovery is booked by a sync engine of the run.
+
+    :return: ``(broker, engine, the recovery pass's events)``.
+    """
+    volume = 1000 if straddle else 2000
+    broker = _ReconcileBroker(_recon(orders=[_order(order_id=111, volume=volume)]),
+                              deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=volume_to_units(volume))
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    if straddle:
+        broker._recon = _recon(orders=[_order(order_id=111, volume=volume, executed=500,
+                                              position_id=222, price=1.0)])
+        (booked,) = _run(broker)
+        assert booked.fill_id == 'c11:snapshot:500' and booked.fee == 0.0
+        __test_helper_book(engine, [booked])
+        only = _deal(deal_id=930, order_id=111, position_id=222, filled_volume=1000, price=1.0)
+        only.commission = 400
+        deals = [only]
+    else:
+        first = _deal(deal_id=920, order_id=111, position_id=222, filled_volume=1000,
+                      price=1.0)
+        first.commission = 300
+        second = _deal(deal_id=921, order_id=111, position_id=222, filled_volume=1000,
+                       price=2.0)
+        second.commission = 500
+        second.executionTimestamp = first.executionTimestamp + 60_000
+        deals = [second, first]
+    broker._recon = _recon(positions=[_position(position_id=222, volume=volume)])
+    broker._wire._deal_res = _deal_res(*deals)
+    return broker, engine, _run(broker)
+
+
+#: scenario -> (the recovery's events as ``(fill id, units, price,
+#: commission)``, a fee event without units and price; the position; the
+#: commission the books end with; the late push of the last deal). The
+#: straddling deal's commission is split by its parts: the half the snapshot
+#: booked goes to that booking's fill id, the half above the cursor rides on
+#: the deal's own fill.
+__test_helper_RECOVERED_ENTRIES = {
+    'two-deals': ([('920', 10.0, 1.0, 3.0), ('921', 10.0, 2.0, 5.0)], 20.0, 8.0,
+                  dict(deal_id=921, executed=2000, filled=1000, price=2.0, commission=500)),
+    'straddling-deal': ([('c11:snapshot:500', None, None, 2.0), ('930', 5.0, 1.0, 2.0)],
+                        10.0, 4.0,
+                        dict(deal_id=930, executed=1000, filled=1000, price=1.0,
+                             commission=400)),
+}
+
+
+def __test_helper_event_terms(event) -> tuple:
+    """``(fill id, units, price, commission)`` of an event, approximated."""
+    return (event.fill_id,
+            None if event.fill_qty is None else pytest.approx(event.fill_qty),
+            None if event.fill_price is None else pytest.approx(event.fill_price),
+            pytest.approx(event.fee))
+
+
+@pytest.mark.parametrize('scenario', list(__test_helper_RECOVERED_ENTRIES))
+def __test_recovered_entry_fill_is_one_event_per_deal_booked_once__(
+        tmp_path, monkeypatch, scenario):
+    """The recovered entry fill is delivered as the push stream delivers it:
+    one event per deal, with the deal id as the fill id, its own price and
+    commission (a deal straddling the cursor books its part and the commission
+    the snapshot booking left), and a delivery record per fill written with
+    the cursor. Delivered twice, it is booked once, and a late push of a
+    recovered deal books nothing."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    expected, size, commission, late_push = __test_helper_RECOVERED_ENTRIES[scenario]
+    broker, engine, events = __test_helper_recovered_entry_run(
+        tmp_path, straddle=scenario == 'straddling-deal')
+
+    assert [__test_helper_event_terms(e) for e in events] == expected
+    assert [e.journal_fill_qty for e in events] == [e.fill_qty for e in events]
+    fills = [terms for terms in expected if terms[1] is not None]
+    records = broker.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT)
+    # Beside the record of a snapshot booking the engine took and no pass
+    # settled yet.
+    assert {key for key in records if ':snapshot:' not in key} == {
+        f'fill:{fill_id}' for fill_id, *_rest in fills}
+
+    __test_helper_book(engine, [*events, *events])
+    late = broker._translate_exec_event(__test_helper_entry_push(**late_push))
+    __test_helper_book(engine, [late] if late is not None else [])
+
+    assert engine._position.size == pytest.approx(size)
+    assert engine._position.open_commission == pytest.approx(commission)
+    for fill_id, *_rest in expected:
+        assert broker.store_ctx.fill_delivered(fill_id)
+    assert broker._settle_deliveries() == []
+    assert broker.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT) == {}
+
+
+@pytest.mark.parametrize('engine_booked', [False, True], ids=['before-engine', 'after-engine'])
+@pytest.mark.parametrize('scenario', list(__test_helper_RECOVERED_ENTRIES))
+def __test_recovered_entry_fill_commission_survives_a_restart__(
+        tmp_path, monkeypatch, scenario, engine_booked):
+    """The process recovered the entry fill and died: before its engine booked
+    the events, or after. The next process starts from the journal, which
+    holds the fill; it delivers again only the fills without a receipt, marked
+    journaled before the restart, and the adopted trade carries the recovered
+    commission once however often they are delivered. A late push of a
+    recovered deal books nothing."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    expected, size, commission, late_push = __test_helper_RECOVERED_ENTRIES[scenario]
+    broker, engine, events = __test_helper_recovered_entry_run(
+        tmp_path, straddle=scenario == 'straddling-deal')
+    if engine_booked:
+        __test_helper_book(engine, events)
+        assert engine._position.open_commission == pytest.approx(commission)
+    # The process dies here.
+    process = _next_process(broker)
+    restarted = __test_helper_engine(process)
+    restarted.reconcile()
+    assert restarted._position.size == pytest.approx(size)
+
+    redelivered = __test_helper_stream_start(process)
+    __test_helper_book(restarted, [*redelivered, *redelivered])
+
+    # Fills first, marked as in the restart's position, then commissions.
+    assert [(e.fill_id, e.journaled_before_restart) for e in redelivered] == (
+        [] if engine_booked else [
+            *((fill_id, True) for fill_id, qty, *_rest in expected if qty is not None),
+            *((fill_id, False) for fill_id, qty, *_rest in expected if qty is None)])
+    assert restarted._position.size == pytest.approx(size)
+    assert restarted._position.open_commission == pytest.approx(commission)
+    late = process._translate_exec_event(__test_helper_entry_push(**late_push))
+    __test_helper_book(restarted, [late] if late is not None else [])
+    assert restarted._position.size == pytest.approx(size)
+    assert restarted._position.open_commission == pytest.approx(commission)
+    assert process._settle_deliveries() == []
+    assert process.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT) == {}
+    assert __test_helper_stream_start(_next_process(process)) == []
+
+
+def __test_recovered_straddling_deal_charges_each_trade_its_own_commission__(
+        tmp_path, monkeypatch):
+    """The straddling deal's recovery charges the half the snapshot booked to
+    the trade that booking opened and the half above the cursor to the trade
+    of the deal's own slice: a FIFO close of the older 5 units realizes 2.0 of
+    entry commission, and the remaining 5 keep the other 2.0."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker, engine, events = __test_helper_recovered_entry_run(tmp_path, straddle=True)
+    __test_helper_book(engine, events)
+    assert engine._position.open_commission == pytest.approx(4.0)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    __test_helper_book(engine, [__test_helper_close_long(5.0)])
+
+    assert engine._position.size == pytest.approx(5.0)
+    (closed,) = engine._position.closed_trades
+    assert closed.commission == pytest.approx(2.0)
+    assert engine._position.open_commission == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['same-process', 'restart'])
+def __test_push_of_a_deal_straddling_the_cursor_books_only_its_new_part__(
+        tmp_path, monkeypatch, restart):
+    """A snapshot-only pass booked the first 5 units of entry order 111 (10
+    units) before the history listed its only deal, 930 (commission 4.0);
+    the deal's push then arrives first. It books only the 5 units above the
+    cursor with their half of the commission, and the other half goes to the
+    snapshot booking's trade as a fee event the stream delivers ahead of the
+    fill: the books hold the venue's 10 units and 4.0, a FIFO close of the
+    older 5 realizes 2.0 of it, and a later recovery or copy of the deal books
+    nothing more, in this process or after a restart (where the engine no
+    longer knows which trade the snapshot booking opened)."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker = _ReconcileBroker(_recon(orders=[_order(order_id=111, volume=1000)]),
+                              deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=volume_to_units(1000))
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    broker._recon = _recon(orders=[_order(order_id=111, volume=1000, executed=500,
+                                          position_id=222, price=1.0)])
+    (booked,) = _run(broker)
+    assert booked.fill_id == 'c11:snapshot:500'
+    __test_helper_book(engine, [booked])
+    if restart:
+        broker._recon = _recon(
+            orders=[_order(order_id=111, volume=1000, executed=500, position_id=222,
+                           price=1.0)],
+            positions=[_position(position_id=222, volume=500)])
+        broker = _next_process(broker)
+        engine = __test_helper_engine(broker)
+        engine.reconcile()
+        assert __test_helper_stream_start(broker) == []
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    push = dict(deal_id=930, executed=1000, filled=1000, price=1.0, commission=400,
+                volume=1000)
+
+    delivered = __test_helper_stream_of(broker, [__test_helper_entry_push(**push)])
+
+    assert [(e.event_type, e.fill_id, e.fill_qty, e.fee) for e in delivered] == [
+        (FEE_EVENT_TYPE, 'c11:snapshot:500', None, pytest.approx(2.0)),
+        ('filled', '930', pytest.approx(5.0), pytest.approx(2.0))]
+    fill = delivered[1]
+    assert fill.journal_fill_qty == pytest.approx(5.0)
+    row = broker.store_ctx.get_order('c11')
+    assert row is not None and row.filled_qty == pytest.approx(10.0)
+    assert not (row.extras or {}).get('fee_unbooked')
+    __test_helper_book(engine, [*delivered, *delivered])
+    assert engine._position.size == pytest.approx(10.0)
+    assert engine._position.open_commission == pytest.approx(4.0)
+
+    only = _deal(deal_id=930, order_id=111, position_id=222, filled_volume=1000, price=1.0)
+    only.commission = 400
+    broker._wire._deal_res = _deal_res(only)
+    later = [event for _ in range(2) for event in _run(broker)]
+    copy = broker._translate_exec_event(__test_helper_entry_push(**push))
+    __test_helper_book(engine, [*later, *([copy] if copy is not None else [])])
+    assert later == [] and copy is None and not broker._released_close_events
+    assert engine._position.size == pytest.approx(10.0)
+    assert engine._position.open_commission == pytest.approx(4.0)
+
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+    __test_helper_book(engine, [__test_helper_close_long(5.0)])
+    (closed,) = engine._position.closed_trades
+    assert closed.commission == pytest.approx(2.0)
+    assert engine._position.open_commission == pytest.approx(2.0)
+    assert broker._settle_deliveries() == []
+    assert broker.store_ctx.keyed_events_for_run_id(_FEE_DELIVERY_EVENT) == {}
+
+
+def __test_commission_of_a_fill_held_for_the_venue_is_delivered_again_once_it_is_taken__(
+        tmp_path, monkeypatch):
+    """A fee event of a fill the engine holds for the venue's verdict is not
+    booked. Once the engine took the fill, the commission is delivered again,
+    once, and the record goes when the receipt accounts it."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker = _ReconcileBroker(_recon(), deal_res=_deal_res())
+    _open(tmp_path, broker)
+    engine = __test_helper_engine(broker)
+    monkeypatch.setattr(engine, '_fill_report_grace_s', lambda: 0.0)
+    engine.reconcile()
+    entry = replace(__test_helper_close_long(1.0), order=replace(
+        __test_helper_close_long(1.0).order, id='entry-1', side='buy', reduce_only=False),
+        fill_id='entry-1', pine_id='long', from_entry=None, leg_type=LegType.ENTRY)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=100)])
+    __test_helper_book(engine, [entry])
+    broker._recon = _recon()
+    __test_helper_book(engine, [__test_helper_close_long(1.0)])
+    assert engine._position.size == 0.0 and len(engine._position.closed_trades) == 1
+    netprofit = engine._position.netprofit
+    held = replace(__test_helper_close_long(1.0), fill_id='late-1',
+                   order=replace(__test_helper_close_long(1.0).order, id='late-1'))
+    fee = replace(held, event_type=FEE_EVENT_TYPE, fill_qty=None, fill_price=None,
+                  journal_fill_qty=None, fee=0.7)
+    broker._journal_fee_delivery(fee)
+    __test_helper_book(engine, [held, fee])
+    assert not broker.store_ctx.fill_delivered('late-1')
+    assert broker._settle_deliveries() == []
+    for _ in range(2):
+        engine.reconcile()
+    assert broker.store_ctx.fill_delivered('late-1')
+
+    again = broker._settle_deliveries()
+    assert [(e.event_type, e.fill_id, e.fee) for e in again] == [(FEE_EVENT_TYPE, 'late-1', 0.7)]
+    assert broker._settle_deliveries() == []
+    __test_helper_book(engine, again)
+
+    assert engine._position.netprofit == pytest.approx(netprofit - 0.7)
+    assert broker._settle_deliveries() == []
+    assert broker.store_ctx.keyed_events_for_run_id(_FEE_DELIVERY_EVENT) == {}
 
 
 def __test_recovered_residual_after_a_restart_charges_only_its_own_commission__(tmp_path):
@@ -1472,6 +1971,126 @@ def __test_grace_expired_close_judged_before_its_verdict_landed_is_delivered_aft
     assert _drive_tracker(later) == ([], None)
 
 
+def __test_helper_engine(broker) -> OrderSyncEngine:
+    """A sync engine of ``broker``'s run on its journal, as a process builds it."""
+    return OrderSyncEngine(broker=broker, position=BrokerPosition(), symbol='EURUSD',
+                           run_tag=broker.store_ctx.run_tag, mintick=0.00001,
+                           store_ctx=broker.store_ctx)
+
+
+def __test_helper_book(engine: OrderSyncEngine, events) -> None:
+    """Hand ``events`` to the engine and book them, as the next bar does."""
+    for event in events:
+        engine.on_order_event(event)
+    engine.apply_async_events()
+
+
+def __test_helper_stream_of(broker, messages) -> list:
+    """Start ``broker``'s event stream with ``messages`` queued; the events it delivers."""
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        for message in messages:
+            broker._exec_events.put_nowait(message)
+        stream = broker.watch_orders()
+        events = []
+        try:
+            while True:
+                events.append(await asyncio.wait_for(stream.__anext__(), timeout=0.05))
+        except asyncio.TimeoutError:
+            return events
+        finally:
+            await stream.aclose()
+    return asyncio.run(run())
+
+
+def __test_helper_stream_start(broker) -> list:
+    """Start ``broker``'s event stream with nothing queued; the events it delivers first."""
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        stream = broker.watch_orders()
+        events = []
+        try:
+            while True:
+                events.append(await asyncio.wait_for(stream.__anext__(), timeout=0.05))
+        except asyncio.TimeoutError:
+            return events
+        finally:
+            await stream.aclose()
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize('verdict_applied', [False, True], ids=['before-verdict', 'after-verdict'])
+def __test_vanished_close_a_process_died_on_is_in_the_restarted_books_once__(
+        tmp_path, monkeypatch, verdict_applied):
+    """The vanished position's close deal 900 was judged; the process died
+    before its engine booked the close fill: before the tracker applied the
+    CLOSED verdict (the rows are live, the journal does not hold the close),
+    or after it retired the rows and before the yielded fill was booked (the
+    journal holds it). The restart adopts the flat venue either way. Before
+    the verdict, the next judgment delivers the close as a new fill; after it,
+    the fill is delivered again from its delivery record, marked journaled
+    before the restart: the engine records its receipt and books nothing, the
+    record goes once the receipt shows, and no later process delivers it."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    qty = volume_to_units(2000)
+    broker = _ReconcileBroker(
+        _recon(positions=[_position(position_id=222, volume=2000)]),
+        deal_res=_deal_res(_close_deal(
+            deal_id=900, order_id=111, position_id=222, closed_volume=2000)))
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=qty,
+                   extras={'missing_pending_since': 0.0})
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    assert engine._position.size == pytest.approx(qty)
+    broker._recon = _recon()
+    if verdict_applied:
+        events, err = _drive_tracker(broker)
+        assert err is None and [(e.fill_id, e.journaled_before_restart) for e in events] == [
+            ('900', False)]
+        assert _live_coids(broker) == []
+        assert set(broker.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT)) == {
+            'fill:900'}
+    else:
+        def stop_before_apply(*_args, **_kwargs):
+            raise RuntimeError('process stopped')
+
+        broker._disappearance_tracker()._apply_confirmation = stop_before_apply
+        with pytest.raises(RuntimeError, match='process stopped'):
+            _drive_tracker(broker)
+        assert _live_coids(broker) == ['c3']
+        assert broker.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT) == {}
+    # The process dies here: its engine never books the close fill.
+    process = _next_process(broker)
+    restarted = __test_helper_engine(process)
+    restarted.reconcile()
+    assert restarted._position.size == pytest.approx(0.0)
+
+    redelivered = __test_helper_stream_start(process)
+    judged, err = _drive_tracker(process)
+    __test_helper_book(restarted, [*redelivered, *judged])
+
+    assert err is None
+    delivered = [(e.fill_id, e.journaled_before_restart) for e in (*redelivered, *judged)]
+    assert delivered == [('900', verdict_applied)]
+    assert restarted._position.size == pytest.approx(0.0)
+    assert len(restarted._position.closed_trades) == 0
+    assert _live_coids(process) == []
+    assert process.store_ctx.keyed_events_for_run_id(ctrader_reconcile._VANISHED_CLOSE_EVENT) == {}
+    if verdict_applied:
+        assert process.store_ctx.fill_delivered('900')
+        assert process._settle_deliveries() == []
+        assert process.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT) == {}
+        later = _next_process(process)
+        assert __test_helper_stream_start(later) == []
+        assert _drive_tracker(later) == ([], None)
+    else:
+        # Held for the venue's verdict, so its receipt waits for that; until
+        # then the record keeps the fill for a later process.
+        assert set(process.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT)) == {
+            'fill:900'}
+
+
 def __test_grace_expired_inconclusive_recheck_defers_retire__(tmp_path):
     # At grace expiry the final deal-history re-check is inconclusive (transport
     # down): never conclude a cancel from missing evidence. The row keeps its
@@ -1494,12 +2113,14 @@ def __test_grace_expired_inconclusive_recheck_defers_retire__(tmp_path):
 class _OrderStatusWire(_FakeWire):
     """An empty deal history, and the vanished entry order's own status."""
 
-    def __init__(self, *, status, expiry=None, details_error=None, executed=0):
+    def __init__(self, *, status, expiry=None, details_error=None, executed=0,
+                 details_deals=()):
         super().__init__(deal_res=_deal_res())
         self._status = status
         self._expiry = expiry
         self._details_error = details_error
         self._executed = executed
+        self._details_deals = details_deals
 
     async def send_request(self, req, *, timeout=None, **kwargs):
         if not isinstance(req, _oa.ProtoOAOrderDetailsReq):
@@ -1507,11 +2128,13 @@ class _OrderStatusWire(_FakeWire):
         self.requests.append(req)
         if self._details_error is not None:
             raise self._details_error
-        order = _order(order_id=req.orderId, volume=2000, executed=self._executed)
+        order = _order(order_id=req.orderId, volume=2000, executed=self._executed or 0)
         order.orderStatus = self._status
         if self._expiry is not None:
             order.expirationTimestamp = self._expiry
-        return _oa.ProtoOAOrderDetailsRes(order=order)
+        if self._executed is None:
+            order.ClearField('executedVolume')
+        return _oa.ProtoOAOrderDetailsRes(order=order, deal=list(self._details_deals))
 
 
 def _foreign_expiry_wire() -> _OrderStatusWire:
@@ -1530,9 +2153,20 @@ def _vanished_working_broker(tmp_path, wire) -> tuple[_ReconcileBroker, list]:
     _seed_working(broker, 'w1', order_id=600, qty=volume_to_units(2000),
                   extras={'missing_pending_since': 0.0})
     reports: list = []
-    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
-        (reason, context, kind))
+
+    def sink(reason, context, *, kind):
+        reports.append((reason, context, kind))
+        _store_test_latch(broker, reason, context, kind)
+
+    broker.quarantine_sink = sink
     return broker, reports
+
+
+def _store_test_latch(broker, reason, context, kind) -> None:
+    """Store a test sink's quarantine latch in ``store_ctx`` the way the engine's sink does."""
+    broker.store_ctx.record_quarantine(
+        'q-test', kind=str(kind), reason=reason, intent_key=None,
+        context=context, entered_ts_ms=int(epoch_time() * 1000))
 
 
 @pytest.mark.parametrize('status', [
@@ -1570,16 +2204,16 @@ def __test_grace_expired_working_order_with_a_foreign_expiry_is_reported__(tmp_p
 
 @pytest.mark.parametrize('wire', [
     _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED),
-    _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED,
-                     details_error=CTraderProtocolError('ORDER_NOT_FOUND', 'no such order')),
-], ids=['cancelled', 'not-found'])
+    _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED, executed=None),
+], ids=['cancelled', 'cancelled-without-executed-volume'])
 def __test_grace_expired_working_order_cancel_nobody_can_be_named_for_is_audited__(
         tmp_path, caplog, wire):
     """The stream missed the cancel of a pending entry; the order's status reads
-    cancelled (or the venue no longer knows the order). Only the push carries
-    ``isServerEvent``, so a server-initiated cancel and someone else's look the
-    same: the cancel is booked, logged as an ERROR and audited, and the
-    unexpected-cancel policy never runs."""
+    cancelled, and its details list no deal (the answer lists every deal the
+    order's fills created), whether or not they carry the executed volume.
+    Only the push carries ``isServerEvent``, so a server-initiated cancel and
+    someone else's look the same: the cancel is booked, logged as an ERROR and
+    audited, and the unexpected-cancel policy never runs."""
     broker, reports = _vanished_working_broker(tmp_path, wire)
 
     with caplog.at_level(logging.ERROR, logger='pynecore_ctrader.protection'):
@@ -1596,6 +2230,89 @@ def __test_grace_expired_working_order_cancel_nobody_can_be_named_for_is_audited
                for record in caplog.records)
 
 
+def _not_found_wire() -> _OrderStatusWire:
+    return _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED,
+                            details_error=CTraderProtocolError('ORDER_NOT_FOUND', 'no such order'))
+
+
+def __test_grace_expired_working_order_the_venue_does_not_find_quarantines__(tmp_path, caplog):
+    """The venue no longer knows a vanished pending entry: no status, executed
+    volume or deal list proves it unexecuted. The row stays live with its
+    stamp, the bot is quarantined (entry block) once with an ERROR, and no
+    cancel is booked; a later pass neither books nor quarantines again."""
+    broker, reports = _vanished_working_broker(tmp_path, _not_found_wire())
+
+    with caplog.at_level(logging.ERROR, logger='pynecore_ctrader.reconcile'):
+        events, err = _drive_tracker(broker)
+        again, err_again = _drive_tracker(broker)
+
+    assert events == [] and again == [] and err is None and err_again is None
+    assert [(reason, kind) for reason, _context, kind in reports] == [
+        ('vanished_order_not_found', QuarantineKind.ENTRY_BLOCK)]
+    assert reports[0][1]['order_id'] == 600
+    assert 'w1' in _live_coids(broker)
+    assert broker.store_ctx.get_order('w1').extras.get('missing_pending_since') == 0.0
+    assert _store_events(broker, 'ctrader_cancel_unattributed') == []
+    assert sum(record.levelno == logging.ERROR and 'not found' in record.getMessage()
+               for record in caplog.records) == 1
+
+
+def __test_not_found_vanished_order_is_retired_once_a_resume_accepts_it__(tmp_path):
+    """An operator resume accepted the venue as it stands: the not-found order
+    is retired as an unattributed cancel, with no quarantine and no policy."""
+    broker, reports = _vanished_working_broker(tmp_path, _not_found_wire())
+    row = broker.store_ctx.get_order('w1')
+    broker.store_ctx.upsert_order('w1', extras={
+        **(row.extras or {}), MISSING_ACCEPTED_BY_RESUME_EXTRA: 0.0})
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None and reports == []
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    assert 'w1' not in _live_coids(broker)
+    assert len(_store_events(broker, 'ctrader_cancel_unattributed')) == 1
+
+
+@pytest.mark.parametrize('wire', [
+    _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED),
+    _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED),
+    _not_found_wire(),
+], ids=['cancelled', 'expired', 'not-found'])
+def __test_vanished_order_with_a_reported_execution_floor_is_no_cancel__(tmp_path, wire):
+    """An earlier read recorded that the venue reported 10 units executed
+    (``executed_cents``), though the cursor counts none yet: whatever the
+    order's details say now, the row is no zero-fill cancel. The stamp is
+    cleared and the row waits for its fill."""
+    broker, reports = _vanished_working_broker(tmp_path, wire)
+    row = broker.store_ctx.get_order('w1')
+    broker.store_ctx.upsert_order('w1', extras={**(row.extras or {}), 'executed_cents': 1000})
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None and reports == []
+    assert 'w1' in _live_coids(broker)
+    assert 'missing_pending_since' not in (broker.store_ctx.get_order('w1').extras or {})
+
+
+def __test_vanished_position_linked_order_with_an_execution_floor_is_no_cancel__(tmp_path):
+    """A working order linked to a position, whose position history shows no
+    close, reaches the cancel verdict without asking the order's details: an
+    executed volume the venue reported earlier (``executed_cents``) beyond the
+    cursor still makes it no zero-fill cancel. The stamp is cleared and the
+    row waits for its fill."""
+    broker, reports = _vanished_working_broker(tmp_path, _OrderStatusWire(
+        status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED))
+    row = broker.store_ctx.get_order('w1')
+    broker.store_ctx.upsert_order('w1', extras={
+        **(row.extras or {}), 'position_id': 222, 'executed_cents': 1000})
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None and reports == []
+    assert 'w1' in _live_coids(broker)
+    assert 'missing_pending_since' not in (broker.store_ctx.get_order('w1').extras or {})
+
+
 @pytest.mark.parametrize('status, executed', [
     (_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, 2000),
     (_model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED, 1000),
@@ -1609,6 +2326,23 @@ def __test_grace_expired_working_order_the_venue_shows_executed_is_no_cancel__(
     snapshot bridge promotes the row once the history lists the fill."""
     broker, reports = _vanished_working_broker(
         tmp_path, _OrderStatusWire(status=status, executed=executed))
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None and reports == []
+    assert 'w1' in _live_coids(broker)
+    assert 'missing_pending_since' not in (broker.store_ctx.get_order('w1').extras or {})
+
+
+def __test_grace_expired_working_order_whose_details_list_a_fill_is_no_cancel__(tmp_path):
+    """The deal history lists no fill yet and the cancelled order's details
+    omit its executed volume, but they list a deal its fill created: no
+    cancel; the stamp is cleared, and the snapshot bridge promotes the row
+    once the history lists the fill."""
+    broker, reports = _vanished_working_broker(tmp_path, _OrderStatusWire(
+        status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED, executed=None,
+        details_deals=(_deal(deal_id=905, order_id=600, position_id=222,
+                             filled_volume=1000),)))
 
     events, err = _drive_tracker(broker)
 
@@ -1773,8 +2507,12 @@ def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
     broker = _ReconcileBroker(_recon())
     broker._wire = _foreign_expiry_wire()
     latched: list[tuple[str, dict, QuarantineKind]] = []
-    broker.quarantine_sink = lambda reason, context, *, kind: latched.append(
-        (reason, context, kind))
+
+    def sink(reason, context, *, kind):
+        latched.append((reason, context, kind))
+        _store_test_latch(broker, reason, context, kind)
+
+    broker.quarantine_sink = sink
     _open(tmp_path, broker)
     _seed_working(broker, 'q1', order_id=222, qty=qty,
                   extras={'missing_pending_since': 0.0})
@@ -2514,7 +3252,7 @@ def __test_recovered_manual_close_of_a_working_order_position_is_reported__(tmp_
 
     # The trade is the bot's though its close was not: both fills are booked.
     assert [(e.leg_type, e.fill_id) for e in events] == [
-        (LegType.ENTRY, None), (LegType.CLOSE, '906')]
+        (LegType.ENTRY, '905'), (LegType.CLOSE, '906')]
     assert broker.store_ctx.get_order('c14').state == 'closed'
     assert {905, 906} <= broker._seen_deal_ids
     assert len(reports) == 1
@@ -2986,6 +3724,101 @@ def __test_close_inside_the_skew_window_an_expiry_retired_is_not_booked_again__(
     assert broker._translate_exec_event(push) is None
     assert _retired(broker) == pytest.approx(10.0)
     assert reports == []
+
+
+def _foreign_hidden_shrink_broker(tmp_path):
+    """NETTING position 222: the bot opened 20 (deal 901), another client added
+    5 (deal 902); the bot's own close of 10 (order 600) executed while the
+    stream was down, and the deal history does not show its deal 903 yet. The
+    venue holds 15: the journal share of 20 is 5 above it (a waiting
+    shortfall) and 10 above the bot's real share, the other client's 5 hiding
+    the rest."""
+    base_ms = 1_700_000_000_000
+    deals = [
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               base_ms + 1_000),
+        _timed(_deal(deal_id=902, order_id=500, position_id=222, filled_volume=500),
+               base_ms + 2_000),
+    ]
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=1500)]))
+    broker._wire = _VenueWire(deal_res=_deal_res(*deals),
+                              orders=[_closing_order(600, coid=''), _closing_order(700)])
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=20.0)
+    broker.store_ctx.add_ref('c3', 'order_id', '111')
+    broker._settle_own_close(broker._open_own_close(222, 10.0), 600)
+    return broker, reports, deals
+
+
+def _pass(broker) -> list:
+    """One reconcile pass, then the report flush ``watch_orders`` runs after it."""
+    events = _run(broker)
+    broker._flush_external_interventions()
+    return events
+
+
+def __test_close_of_hidden_foreign_exposure_during_a_shrink_wait_takes_no_share__(tmp_path):
+    """During the shortfall's wait the other client closes its own 5 (order
+    700, deal 904): the bot's real share (10) is the whole venue (10), so the
+    close took none of it. The journal share (20) counts the unseen own close,
+    which may have executed before 904: the close is ambiguous, neither
+    reported nor debited. Once 903 shows, the own close retires its 10 and the
+    journal ends at the bot's real share, the venue's 10."""
+    broker, reports, deals = _foreign_hidden_shrink_broker(tmp_path)
+    assert _pass(broker) == [] and _pass(broker) == []
+    assert 222 in broker._unexplained_shrinks
+    deals.append(_timed(_close_deal(deal_id=904, order_id=700, position_id=222,
+                                    closed_volume=500), 1_700_000_005_000))
+    broker._wire._deal_res = _deal_res(*deals)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+
+    assert [event for _ in range(3) for event in _pass(broker)] == []
+
+    assert reports == []
+    assert _retired(broker) == pytest.approx(0.0)
+    deals.append(_close_deal_903(price=1.2345))
+    broker._wire._deal_res = _deal_res(*deals)
+
+    events = [event for _ in range(3) for event in _pass(broker)]
+
+    assert [(e.fill_id, e.fill_qty) for e in events] == [('903', pytest.approx(10.0))]
+    assert _retired(broker) == pytest.approx(10.0)
+    assert broker._own_share(222) == pytest.approx(10.0)
+    assert reports == []
+
+
+def __test_close_of_the_bot_s_share_during_a_shrink_wait_is_still_reported__(tmp_path):
+    """The same wait without the other client's exposure: the bot holds the
+    whole venue (10) after its unseen close, and order 700 closing 5 takes 5
+    of it whichever way the unseen close ran. That is reported and retired;
+    903 retires its own 10 once it shows."""
+    broker, reports, deals = _foreign_hidden_shrink_broker(tmp_path)
+    deals.pop()
+    broker._wire._deal_res = _deal_res(*deals)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=1000)])
+    assert _pass(broker) == [] and _pass(broker) == []
+    deals.append(_timed(_close_deal(deal_id=904, order_id=700, position_id=222,
+                                    closed_volume=500), 1_700_000_005_000))
+    broker._wire._deal_res = _deal_res(*deals)
+    broker._recon = _recon(positions=[_position(position_id=222, volume=500)])
+
+    events = [event for _ in range(3) for event in _pass(broker)]
+
+    assert [(e.fill_id, e.fill_qty) for e in events] == [('904', pytest.approx(5.0))]
+    assert [(r[1]['deal_ids'], r[1]['booked_qty']) for r in reports] == [
+        ([904], pytest.approx(5.0))]
+    deals.append(_close_deal_903(price=1.2345))
+    broker._wire._deal_res = _deal_res(*deals)
+
+    events = [event for _ in range(3) for event in _pass(broker)]
+
+    assert [(e.fill_id, e.fill_qty) for e in events] == [('903', pytest.approx(10.0))]
+    assert _retired(broker) == pytest.approx(15.0)
+    assert broker._own_share(222) == pytest.approx(5.0)
+    assert len(reports) == 1
 
 
 def _expired_two_entry_shrink_broker(tmp_path):
@@ -3796,7 +4629,7 @@ def __test_filled_then_closed_entry_judges_the_position_s_closes_like_its_rows__
     events = _run(broker)
 
     assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
-        (None, None, pytest.approx(3.0)),
+        ('903', None, pytest.approx(3.0)),
         ('907', '__pyne_partial__L2', pytest.approx(10.0)),
         ('909', '__pyne_partial__L2', pytest.approx(8.0))]
     assert _live_coids(broker) == []
@@ -3822,7 +4655,7 @@ def __test_filled_then_closed_entry_waits_for_a_confirmed_close_missing_from_his
     events = _run(broker)
 
     assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
-        (None, None, pytest.approx(3.0)),
+        ('903', None, pytest.approx(3.0)),
         ('907', '__pyne_partial__L2', pytest.approx(10.0)),
         ('909', '__pyne_partial__L2', pytest.approx(8.0))]
     assert _live_coids(broker) == []
@@ -3841,12 +4674,12 @@ def __test_filled_then_closed_entries_of_one_position_are_recovered_together__(t
     events = [event for _ in range(2) for event in _run(broker)]
 
     assert [(e.fill_id, e.from_entry, e.fill_qty) for e in events] == [
-        (None, None, pytest.approx(3.0)),
-        (None, None, pytest.approx(2.0)),
+        ('903', None, pytest.approx(3.0)),
+        ('904', None, pytest.approx(2.0)),
         ('907', '__pyne_partial__L2', pytest.approx(10.0)),
         ('909', '__pyne_partial__L2', pytest.approx(10.0))]
-    assert sum(e.fill_qty for e in events if e.fill_id is None) + 15.0 == pytest.approx(
-        sum(e.fill_qty for e in events if e.fill_id is not None))
+    assert sum(e.fill_qty for e in events if e.leg_type is LegType.ENTRY) + 15.0 == (
+        pytest.approx(sum(e.fill_qty for e in events if e.leg_type is LegType.CLOSE)))
     assert _live_coids(broker) == []
     assert reports == []
 
@@ -5512,3 +6345,321 @@ def __test_close_coverage_journal_keeps_one_record_per_position__(tmp_path):
         int((1_700_000_200.0 + 49) * 1000) - ctrader_reconcile._CLOCK_SKEW_MS)
     assert restarted._resume_accepted_until[333] == restarted._closes_covered_until[333]
     assert 222 not in restarted._resume_accepted_until
+
+
+@pytest.mark.parametrize('closed', ['partial', 'full'])
+def __test_close_push_whose_judgment_rolled_back_is_booked_by_the_next_pass__(tmp_path, closed):
+    """The push of the bot's own close of position 222 (deal 903) is judged in
+    a transaction that rolls back, and the stream drops the message. The deal
+    is not taken for one the run booked: the next passes judge it from the
+    deal history and deliver it once, with its debit in the journal."""
+    venue = 1000 if closed == 'partial' else 0
+    broker, reports = _shrunk_position_broker(tmp_path, closing_order=_closing_order(600))
+    broker._recon = _recon(positions=[_position(position_id=222, volume=venue)] if venue
+                           else [])
+    broker._wire = _VenueWire(deal_res=_deal_res(
+        _timed(_deal(deal_id=901, order_id=111, position_id=222, filled_volume=2000),
+               1_700_000_001_000),
+        _close_deal_903(price=1.2345)), orders=[_closing_order(600)])
+    broker._settle_own_close(broker._open_own_close(222, 10.0), 600)
+    broker._snapshot_open_positions = {222: _position(position_id=222, volume=2000)}
+    push = _own_close_903(price=1.2345)
+    if not venue:
+        push.position.positionStatus = _model.ProtoOAPositionStatus.POSITION_STATUS_CLOSED
+        push.position.tradeData.volume = 0
+
+    def write_fails(*_args, **_kwargs):
+        raise RuntimeError('journal write failed')
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(broker, '_journal_fill_delivery', write_fails)
+        with pytest.raises(RuntimeError, match='journal write failed'):
+            broker._translate_exec_event(push)
+
+    assert 903 not in broker._seen_deal_ids
+    events = [event for _ in range(3) for event in _run(broker)]
+    if not venue:
+        row = broker.store_ctx.get_order('c3')
+        broker.store_ctx.upsert_order(
+            'c3', extras={**(row.extras or {}), 'missing_pending_since': 0.0})
+        events += _drive_tracker(broker)[0]
+
+    assert [(e.leg_type, e.fill_id, e.fill_qty) for e in events
+            if e.leg_type is LegType.CLOSE] == [(LegType.CLOSE, '903', pytest.approx(10.0))]
+    assert reports == []
+
+
+def __test_filled_then_closed_retirement_that_failed_is_delivered_by_the_next_pass__(tmp_path):
+    """The pass that retires working order 111 as filled (deal 905) and closed
+    (deal 906) fails at its journal write. Its deals are not taken as seen:
+    the next pass delivers the whole trade once and retires the row."""
+    broker = _filled_then_closed_broker(tmp_path)
+
+    def write_fails(*_args, **_kwargs):
+        raise RuntimeError('journal write failed')
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(broker, '_journal_fill_delivery', write_fails)
+        with pytest.raises(RuntimeError, match='journal write failed'):
+            _run(broker)
+
+    assert not {905, 906} & broker._seen_deal_ids
+    assert 'c14' in _live_coids(broker)
+    events = _run(broker)
+
+    assert [(e.leg_type, e.fill_id) for e in events if e.leg_type is LegType.CLOSE] == [
+        (LegType.CLOSE, '906')]
+    assert [e.leg_type for e in events] == [LegType.ENTRY, LegType.CLOSE]
+    assert 'c14' not in _live_coids(broker)
+    assert _run(broker) == []
+
+
+def __test_helper_vanished_close_judged_before_its_verdict(tmp_path):
+    """Position 222 of row c3 vanished; its close deal 900 was judged, and the
+    process died before the tracker applied the CLOSED verdict: the journal
+    still owns the row's 20 units. Returns the next process of the run."""
+    qty = volume_to_units(2000)
+    broker = _ReconcileBroker(
+        _recon(positions=[_position(position_id=222, volume=2000)]),
+        deal_res=_deal_res(_close_deal(
+            deal_id=900, order_id=111, position_id=222, closed_volume=2000)))
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=qty,
+                   extras={'missing_pending_since': 0.0})
+    __test_helper_engine(broker).reconcile()
+    broker._recon = _recon()
+
+    def stop_before_apply(*_args, **_kwargs):
+        raise RuntimeError('process stopped')
+
+    broker._disappearance_tracker()._apply_confirmation = stop_before_apply
+    with pytest.raises(RuntimeError, match='process stopped'):
+        _drive_tracker(broker)
+    assert _live_coids(broker) == ['c3']
+    return _next_process(broker)
+
+
+@pytest.mark.parametrize('history', ['readable', 'unreadable'])
+def __test_vanished_close_judged_before_its_verdict_is_no_startup_alarm__(
+        tmp_path, monkeypatch, caplog, history):
+    """The restart finds the row the earlier judgment's close explains: the
+    startup recovery retires it from that judgment, whether or not the deal
+    history can be read again, so the engine's startup comparison finds the
+    journal at the flat venue and reports nothing. The judgment's journal of
+    the close goes with the row."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    process = __test_helper_vanished_close_judged_before_its_verdict(tmp_path)
+    if history == 'unreadable':
+        process._wire = _FakeWire(fail=True)
+    restarted = __test_helper_engine(process)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(process._recover_in_flight_submissions())
+        restarted.reconcile()
+        events = [*__test_helper_stream_start(process), *_drive_tracker(process)[0]]
+
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert _live_coids(process) == []
+    assert restarted._position.size == pytest.approx(0.0)
+    assert events == []
+    assert process.store_ctx.keyed_events_for_run_id(ctrader_reconcile._VANISHED_CLOSE_EVENT) == {}
+
+
+def __test_vanished_position_no_judgment_explains_is_a_startup_alarm__(
+        tmp_path, monkeypatch, caplog):
+    """The same restart without an earlier judgment of the close, and the deal
+    history cannot be read: nothing explains the flat venue, so the row stays
+    live. While the plugin still recovers the close (its row is live with the
+    position gone) the engine's startup comparison waits; once the recovery
+    settles without a fill, it reports the difference."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker = _ReconcileBroker(_recon())
+    broker._wire = _FakeWire(fail=True)
+    _open(tmp_path, broker)
+    _seed_position(broker, 'c3', position_id=222, qty=volume_to_units(2000),
+                   extras={'missing_pending_since': 0.0})
+    restarted = __test_helper_engine(broker)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(broker._recover_in_flight_submissions())
+        restarted.reconcile()
+
+    assert _live_coids(broker) == ['c3']
+    assert broker.fill_recovery_pending({'long'})
+    assert not any('no fill explains' in r.getMessage() for r in caplog.records
+                   if r.levelno >= logging.ERROR)
+    monkeypatch.setattr(broker, 'fill_recovery_pending', lambda entry_ids: False)
+    with caplog.at_level(logging.WARNING):
+        restarted.reconcile()
+    assert any('no fill explains' in r.getMessage() for r in caplog.records
+               if r.levelno >= logging.ERROR)
+
+
+def __test_vanished_close_judged_before_its_verdict_short_of_the_journal_is_a_startup_alarm__(
+        tmp_path, monkeypatch, caplog):
+    """The earlier judgment's close took 20 units, but the journal owns 30 on
+    the position and the deal history cannot be read: the judgment does not
+    explain the flat venue, so the row stays live. The engine waits while the
+    plugin still recovers the close, and reports once that settles."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    process = __test_helper_vanished_close_judged_before_its_verdict(tmp_path)
+    process.store_ctx.upsert_order('c3', qty=30.0, filled_qty=30.0)
+    process._wire = _FakeWire(fail=True)
+    restarted = __test_helper_engine(process)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(process._recover_in_flight_submissions())
+        restarted.reconcile()
+
+    assert _live_coids(process) == ['c3']
+    pending = process.fill_recovery_pending({'long'})
+    reported = any('no fill explains' in r.getMessage() for r in caplog.records
+                   if r.levelno >= logging.ERROR)
+    assert pending and not reported
+    monkeypatch.setattr(process, 'fill_recovery_pending', lambda entry_ids: False)
+    with caplog.at_level(logging.WARNING):
+        restarted.reconcile()
+    assert any('no fill explains' in r.getMessage() for r in caplog.records
+               if r.levelno >= logging.ERROR)
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['same-process', 'restart'])
+@pytest.mark.parametrize('listed', ['at-once', 'late'])
+def __test_commission_of_a_snapshot_booked_fill_whose_push_never_came_is_booked_once__(
+        tmp_path, monkeypatch, listed, restart):
+    """The first deal of entry order 111 (920) was booked from the snapshot
+    without its commission, and its push never came; the second deal's push
+    filled the order to the end, so its row is a settled position no recovery
+    reads again. The passes read the order's deal history until it lists the
+    first deal (at once, or only on a later pass), and deliver its commission
+    as a fee event, once, in this process or after a restart."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker = _ReconcileBroker(_recon(orders=[_order(order_id=111, volume=2000)]),
+                              deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=volume_to_units(2000))
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    broker._recon = _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                                          position_id=222, price=1.0)])
+    __test_helper_book(engine, _run(broker))
+    first = _deal(deal_id=920, order_id=111, position_id=222, filled_volume=1000, price=1.0)
+    first.commission = 300
+    second = _deal(deal_id=921, order_id=111, position_id=222, filled_volume=1000, price=2.0)
+    second.commission = 500
+    second.executionTimestamp = first.executionTimestamp + 60_000
+    broker._recon = _recon(positions=[_position(position_id=222, volume=2000)])
+    pushed = broker._translate_exec_event(__test_helper_entry_push(**__test_helper_DEAL_B))
+    assert pushed is not None and pushed.fee == pytest.approx(5.0)
+    __test_helper_book(engine, [pushed])
+    if restart:
+        broker = _next_process(broker)
+        engine = __test_helper_engine(broker)
+        engine.reconcile()
+    events: list = []
+    if listed == 'late':
+        broker._wire._deal_res = _deal_res(second)
+        events += [event for _ in range(2) for event in _run(broker)]
+        assert events == []
+    broker._wire._deal_res = _deal_res(first, second)
+
+    events += [event for _ in range(3) for event in _run(broker)]
+    __test_helper_book(engine, [*events, *events])
+
+    assert [(e.event_type, e.fill_id, e.fee) for e in events] == [
+        (FEE_EVENT_TYPE, 'c11:snapshot:1000', pytest.approx(3.0))]
+    # After a restart the adopted trade keeps the second deal's receipted 5.0.
+    assert engine._position.open_commission == pytest.approx(8.0)
+    row = broker.store_ctx.get_order('c11')
+    assert row is not None and not (row.extras or {}).get('fee_unbooked')
+    assert broker._settle_deliveries() == []
+    assert broker.store_ctx.keyed_events_for_run_id(_FEE_DELIVERY_EVENT) == {}
+
+
+def __test_reconcile_unpriced_deal_in_history_books_nothing_until_priced__(tmp_path):
+    """A complete deal history listing the progress without its price proves
+    nothing yet: no fill is booked, the cursor stays and the deal is not
+    taken as seen, so the priced push of that deal books it."""
+    unpriced = _deal(deal_id=930, order_id=111, position_id=222,
+                     filled_volume=1000, price=0.0)
+    broker = _ReconcileBroker(
+        _recon(orders=[_order(order_id=111, volume=2000, executed=1000,
+                              position_id=222, price=0.0)]),
+        deal_res=_deal_res(unpriced),
+    )
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c11', order_id=111, qty=volume_to_units(2000))
+
+    assert _run(broker) == []
+    row = broker.store_ctx.get_order('c11')
+    assert row is not None and row.filled_qty == 0.0
+    assert 930 not in broker._seen_deal_ids
+    assert 111 not in broker._deal_walks, "the window is read whole again"
+
+    push = __test_helper_entry_push(
+        deal_id=930, executed=1000, filled=1000, price=1.0, commission=300)
+    event = broker._translate_exec_event(push)
+    assert event is not None and event.event_type == 'partial'
+    assert event.fill_qty == pytest.approx(volume_to_units(1000))
+    assert event.fill_price == 1.0 and event.fill_id == '930'
+    assert broker.store_ctx.get_order('c11').filled_qty == pytest.approx(10.0)
+
+
+def __test_helper_unpriced_opening_history(*, close_price):
+    """Order 111 filled (deal 905) onto netting position 222, which an older
+    deal of another participant (904, order 777) had opened and the history
+    lists without a price; the SL (deal 906, order 999) then closed the whole
+    position while the stream was down."""
+    opening = _deal(deal_id=904, order_id=777, position_id=222, filled_volume=500, price=0.0)
+    opening.executionTimestamp = 1_699_999_000_000
+    return _deal_res(
+        opening,
+        _deal(deal_id=905, order_id=111, position_id=222, filled_volume=2000, price=1.2),
+        _close_deal(deal_id=906, order_id=999, position_id=222, closed_volume=2500,
+                    price=close_price))
+
+
+def __test_helper_unpriced_opening_broker(tmp_path, *, close_price):
+    """The working row of order 111 against :func:`__test_helper_unpriced_opening_history`."""
+    broker = _ReconcileBroker(_recon(positions=[]), deal_res=(
+        __test_helper_unpriced_opening_history(close_price=close_price)))
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c14', order_id=111, qty=volume_to_units(2000))
+    return broker
+
+
+def __test_unpriced_unrelated_deal_does_not_block_the_position_s_recovery__(tmp_path):
+    """An unpriced deal that needs no fill event (another participant's
+    opening) stays volume evidence: the priced entry and close are delivered."""
+    broker = __test_helper_unpriced_opening_broker(tmp_path, close_price=1.15)
+
+    events = _run(broker)
+
+    assert [(e.leg_type, e.event_type, e.fill_qty, e.fill_price, e.fill_id)
+            for e in events] == [
+        (LegType.ENTRY, 'filled', pytest.approx(20.0), pytest.approx(1.2), '905'),
+        (LegType.CLOSE, 'filled', pytest.approx(20.0), pytest.approx(1.15), '906'),
+    ]
+    assert 'c14' not in _live_coids(broker)
+
+
+def __test_unpriced_close_of_the_share_is_judged_once_priced__(tmp_path):
+    """The close of the bot's share listed without a price is not judged: no
+    fill, the row stays live and the walk is dropped; once the history prices
+    it, the next pass delivers the trade."""
+    broker = __test_helper_unpriced_opening_broker(tmp_path, close_price=0.0)
+
+    assert _run(broker) == []
+    assert 'c14' in _live_coids(broker)
+    assert 906 not in broker._judged_close_deals
+    assert 906 not in broker._seen_deal_ids
+    assert 111 not in broker._deal_walks, "the window is read whole again"
+
+    broker._wire._deal_res = __test_helper_unpriced_opening_history(close_price=1.15)
+    events = _run(broker)
+
+    assert [(e.leg_type, e.fill_price, e.fill_id) for e in events] == [
+        (LegType.ENTRY, pytest.approx(1.2), '905'),
+        (LegType.CLOSE, pytest.approx(1.15), '906'),
+    ]
+    assert 'c14' not in _live_coids(broker)

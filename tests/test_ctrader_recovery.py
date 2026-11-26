@@ -754,8 +754,10 @@ def __test_live_reconcile_keeps_waiting_for_a_sibling_s_fill_startup_waited_for_
     events = _reconcile_events(broker)
     broker._flush_external_interventions()
 
+    # c5's 10 units are its two deals (905, 908), one event each.
     assert _joint_share_fills(events) == [
-        ('222', 'c4', 10.0), ('222', 'c5', 10.0), ('998', None, 10.0), ('999', None, 10.0)]
+        ('222', 'c4', 10.0), ('222', 'c5', 5.0), ('222', 'c5', 5.0), ('998', None, 10.0),
+        ('999', None, 10.0)]
     assert _live_coids(broker) == set()
     assert len(reports) == 1
     assert reports[0][1]['deal_ids'] == [906]
@@ -943,6 +945,34 @@ def __test_recover_unknown_past_ttl_abandons__(tmp_path):
     assert row is not None
     assert row.state == 'rejected'
     assert 'c7' not in _live_coids(broker)
+
+
+@pytest.mark.parametrize('evidence', ['order-identified', 'execution-floor'])
+def __test_recover_unknown_past_ttl_keeps_a_row_with_venue_evidence__(tmp_path, evidence):
+    """An earlier startup identified the row's venue order (its ``order_id``
+    ref), or recorded that order's executed volume (``executed_cents``): a
+    later complete history read without the coid disproves neither, so even
+    past the TTL the row is not abandoned and keeps what it recorded."""
+    qty = volume_to_units(2000)
+    broker = _RecoveryBroker(_recon(), order_res=_order_res())
+    _open(tmp_path, broker)
+    _seed_submitted(broker, 'c7e', qty=qty)
+    extras = ({'order_id': '111'} if evidence == 'order-identified'
+              else {'executed_cents': 1000})
+    broker.store_ctx.upsert_order('c7e', extras=extras)
+
+    saved = _recovery._ABANDON_TTL_S
+    _recovery._ABANDON_TTL_S = -1.0
+    try:
+        _recover(broker)
+    finally:
+        _recovery._ABANDON_TTL_S = saved
+
+    row = broker.store_ctx.get_order('c7e')
+    assert row.state == 'submitted'
+    assert 'c7e' in _live_coids(broker)
+    for key, value in extras.items():
+        assert row.extras[key] == value
 
 
 def __test_recover_inconclusive_history_never_abandons__(tmp_path):
@@ -1396,6 +1426,26 @@ def __test_parked_absent_past_ttl_is_rejected_after_consecutive_misses__(tmp_pat
     assert row.state == 'rejected'
     assert 'k1' not in _live_coids(broker)
     assert _resolution_of(broker, 'k1') == 'rejected'
+    assert broker._parked_resolver.misses == {}
+
+
+def __test_parked_absence_with_an_execution_floor_is_never_rejected__(tmp_path):
+    """The journal holds the order's executed volume (``executed_cents``) but no
+    venue order id: the order reached the venue, so complete history reads
+    without the coid are no absence. Past the miss threshold and the TTL the
+    row stays parked with its floor; the intent is never dispatched again."""
+    broker = _RecoveryBroker(_recon(), order_res=_order_res())
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'k1e', age_s=700)
+    broker.store_ctx.upsert_order('k1e', extras={'executed_cents': 1000})
+
+    _resolve_parked(broker, passes=4)
+
+    row = broker.store_ctx.get_order('k1e')
+    assert row.state == 'disposition_unknown'
+    assert row.extras['executed_cents'] == 1000
+    assert 'k1e' in _live_coids(broker)
+    assert _resolution_of(broker, 'k1e') is None
     assert broker._parked_resolver.misses == {}
 
 
@@ -2102,3 +2152,113 @@ def __test_a_failed_adopted_leg_takeover_changes_nothing_and_is_retried__(
     assert row.filled_qty == pytest.approx(volume_to_units(2000))
     assert 5501 in broker._seen_deal_ids
     assert len(_events(broker, 'ctrader_adopted_leg_taken_over')) == 1
+
+
+def __test_helper_without_executed_volume(order):
+    """The order as a venue message that omits its executed volume."""
+    order.ClearField('executedVolume')
+    return order
+
+
+@pytest.mark.parametrize('history', ['no-fill', 'read-failed', 'filled'])
+def __test_recover_terminal_order_without_executed_volume_asks_its_deals__(
+        tmp_path, history):
+    """A terminal order the history reports without its executed volume
+    proves nothing executed: a deal history without a fill of it, complete or
+    failed, leaves the row pending with its refs for the reconcile pass's
+    verdict, and a fill the deals list is confirmed."""
+    qty = volume_to_units(2000)
+    deals = (_deal_res(_deal(deal_id=901, order_id=111, position_id=222,
+                             filled_volume=1000))
+             if history == 'filled' else _deal_res())
+    broker = _RecoveryBroker(
+        _recon(positions=([_position(position_id=222, volume=1000)]
+                          if history == 'filled' else [])),
+        order_res=_order_res(__test_helper_without_executed_volume(_order(
+            order_id=111, coid='c5d', volume=2000, status=_CANCELLED))),
+        deal_res=deals, deal_fail=history == 'read-failed',
+    )
+    _open(tmp_path, broker)
+    _seed_submitted(broker, 'c5d', qty=qty)
+
+    _recover(broker)
+
+    row = broker.store_ctx.get_order('c5d')
+    assert row is not None
+    if history in ('no-fill', 'read-failed'):
+        assert row.state == 'submitted'
+        assert (row.extras or {}).get('order_id') == '111'
+        assert 'c5d' in _live_coids(broker)
+    else:
+        assert row.state == 'confirmed'
+        assert row.filled_qty == volume_to_units(1000)
+        assert 901 in broker._seen_deal_ids
+
+
+def __test_recover_terminal_reported_zero_contradicted_by_the_floor_stays_pending__(tmp_path):
+    """An earlier read recorded the order's executed volume (the row's
+    ``executed_cents`` floor), and the history now reports the cancelled order
+    with zero executed: the venue's executed volume never shrinks, so the
+    zero proves nothing. With no fill listed yet the row stays pending with
+    its refs for the reconcile pass's verdict."""
+    broker = _RecoveryBroker(
+        _recon(), order_res=_order_res(_order(
+            order_id=111, coid='c5f', volume=2000, status=_CANCELLED)),
+        deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_submitted(broker, 'c5f', qty=volume_to_units(2000))
+    broker.store_ctx.upsert_order('c5f', extras={'executed_cents': 1000})
+
+    _recover(broker)
+
+    row = broker.store_ctx.get_order('c5f')
+    assert row.state == 'submitted'
+    assert row.extras['order_id'] == '111'
+    assert row.extras['executed_cents'] == 1000
+    assert 'c5f' in _live_coids(broker)
+
+
+def __test_recover_terminal_reported_zero_contradicted_by_the_cursor_stays_pending__(tmp_path):
+    """The journal already counts a fill of the order (its cursor), and the
+    history now reports the cancelled order with zero executed: the zero
+    proves nothing, so the row is not retired as rejected. With no fill
+    listed yet it stays pending with its refs for the reconcile pass."""
+    broker = _RecoveryBroker(
+        _recon(), order_res=_order_res(_order(
+            order_id=111, coid='c5g', volume=2000, status=_CANCELLED)),
+        deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_submitted(broker, 'c5g', qty=volume_to_units(2000))
+    broker.store_ctx.upsert_order('c5g', filled_qty=volume_to_units(500))
+
+    _recover(broker)
+
+    row = broker.store_ctx.get_order('c5g')
+    assert row.state == 'submitted'
+    assert row.extras['order_id'] == '111'
+    assert row.filled_qty == volume_to_units(500)
+    assert 'c5g' in _live_coids(broker)
+
+
+@pytest.mark.parametrize('volume', ['reported-zero', 'omitted'])
+def __test_parked_terminal_order_is_refused_only_on_a_reported_zero__(tmp_path, volume):
+    """A parked dispatch whose order ended is refused at once only when the
+    venue reports that nothing executed; one without its executed volume
+    lands with its refs, so the reconcile pass ends it from its deals."""
+    order = _order(order_id=44, coid='k8', volume=2000, status=_CANCELLED)
+    if volume == 'omitted':
+        __test_helper_without_executed_volume(order)
+    broker = _RecoveryBroker(_recon(), order_res=_order_res(order))
+    _open(tmp_path, broker)
+    _park_unknown(broker, 'k8', age_s=60)
+
+    _resolve_parked(broker)
+
+    row = broker.store_ctx.get_order('k8')
+    if volume == 'reported-zero':
+        assert row.state == 'rejected'
+        assert _resolution_of(broker, 'k8') == 'rejected'
+    else:
+        assert row.state == 'disposition_unknown'
+        assert row.extras['order_id'] == '44'
+        assert _resolution_of(broker, 'k8') is None

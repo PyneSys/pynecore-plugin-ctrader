@@ -2,20 +2,26 @@
 @pyne
 """
 import asyncio
+import logging
+import sqlite3
 import time
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
+from pynecore import lib
 from pynecore.core.broker.exceptions import (
     BrokerManualInterventionError,
     ExchangeConnectionError,
     ExchangeOrderRejectedError,
+    JournalWriteError,
     OrderDispositionUnknownError,
     OrderSkippedByPlugin,
     UnexpectedCancelError,
     VenueWritesQuarantinedError,
 )
-from pynecore.core.broker.idempotency import KIND_CANCEL
+from pynecore.core.broker.idempotency import KIND_CANCEL, KIND_CLOSE, KIND_ENTRY
 from pynecore.core.broker.models import (
     CANCEL_REASON_VENUE_REJECTED,
     VENUE_DRIVEN_CANCEL_REASONS,
@@ -32,23 +38,35 @@ from pynecore.core.broker.models import (
     QuarantineKind,
 )
 from pynecore.core.broker.native_failsafe_manager import NativeBracketSnapshot
+from pynecore.core.broker.parked_dispatch import (
+    ParkedDispatchResolver,
+    ParkedOutcome,
+    ParkedVerdict,
+)
 from pynecore.core.broker.one_way_emulator import (
     OneWayEmulator,
     close_leg_attempt_client_order_id,
 )
 from pynecore.core.broker.protection_guard import ProtectionLevels, rebaseline_after_resume
 from pynecore.core.broker.run_identity import RunIdentity
-from pynecore.core.broker.storage import BrokerStore
+from pynecore.core.broker.storage import BrokerStore, RunContext
 from pynecore.core.broker.store_helpers import (
+    CLOSE_ENDED_PARTIALLY_EVENT,
+    CLOSE_ENDED_UNFILLED_EVENT,
+    CLOSE_EXECUTED_QTY_KEY,
     ENTRY_KIND_POSITION,
     ENTRY_KIND_WORKING,
     create_bracket_ownership_row,
     create_close_leg_row,
     create_entry_order_row,
+    is_proven_refusal,
     mark_disposition_unknown,
 )
+from pynecore.core.broker.position import BrokerPosition
+from pynecore.core.broker.sync_engine import OrderSyncEngine
 
 from pynecore_ctrader import CTrader, CTraderConfig
+from pynecore_ctrader import recovery as ctrader_recovery
 from pynecore_ctrader.exceptions import CTraderProtocolError, map_error_code
 from pynecore_ctrader.helpers import (
     money_value,
@@ -59,7 +77,7 @@ from pynecore_ctrader.helpers import (
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
 from pynecore_ctrader.models import _SymbolRules
-from pynecore_ctrader.protection import _PositionDeal
+from pynecore_ctrader.protection import _FILL_DELIVERY_EVENT, _ClaimedFill, _PositionDeal
 from pynecore_ctrader.reconcile import _DealBridgeResult
 from pynecore_ctrader.wire import WireClient
 
@@ -674,6 +692,49 @@ def __test_translate_recovers_parked_entry_fill_by_coid__(tmp_path):
     # The now-resolved park is dropped (a filled MARKET never re-surfaces in
     # get_open_orders, so it would otherwise be replayed forever).
     assert 'c1' not in broker.store_ctx.replay()[1]
+
+
+def __test_translate_parked_entry_fill_whose_journal_write_failed_is_taken_again__(tmp_path):
+    """The push fill of a parked MARKET entry (coid echo) fails at its journal
+    write. Nothing of it stays done: the row keeps its parked state and
+    unraised cursor, the deal is not taken as seen, and the same fill
+    delivered again is recovered and booked."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    create_entry_order_row(
+        broker.store_ctx, coid='c1', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='pine1', pine_entry_id='pine1',
+        kind=ENTRY_KIND_POSITION, order_type='market',
+    )
+    mark_disposition_unknown(broker.store_ctx, coid='c1')
+    broker.store_ctx.record_park('c1', 'pine1')
+    order = _make_order(order_id=111, executed=1000, position_id=222,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    order.clientOrderId = 'c1'
+    deal = _model.ProtoOADeal(dealId=5, filledVolume=1000, executionPrice=1.2345)
+    push = _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order, deal=deal)
+
+    def write_fails(*_args, **_kwargs):
+        raise RuntimeError('journal write failed')
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(broker, '_journal_fill_delivery', write_fails)
+        with pytest.raises(RuntimeError, match='journal write failed'):
+            broker._translate_exec_event(push)
+
+    row = broker.store_ctx.get_order('c1')
+    assert row.state == 'disposition_unknown'
+    assert row.filled_qty == 0.0
+    assert broker.store_ctx.find_by_ref('order_id', '111') is None
+    assert 'c1' in broker.store_ctx.replay()[1]
+    assert 5 not in broker._seen_deal_ids
+
+    out = broker._translate_exec_event(push)
+
+    assert out is not None
+    assert (out.event_type, out.pine_id, out.fill_id, out.fill_qty) == (
+        'filled', 'pine1', '5', pytest.approx(10.0))
+    assert broker.store_ctx.get_order('c1').filled_qty == 10.0
 
 
 def __test_translate_never_resurrects_a_closed_row_by_coid__(tmp_path):
@@ -1482,6 +1543,183 @@ def __test_unbound_close_after_a_restart_keeps_the_fill_order__(tmp_path):
     second = restarted.store_ctx.get_order('c2')
     assert (second.extras or {})['journal_exposure_retired'] == pytest.approx(10.0)
     assert (first.extras or {})['journal_exposure_retired'] == pytest.approx(2.0)
+
+
+def __test_helper_venue(volume_cents: int) -> _oa.ProtoOAReconcileRes:
+    """The venue's snapshot: the long NETTING position 54302872, or nothing."""
+    res = _oa.ProtoOAReconcileRes()
+    if volume_cents:
+        res.position.append(_model.ProtoOAPosition(
+            positionId=54302872, price=1.1,
+            positionStatus=_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+            tradeData=_model.ProtoOATradeData(symbolId=1, volume=volume_cents,
+                                              tradeSide=_model.ProtoOATradeSide.BUY)))
+    return res
+
+
+def __test_helper_bracket_close(*, deal_id, closed_cents, remaining_cents):
+    """The position's own SL / TP closing ``closed_cents`` of the long position."""
+    order = _make_order(order_id=70215164, volume=closed_cents, executed=closed_cents,
+                        position_id=54302872, closing=True,
+                        side=_model.ProtoOATradeSide.SELL,
+                        order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    deal = _model.ProtoOADeal(dealId=deal_id, filledVolume=closed_cents, executionPrice=1.2,
+                              commission=40, moneyDigits=2)
+    event = _exec_event(_model.ProtoOAExecutionType.ORDER_FILLED, order=order, deal=deal)
+    event.position.CopyFrom(_model.ProtoOAPosition(
+        positionId=54302872,
+        positionStatus=(_model.ProtoOAPositionStatus.POSITION_STATUS_OPEN if remaining_cents
+                        else _model.ProtoOAPositionStatus.POSITION_STATUS_CLOSED),
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=remaining_cents,
+                                          tradeSide=_model.ProtoOATradeSide.BUY)))
+    return event
+
+
+def __test_helper_engine(broker) -> OrderSyncEngine:
+    """A sync engine of ``broker``'s run on its journal, as a process builds it."""
+    return OrderSyncEngine(broker=broker, position=BrokerPosition(), symbol='EURUSD',
+                           run_tag=broker.store_ctx.run_tag, mintick=0.00001,
+                           store_ctx=broker.store_ctx)
+
+
+def __test_helper_book(engine: OrderSyncEngine, events) -> None:
+    """Hand ``events`` to the engine and book them, as the next bar does."""
+    for event in events:
+        engine.on_order_event(event)
+    engine.apply_async_events()
+
+
+def __test_helper_stream_start(broker) -> list:
+    """Start ``broker``'s event stream with nothing queued; the events it delivers first."""
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        stream = broker.watch_orders()
+        events = []
+        try:
+            while True:
+                events.append(await asyncio.wait_for(stream.__anext__(), timeout=0.05))
+        except asyncio.TimeoutError:
+            return events
+        finally:
+            await stream.aclose()
+    return asyncio.run(run())
+
+
+def __test_helper_delivery_records(broker) -> dict:
+    return broker.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT)
+
+
+#: What the first process got done before it died in the push crash-window
+#: tests: ``kind`` -> (venue volume left in cents, the fill id the engine never
+#: took, the position the restart must hold).
+__test_helper_PUSH_CRASHES = {
+    'entry': (1000, '81', 10.0),
+    'partial_close': (600, '83', 6.0),
+    'full_close': (0, '83', 0.0),
+}
+
+
+@pytest.mark.parametrize('kind', list(__test_helper_PUSH_CRASHES))
+def __test_push_fill_journaled_before_the_engine_took_it_is_received_once_after_a_restart__(
+        tmp_path, monkeypatch, kind):
+    """The process journaled a push fill (the entry's raised cursor, the close
+    judged and debited or its rows retired) and died before its engine booked
+    the event. The restart adopts the position from the venue and the journal,
+    which already hold the fill; the next process delivers the fill again
+    marked as journaled before the restart, the engine records its receipt and
+    books nothing, and the delivery record goes once the receipt shows."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    venue_cents, fill_id, expected = __test_helper_PUSH_CRASHES[kind]
+    broker = _FakeBroker(reconcile=__test_helper_venue(0))
+    _open_store(tmp_path, broker)
+    _seed_unfilled_entry(broker, coid='c1', pine_id='L', order_id='70211174')
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    pushed = _deliver(broker, [_entry_fill_event(order_id=70211174, deal_id=81)])
+    if kind != 'entry':
+        broker._reconcile_res = __test_helper_venue(1000)
+        __test_helper_book(engine, pushed)
+        assert engine._position.size == pytest.approx(10.0)
+        pushed = _deliver(broker, [__test_helper_bracket_close(
+            deal_id=83, closed_cents=1000 - venue_cents, remaining_cents=venue_cents)])
+    assert [event.fill_id for event in pushed] == [fill_id]
+    assert set(__test_helper_delivery_records(broker)) == {'fill:81', f'fill:{fill_id}'}
+    # The process dies here: its engine never books the pushed fill.
+    process = _FakeBroker(reconcile=__test_helper_venue(venue_cents))
+    process.store_ctx = broker.store_ctx
+    restarted = __test_helper_engine(process)
+    restarted.reconcile()
+    assert restarted._position.size == pytest.approx(expected)
+    closed_before = len(restarted._position.closed_trades)
+
+    redelivered = __test_helper_stream_start(process)
+    __test_helper_book(restarted, redelivered)
+
+    assert [(event.fill_id, event.journaled_before_restart) for event in redelivered] == [
+        (fill_id, True)]
+    assert restarted._position.size == pytest.approx(expected)
+    assert len(restarted._position.closed_trades) == closed_before
+    assert process.store_ctx.fill_delivered(fill_id)
+    assert process._settle_deliveries() == []
+    assert __test_helper_delivery_records(process) == {}
+    later = _FakeBroker(reconcile=__test_helper_venue(venue_cents))
+    later.store_ctx = broker.store_ctx
+    assert __test_helper_stream_start(later) == []
+
+
+def __test_push_fill_yielded_twice_in_one_process_is_booked_once__(tmp_path, monkeypatch):
+    """A fill the engine is handed twice within one process (a stream that
+    delivered it, then a reopened stream) is booked once; its record goes once
+    the receipt shows."""
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker = _FakeBroker(reconcile=__test_helper_venue(0))
+    _open_store(tmp_path, broker)
+    _seed_unfilled_entry(broker, coid='c1', pine_id='L', order_id='70211174')
+    engine = __test_helper_engine(broker)
+    engine.reconcile()
+    entry = _deliver(broker, [_entry_fill_event(order_id=70211174, deal_id=81)])
+    broker._reconcile_res = __test_helper_venue(1000)
+    __test_helper_book(engine, entry)
+    close = _deliver(broker, [__test_helper_bracket_close(
+        deal_id=83, closed_cents=400, remaining_cents=600)])
+    broker._reconcile_res = __test_helper_venue(600)
+
+    __test_helper_book(engine, close + close + entry)
+
+    assert engine._position.size == pytest.approx(6.0)
+    assert len(engine._position.closed_trades) == 1
+    assert broker.store_ctx.fill_delivered('81') and broker.store_ctx.fill_delivered('83')
+    assert set(__test_helper_delivery_records(broker)) == {'fill:81', 'fill:83'}
+    assert broker._settle_deliveries() == []
+    assert __test_helper_delivery_records(broker) == {}
+
+
+def __test_push_close_interrupted_at_its_debit_leaves_nothing_durable__(tmp_path):
+    """The process stops while the push close's debit is written: the close
+    judged, the debit and the delivery record go together or not at all, so
+    the deal is neither judged nor delivered for a later process and the
+    process keeps no memory of judging it."""
+    broker = _FakeBroker(reconcile=__test_helper_venue(1000))
+    _open_store(tmp_path, broker)
+    _seed_unfilled_entry(broker, coid='c1', pine_id='L', order_id='70211174')
+    _deliver(broker, [_entry_fill_event(order_id=70211174, deal_id=81)])
+    judged_before = list(broker.store_ctx.iter_events_by_kind_since('ctrader_close_judged', 0))
+
+    def stop_at_debit(*_args, **_kwargs):
+        raise RuntimeError('process stopped')
+
+    broker._retire_partial_close_exposure = stop_at_debit
+    with pytest.raises(RuntimeError, match='process stopped'):
+        broker._translate_exec_event(__test_helper_bracket_close(
+            deal_id=83, closed_cents=400, remaining_cents=600))
+
+    assert list(broker.store_ctx.iter_events_by_kind_since(
+        'ctrader_close_judged', 0)) == judged_before
+    assert 83 not in broker._judged_close_deals
+    assert set(__test_helper_delivery_records(broker)) == {'fill:81'}
+    row = broker.store_ctx.get_order('c1')
+    assert row is not None and 'journal_exposure_retired' not in (row.extras or {})
 
 
 def __test_named_close_spills_the_rest_in_fill_order__(tmp_path):
@@ -2506,6 +2744,128 @@ def __test_execute_cancel_bool_confirmed_closes_broker_store_row__(tmp_path):
     assert list(broker.store_ctx.iter_live_orders()) == []
 
 
+@pytest.mark.parametrize('answer', ['cancelled-zero', 'not-found'])
+def __test_execute_cancel_bool_keeps_an_entry_with_an_unbooked_execution_floor__(
+        tmp_path, monkeypatch, answer):
+    """``True`` lets the core tear the entry's tracking and fail-safe down.
+    An earlier read recorded 10 units executed (``executed_cents``) that the
+    cursor does not count yet, so neither a cancel answer reporting zero nor a
+    not-found answer returns it: the row stays live, the cursor unmoved. Once
+    the fill is booked, the not-found answer is a settled end when the order's
+    final status names the executed volume the journal booked."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    row = broker.store_ctx.get_order('coid-111')
+    broker.store_ctx.upsert_order('coid-111', extras={**row.extras, 'executed_cents': 1000})
+    if answer == 'cancelled-zero':
+        broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED,
+                                           order=_make_order(order_id=111, executed=0))
+    else:
+        err = ExchangeOrderRejectedError("order gone")
+        err.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
+        broker._raise_on_dispatch = err
+    intent = CancelIntent(pine_id='Long', symbol='EURUSD')
+
+    assert asyncio.run(broker.execute_cancel(_envelope(intent))) is False
+
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+    assert broker.store_ctx.get_order('coid-111').filled_qty == 0.0
+    broker.store_ctx.set_filled('coid-111', 10.0)
+    err = ExchangeOrderRejectedError("order gone")
+    err.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
+    broker._raise_on_dispatch = err
+
+    async def ended_close_order(_order_id):
+        return int(_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED), 1000
+
+    monkeypatch.setattr(broker, '_ended_close_order', ended_close_order)
+    assert asyncio.run(broker.execute_cancel(_envelope(intent))) is True
+
+
+def __test_execute_cancel_bool_not_found_after_a_booked_partial_needs_the_final_volume__(
+        tmp_path, monkeypatch):
+    """A not-found answer after one booked partial fill names no final executed
+    volume: another slice may still wait in the event stream. Without the
+    order's final status the cancel is not reported as landed; a final volume
+    above the booked cursor keeps it pending too, until that slice is booked."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker.store_ctx.set_filled('coid-111', 4.0)
+    final: list[tuple[int, int | None] | None] = [None]
+
+    async def ended_close_order(_order_id):
+        return final[0]
+
+    monkeypatch.setattr(broker, '_ended_close_order', ended_close_order)
+    intent = CancelIntent(pine_id='Long', symbol='EURUSD')
+
+    def cancel() -> bool:
+        err = ExchangeOrderRejectedError("order gone")
+        err.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
+        broker._raise_on_dispatch = err
+        return asyncio.run(broker.execute_cancel(_envelope(intent)))
+
+    assert cancel() is False
+    final[0] = (int(_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED), 1000)
+    assert cancel() is False
+    broker.store_ctx.set_filled('coid-111', 10.0)
+    assert cancel() is True
+
+
+@pytest.mark.parametrize('exec_type', ['ORDER_FILLED', 'ORDER_PARTIAL_FILL'])
+def __test_execute_cancel_bool_answered_with_a_fill_is_no_landed_cancel__(tmp_path, exec_type):
+    """A cancel answered with the order's fill only queues that fill for the
+    event stream: ``True`` would let the core drop the entry's mapping before
+    the fill routes, so the cancel is reported as not landed."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker._canned_event = _exec_event(getattr(_model.ProtoOAExecutionType, exec_type),
+                                       order=_make_order(order_id=111, executed=1000))
+    intent = CancelIntent(pine_id='Long', symbol='EURUSD')
+
+    assert asyncio.run(broker.execute_cancel(_envelope(intent))) is False
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+
+
+def __test_execute_cancel_bool_not_found_proves_no_end_of_an_unfilled_entry__(tmp_path):
+    """A not-found answer for an entry nothing of which is booked names no
+    executed volume: the order may have filled, so the cancel is not reported
+    as landed and the row stays live for the reconcile pass."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    err = ExchangeOrderRejectedError("order gone")
+    err.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
+    broker._raise_on_dispatch = err
+    intent = CancelIntent(pine_id='Long', symbol='EURUSD')
+
+    assert asyncio.run(broker.execute_cancel(_envelope(intent))) is False
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+
+
+def __test_entry_answered_with_an_unexpected_response_is_no_refusal__(tmp_path):
+    """The entry request was written and the venue answered with a message that
+    is no verdict on it: the order may have landed, so the send's disposition
+    is unknown and its row is never journalled as refused."""
+    broker = _GatedBroker()
+    broker.venue_writes_blocked = lambda: False
+    _open_store(tmp_path, broker)
+    entry = EntryIntent(pine_id="Long", symbol="EURUSD", side="buy",
+                        qty=10.0, order_type=OrderType.LIMIT, limit=1.05)
+    envelope = _envelope(entry)
+
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.execute_entry(envelope))
+
+    row = broker.store_ctx.get_order(envelope.client_order_id(KIND_ENTRY))
+    assert row is not None and row.closed_ts_ms is None
+    assert row.state == 'disposition_unknown'
+    assert _store_events(broker, 'rejected') == []
+
+
 def _seed_adopted_working_entry(broker, *, pine_id='Long', order_id=111,
                                 position_id=52709805):
     """Seed the restart-adoption shape of a working-order row.
@@ -2613,23 +2973,191 @@ def __test_reinjected_cancel_translation_survives_dropped_refs__(tmp_path):
     _open_store(tmp_path, broker)
     _seed_adopted_working_entry(broker)
     cancelled = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED)
-    broker._retire_cancelled_working_order(111)  # refs now gone
+    broker._retire_cancelled_working_order(111, executed=0.0)  # refs now gone
     event = broker._translate_exec_event(cancelled)
     assert event is not None and event.event_type == 'cancelled'
     assert event.order.id == '111'
 
 
+def __test_cancel_retirement_keeps_a_row_whose_floor_shows_execution__(tmp_path):
+    """The cancel answer reports nothing executed, but an earlier read recorded
+    the order executed 10 units (the row's ``executed_cents`` floor) that the
+    cursor does not count yet: the row is no zero-fill cancel and stays live
+    for the reconcile pass."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    row = broker.store_ctx.get_order('coid-111')
+    broker.store_ctx.upsert_order('coid-111', extras={**row.extras, 'executed_cents': 1000})
+
+    broker._retire_cancelled_working_order(111, executed=0.0)
+
+    assert broker.store_ctx.get_order('coid-111').closed_ts_ms is None
+
+
+def __test_cancel_answer_of_zero_against_a_reported_execution_floor_keeps_the_parent__(
+        tmp_path):
+    """The cancel answer reports nothing executed, but an earlier read recorded
+    the order executed 10 units (the ``executed_cents`` floor) the cursor does
+    not count yet: the disposition is no confirmed cancel, the surfaced cancel
+    event carries the 10 units, and the fill cursor stays for the fill to book."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    row = broker.store_ctx.get_order('coid-111')
+    broker.store_ctx.upsert_order('coid-111', extras={**row.extras, 'executed_cents': 1000})
+    broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED,
+                                       order=_make_order(order_id=111, executed=0))
+    broker._exec_events = asyncio.Queue()
+
+    assert _cancel(broker) is CancelDispositionOutcome.ALREADY_FILLED
+
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+    surfaced = broker._translate_exec_event(broker._exec_events.get_nowait())
+    assert surfaced is not None and surfaced.event_type == 'cancelled'
+    assert surfaced.order.filled_qty == pytest.approx(10.0)
+    assert not surfaced.order.proven_unexecuted
+    assert broker.store_ctx.get_order('coid-111').filled_qty == 0.0
+
+
+@pytest.mark.parametrize('exec_type', [
+    _model.ProtoOAExecutionType.ORDER_CANCELLED,
+    _model.ProtoOAExecutionType.ORDER_EXPIRED,
+    _model.ProtoOAExecutionType.ORDER_REJECTED,
+], ids=['cancelled', 'expired', 'rejected'])
+def __test_terminal_push_never_reports_less_than_the_execution_floor__(tmp_path, exec_type):
+    """A terminal push reporting zero for an entry whose journal holds a
+    reported executed volume of 4 units (cursor still zero) carries those
+    4 units and never proves the order unexecuted; the cursor is not moved."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    row = broker.store_ctx.get_order('coid-111')
+    broker.store_ctx.upsert_order('coid-111', extras={**row.extras, 'executed_cents': 400})
+    event = broker._translate_exec_event(
+        _exec_event(exec_type, order=_make_order(order_id=111, executed=0)))
+    assert event is not None and event.event_type in ('cancelled', 'rejected')
+    assert event.order.filled_qty == pytest.approx(4.0)
+    assert event.order.remaining_qty == pytest.approx(6.0)
+    assert not event.order.proven_unexecuted
+    assert broker.store_ctx.get_order('coid-111').filled_qty == 0.0
+
+
+def __test_ended_order_with_a_reported_execution_floor_is_no_confirmed_cancel__(tmp_path):
+    """A closed row with nothing on the fill cursor and a journalled cancel is
+    no confirmed cancel while its ``executed_cents`` floor shows execution."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    row = broker.store_ctx.get_order('coid-111')
+    broker.store_ctx.upsert_order('coid-111', extras={**row.extras, 'executed_cents': 1000})
+    broker.store_ctx.log_event('cancelled', client_order_id='coid-111')
+    broker.store_ctx.close_order('coid-111')
+    closed = broker.store_ctx.get_order('coid-111')
+
+    assert (asyncio.run(broker._ended_order_cancel_outcome(closed))
+            is CancelDispositionOutcome.UNKNOWN)
+
+
 def __test_cancel_confirmed_keeps_partially_filled_row_live__(tmp_path):
     # A cancelled UNFILLED residual of a partially filled entry leaves a live
     # position under the row — retiring it would strand that exposure. The
-    # confirmed-cancel close must skip a row carrying fills.
+    # confirmed-cancel close must skip a row carrying fills, and the outcome
+    # keeps the parent: its executed part is an open position to protect.
     broker = _FakeBroker()
     _open_store(tmp_path, broker)
     _seed_working_entry(broker)
     broker.store_ctx.set_filled('coid-111', 4.0)
     broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED)
-    assert _cancel(broker) is CancelDispositionOutcome.CANCEL_CONFIRMED
+    assert _cancel(broker) is CancelDispositionOutcome.ALREADY_FILLED
     assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+
+
+@pytest.mark.parametrize('answer', ['executed-in-answer', 'volume-omitted'])
+def __test_cancel_answer_showing_execution_the_cursor_missed_keeps_the_parent__(
+        tmp_path, monkeypatch, answer):
+    """The cancel answer overtakes the fill push: its executed volume (or the
+    order's final status, when the answer omits it) proves the entry executed,
+    so the parent and its row stay, and the cancel event carries that part."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    cancelled = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED,
+                            order=_make_order(order_id=111, executed=400))
+    if answer == 'volume-omitted':
+        cancelled.order.ClearField('executedVolume')
+    broker._canned_event = cancelled
+    broker._exec_events = asyncio.Queue()
+    lookups: list[int] = []
+
+    async def ended_close_order(order_id):
+        lookups.append(order_id)
+        return int(_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED), 400
+
+    monkeypatch.setattr(broker, '_ended_close_order', ended_close_order)
+    assert _cancel(broker) is CancelDispositionOutcome.ALREADY_FILLED
+    assert lookups == ([] if answer == 'executed-in-answer' else [111])
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+    surfaced = broker._translate_exec_event(broker._exec_events.get_nowait())
+    assert surfaced is not None and surfaced.event_type == 'cancelled'
+    assert surfaced.order.filled_qty == pytest.approx(4.0)
+
+
+def __test_cancel_answer_proving_nothing_stays_unknown__(tmp_path, monkeypatch):
+    """An answer without the executed volume, whose order status does not
+    carry it either, proves no disposition: the row stays and the probe asks again."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    cancelled = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED,
+                            order=_make_order(order_id=111))
+    cancelled.order.ClearField('executedVolume')
+    broker._canned_event = cancelled
+
+    async def ended_close_order(_order_id):
+        return None
+
+    monkeypatch.setattr(broker, '_ended_close_order', ended_close_order)
+    assert _cancel(broker) is CancelDispositionOutcome.UNKNOWN
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+
+
+def __test_push_cancel_after_a_known_fill_carries_the_executed_part__(tmp_path):
+    """A cancel push that omits the executed volume, after the journal counted
+    a partial fill, reports that fill and leaves the row live."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker.store_ctx.set_filled('coid-111', 4.0)
+    cancelled = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED,
+                            order=_make_order(order_id=111))
+    cancelled.order.ClearField('executedVolume')
+    event = broker._translate_exec_event(cancelled)
+    assert event is not None and event.event_type == 'cancelled'
+    assert event.order.filled_qty == pytest.approx(4.0)
+    assert event.order.remaining_qty == pytest.approx(6.0)
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+
+
+@pytest.mark.parametrize('exec_type', [
+    _model.ProtoOAExecutionType.ORDER_CANCELLED,
+    _model.ProtoOAExecutionType.ORDER_EXPIRED,
+    _model.ProtoOAExecutionType.ORDER_REJECTED,
+], ids=['cancelled', 'expired', 'rejected'])
+def __test_terminal_push_never_reports_less_than_the_journal_s_fill__(tmp_path, exec_type):
+    """A terminal push of an entry whose journal counted a partial fill
+    reports at least that fill, even when the message says zero executed: it
+    never proves the order unexecuted."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    broker.store_ctx.set_filled('coid-111', 4.0)
+    event = broker._translate_exec_event(
+        _exec_event(exec_type, order=_make_order(order_id=111, executed=0)))
+    assert event is not None and event.event_type in ('cancelled', 'rejected')
+    assert event.order.filled_qty == pytest.approx(4.0)
+    assert event.order.remaining_qty == pytest.approx(6.0)
+    assert not event.order.proven_unexecuted
 
 
 def __test_push_cancelled_closes_broker_store_row__(tmp_path):
@@ -2890,9 +3418,10 @@ def __test_dispatch_order_sends_once_the_quarantine_lifts__():
     broker = _GatedBroker()
     broker.venue_writes_blocked = lambda: False
     req = _oa.ProtoOACancelOrderReq(ctidTraderAccountId=999, orderId=111)
-    with pytest.raises(ExchangeOrderRejectedError):
-        # The canned reconcile snapshot is not an execution event; what matters
-        # is that the request reached the wire.
+    with pytest.raises(OrderDispositionUnknownError):
+        # The canned reconcile snapshot is not an execution event (a written
+        # request with no verdict); what matters is that the request reached
+        # the wire.
         asyncio.run(broker._dispatch_order(req, coid='coid-q', context='gate'))
     assert broker.wire.requests == [req]
 
@@ -4197,6 +4726,11 @@ def __test_no_venue_write_leaves_before_a_replayed_report_is_handled__(tmp_path)
         restarted._exec_events = asyncio.Queue()
         agen = restarted.watch_orders()
         try:
+            # The close fill the dead process journaled, and no engine took,
+            # is delivered first, marked as already in the restart's position.
+            inherited = await asyncio.wait_for(agen.__anext__(), timeout=0.05)
+            assert inherited.journaled_before_restart
+            assert inherited.fill_id == '70400001'
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(agen.__anext__(), timeout=0.05)
         finally:
@@ -4204,7 +4738,8 @@ def __test_no_venue_write_leaves_before_a_replayed_report_is_handled__(tmp_path)
 
     asyncio.run(start_stream())
     assert len(calls) == 1 and calls[0][1]['order_id'] == 70400000
-    with pytest.raises(ExchangeOrderRejectedError):
+    with pytest.raises(OrderDispositionUnknownError):
+        # The canned reconcile snapshot is no verdict on the written request.
         asyncio.run(restarted._dispatch_order(req, coid='coid-r', context='entry'))
     assert _sent_writes(restarted) == [req]
 
@@ -4301,6 +4836,135 @@ def __test_own_close_fill_before_the_response_is_not_reported__(tmp_path):
     assert all(out is not None and out.leg_type is LegType.CLOSE for out in seen)
     assert calls == []
     assert broker._own_closes == []
+
+
+_LEG_COID = f"pc:{_PID}"
+
+
+def _send_close(broker, path: str) -> str:
+    """Send the run's close of ``_PID`` by ``path``; returns the coid it went under."""
+    if path == 'close_leg':
+        asyncio.run(broker.close_leg("EURUSD", str(_PID), 1000, _LEG_COID))
+        return _LEG_COID
+    _close(broker)
+    coid = broker._own_close_history[-1].coid
+    assert coid
+    return coid
+
+
+@pytest.mark.parametrize('path', ['close_leg', 'execute_close'])
+def __test_own_close_fill_carries_the_close_s_client_order_id__(tmp_path, path):
+    """The close request carries no client order id: its fill names the one
+    the close was sent under, in this process and after a restart."""
+    broker = _owned_broker(tmp_path)
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=888, position_id=_PID, closing=True))
+    coid = _send_close(broker, path)
+
+    out = broker._translate_exec_event(_closing_fill(
+        order_id=888, closed_cents=400, remaining_cents=600, partial=True))
+    assert out is not None and out.leg_type is LegType.CLOSE
+    assert out.order.client_order_id == coid
+    broker.store_ctx.close()
+
+    restarted = _FakeBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, restarted)
+    late = restarted._translate_exec_event(_closing_fill(
+        order_id=888, closed_cents=600, deal_id=9001))
+    assert late is not None and late.leg_type is LegType.CLOSE
+    assert late.order.client_order_id == coid
+    foreign = restarted._translate_exec_event(_closing_fill(
+        order_id=70400000, closed_cents=100, deal_id=9002))
+    assert foreign is None or foreign.order.client_order_id is None
+
+
+@pytest.mark.parametrize('answer_order', [889, 900], ids=['own', 'other'])
+def __test_held_close_fill_takes_the_client_order_id_its_answer_proves__(
+        tmp_path, answer_order):
+    """A fill taken for a close in flight carries no client order id until the
+    answer proves the close's order is the fill's: the close's own id then,
+    none when the answer names another order."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    seen: list = []
+
+    async def fill_overtakes_response(_req):
+        seen.append(broker._own_close_fill_coid(889, _PID) is None)
+        seen.append(broker._translate_exec_event(_closing_fill(
+            order_id=889, closed_cents=400, remaining_cents=600, partial=True)))
+
+    broker.on_dispatch = fill_overtakes_response
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=answer_order, position_id=_PID, closing=True))
+    asyncio.run(broker.close_leg("EURUSD", str(_PID), 1000, _LEG_COID))
+    broker.on_dispatch = None
+    assert seen == [True, None], "held until the close is answered"
+    released = _released(broker)
+    assert len(released) == 1
+    expected = _LEG_COID if answer_order == 889 else None
+    assert released[0].order.client_order_id == expected
+    record = __test_helper_delivery_records(broker).get(f"fill:{released[0].fill_id}")
+    assert record is not None and record['order']['client_order_id'] == expected
+
+
+@pytest.mark.parametrize('answer_order', [889, 900], ids=['own', 'other'])
+def __test_held_close_fill_replayed_after_restart_takes_the_proven_client_order_id__(
+        tmp_path, monkeypatch, answer_order):
+    """The process stops after the close's answer journaled its order id and
+    before the held fill was released: the restarted process delivers the
+    fill again with the id the journal proves (the close's own when the venue
+    named its order the fill's, none when another order filled it)."""
+    broker = _HookedBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, broker)
+    _seed_owned_entry(broker)
+    held: list = []
+
+    async def fill_overtakes_response(_req):
+        held.append(broker._translate_exec_event(_closing_fill(
+            order_id=889, closed_cents=400, remaining_cents=600, partial=True)))
+
+    broker.on_dispatch = fill_overtakes_response
+    monkeypatch.setattr(broker, '_release_held_claims', lambda *_args, **_kwargs: None)
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=answer_order, position_id=_PID, closing=True))
+    asyncio.run(broker.close_leg("EURUSD", str(_PID), 1000, _LEG_COID))
+    assert held == [None], "held until the close is answered"
+    records = __test_helper_delivery_records(broker)
+    assert [record['order']['client_order_id'] for record in records.values()] == [None]
+    broker.store_ctx.close()
+
+    restarted = _FakeBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, restarted)
+    replayed = [event for event in restarted._take_inherited_deliveries()
+                if event.event_type in ('filled', 'partial')]
+    assert len(replayed) == 1 and replayed[0].journaled_before_restart
+    assert replayed[0].leg_type is LegType.CLOSE
+    assert replayed[0].order.client_order_id == (_LEG_COID if answer_order == 889 else None)
+
+
+def __test_recovered_close_fill_carries_the_close_s_client_order_id__(tmp_path):
+    """A closing deal the history recovers names the run's close whose order
+    the venue named the deal's, also in a restarted process; a deal of
+    another order gets none."""
+    broker = _owned_broker(tmp_path)
+    broker._settle_own_close(
+        broker._open_own_close(_PID, 10.0, coid=_LEG_COID, volume_cents=1000), 888)
+    row = broker.store_ctx.get_order('c1')
+    own = _PositionDeal(deal_id=5001, order_id=888, executed_ms=1_700_000_000_000,
+                        filled=1000, closed=1000, side='sell', price=1.1, fee=0.0)
+    other = replace(own, deal_id=5002, order_id=70400000)
+    broker.store_ctx.close()
+
+    restarted = _FakeBroker(reconcile=_open_eurusd_position(position_id=_PID))
+    _open_store(tmp_path, restarted)
+    event = restarted._recovered_close_event(row, own, 1000, from_entry='L')
+    assert event.order.client_order_id == _LEG_COID
+    assert restarted._recovered_close_event(
+        row, other, 1000, from_entry='L').order.client_order_id is None
 
 
 def __test_own_close_with_unknown_outcome_claims_its_fill__(tmp_path):
@@ -5823,6 +6487,205 @@ def __test_netting_foreign_close_taken_for_an_own_close_is_not_booked_as_the_bot
     assert _store_events(broker, 'ctrader_close_claim_misbooked') == []
 
 
+@pytest.mark.parametrize(('closed_cents', 'released'), [(2000, None), (2500, 5.0)],
+                         ids=['given-back-whole', 'cut-in-part'])
+def __test_netting_released_claim_s_delivery_record_holds_what_is_delivered__(
+        tmp_path, closed_cents, released):
+    """The bot holds 20 of 40 and closes 10; meanwhile the other party closes
+    20 or 25, taken for the bot's close. A fill given back whole keeps no
+    delivery record; one cut in part keeps the record of exactly the event
+    delivered, so a restart before the engine takes it redelivers that."""
+    broker = _merged_broker(tmp_path, venue_cents=4000, share=20.0)
+
+    async def foreign_fill_in_flight(_req):
+        assert broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=closed_cents,
+            remaining_cents=4000 - closed_cents)) is None
+
+    broker.on_dispatch = foreign_fill_in_flight
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    _close(broker, qty=10.0)
+    broker.on_dispatch = None
+    events = _released(broker)
+
+    records = __test_helper_delivery_records(broker)
+    if released is None:
+        assert events == [] and records == {}
+    else:
+        assert [(event.fill_id, event.fill_qty) for event in events] == [
+            ('70700001', pytest.approx(released))]
+        assert events[0].journal_fill_qty == pytest.approx(released)
+        assert set(records) == {'fill:70700001'}
+        assert records['fill:70700001']['fill_qty'] == pytest.approx(released)
+        assert records['fill:70700001']['journal_fill_qty'] == pytest.approx(released)
+        assert records['fill:70700001']['from_entry'] == events[0].from_entry
+
+
+def __test_helper_release_run(tmp_path, monkeypatch, *, fail: bool):
+    """The bot holds 20 of 40 and closes 10; meanwhile the other party closes
+    25, taken for the bot's close. With ``fail`` the release's first delivery
+    record write fails."""
+    broker = _merged_broker(tmp_path, venue_cents=4000, share=20.0)
+    failures: list[int] = []
+
+    async def foreign_fill_in_flight(_req):
+        assert broker._translate_exec_event(_closing_fill(
+            order_id=70700000, closed_cents=2500, remaining_cents=1500)) is None
+        if fail:
+            failures.append(1)
+
+    original = RunContext.replace_keyed_events
+
+    def failing(self, kind, *args, **kwargs):
+        if kind == _FILL_DELIVERY_EVENT and failures:
+            failures.pop()
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(self, kind, *args, **kwargs)
+
+    monkeypatch.setattr(RunContext, 'replace_keyed_events', failing)
+    broker.on_dispatch = foreign_fill_in_flight
+    broker._canned_event = _exec_event(
+        _model.ProtoOAExecutionType.ORDER_ACCEPTED,
+        order=_make_order(order_id=889, position_id=_PID, closing=True))
+    _close(broker, qty=10.0)
+    broker.on_dispatch = None
+    return broker
+
+
+def __test_netting_release_whose_journal_write_fails_is_delivered_once_on_retry__(
+        tmp_path, monkeypatch):
+    """The release's journal writes fail once: they roll back, the fill stays
+    held as it was, its record still holds the provisional fill, and the retry
+    delivers the corrected fill exactly once, with the debits and the record a
+    release that never failed leaves."""
+    baseline = __test_helper_release_run(tmp_path / 'baseline', monkeypatch, fail=False)
+    expected = _released(baseline)
+    assert [(event.fill_id, event.fill_qty) for event in expected] == [
+        ('70700001', pytest.approx(5.0))]
+    broker = __test_helper_release_run(tmp_path / 'failing', monkeypatch, fail=True)
+
+    assert _released(broker) == []
+    assert len(broker._failed_releases) == 1
+    held = __test_helper_delivery_records(broker)['fill:70700001']
+    assert held['fill_qty'] == pytest.approx(10.0)
+
+    broker._retry_failed_releases()
+    broker._retry_failed_releases()
+
+    def terms(event):
+        return (event.fill_id, event.fill_qty, event.journal_fill_qty, event.from_entry,
+                event.leg_type)
+
+    assert [terms(event) for event in _released(broker)] == [
+        terms(event) for event in expected]
+    assert broker._failed_releases == []
+    assert broker._own_share(_PID) == pytest.approx(baseline._own_share(_PID))
+    records = __test_helper_delivery_records(broker)
+    assert set(records) == set(__test_helper_delivery_records(baseline)) == {'fill:70700001'}
+    assert records['fill:70700001']['fill_qty'] == pytest.approx(5.0)
+    assert records['fill:70700001']['journal_fill_qty'] == pytest.approx(5.0)
+
+
+def __test_netting_release_failing_again_holds_later_messages_back__(tmp_path, monkeypatch):
+    """The release's journal writes fail three times: when the close is
+    answered, when the stream starts, and when the next message arrives. The
+    stream translates no later message and runs no reconcile pass while the
+    release is pending; once the retry lands, the corrected held fill is
+    delivered before any later message is judged."""
+    broker = __test_helper_release_run(tmp_path, monkeypatch, fail=True)
+    broker.on_unexpected_cancel = 'ignore'
+    assert len(broker._failed_releases) == 1
+    original = RunContext.replace_keyed_events
+    failures = [1, 1]
+
+    def failing(self, kind, *args, **kwargs):
+        if kind == _FILL_DELIVERY_EVENT and failures:
+            failures.pop()
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(self, kind, *args, **kwargs)
+
+    monkeypatch.setattr(RunContext, 'replace_keyed_events', failing)
+    steps: list[tuple] = []
+    translate = broker._translate_exec_event
+
+    def spy(message):
+        steps.append(('translated', len(broker._failed_releases)))
+        return translate(message)
+
+    monkeypatch.setattr(broker, '_translate_exec_event', spy)
+
+    async def reconcile_pass():
+        raise AssertionError("no reconcile pass while a release is pending")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(broker, '_run_reconcile_pass', reconcile_pass)
+
+    async def run():
+        broker._exec_events = asyncio.Queue()
+        broker._exec_events.put_nowait(_closing_fill(
+            order_id=70800000, closed_cents=500, remaining_cents=1000))
+        # The next message: its arrival retries the release a third time.
+        broker._exec_events.put_nowait(object())
+        agen = broker.watch_orders()
+        try:
+            first = await asyncio.wait_for(agen.__anext__(), timeout=5.0)
+            steps.append(('delivered', first.fill_id, first.fill_qty))
+            # The later fill is not the bot's to book: nothing more comes.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(agen.__anext__(), timeout=0.2)
+        finally:
+            await agen.aclose()
+
+    asyncio.run(run())
+    assert failures == [] and broker._failed_releases == []
+    # The fill, the message after it and the release's own wake-up.
+    assert steps == [('delivered', '70700001', pytest.approx(5.0)),
+                     ('translated', 0), ('translated', 0), ('translated', 0)]
+
+
+def __test_netting_later_release_never_overtakes_a_failing_earlier_one__(
+        tmp_path, monkeypatch):
+    """A release judged while an earlier one is pending waits behind it; when
+    the earlier one fails again on retry, the later one (whose own writes would
+    succeed) is not delivered either, and once the earlier one lands both go
+    out in the order they were judged."""
+    baseline = __test_helper_release_run(tmp_path / 'baseline', monkeypatch, fail=False)
+    (template,) = _released(baseline)
+    broker = __test_helper_release_run(tmp_path / 'failing', monkeypatch, fail=True)
+    assert len(broker._failed_releases) == 1
+    later = broker._open_own_close(_PID, 1.0, coid='later', volume_cents=100)
+    claim = _ClaimedFill(
+        order_id=990, deal_id=99901, fill_qty=1.0, order_type=1, client_order_id='',
+        from_entry='L', terminal=True, executed_ms=None, share_before=None,
+        share_high=None, venue_after=0.0, booked=1.0,
+        event=replace(template, fill_id='99901', fill_qty=1.0, journal_fill_qty=1.0))
+    later.claims.append(claim)
+
+    broker._release_held_claims(later, [claim])
+    assert _released(broker) == []
+    assert [record for record, _claims, _cuts in broker._failed_releases][1] is later
+
+    original = RunContext.replace_keyed_events
+    failures = [1]
+
+    def failing(self, kind, *args, **kwargs):
+        if kind == _FILL_DELIVERY_EVENT and failures:
+            failures.pop()
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(self, kind, *args, **kwargs)
+
+    monkeypatch.setattr(RunContext, 'replace_keyed_events', failing)
+    broker._retry_failed_releases()
+    assert failures == [] and _released(broker) == []
+    assert [record for record, _claims, _cuts in broker._failed_releases][1] is later
+
+    broker._retry_failed_releases()
+    assert broker._failed_releases == []
+    assert [event.fill_id for event in _released(broker)] == ['70700001', '99901']
+
+
 @pytest.mark.parametrize('sink', ['working', 'missing', 'failing'])
 def __test_netting_foreign_close_taken_for_a_refused_own_close_is_rebooked__(tmp_path, sink):
     """The bot holds 20 of 40 and closes 10; meanwhile the other party closes
@@ -7120,8 +7983,10 @@ def __test_protection_firing_on_a_position_a_recovered_fill_opened_bare_is_repor
     _dispatch_limit_entry(broker, order_id=70211174)
     broker._wire = object()
     res = _oa.ProtoOAReconcileRes()
+    # The snapshot prices the fill (``executionPrice``): an unpriced one is
+    # not bookable and is not recovered from the snapshot alone.
     res.order.append(_make_order(order_id=70211174, volume=1000, executed=500,
-                                 position_id=_PID, limit=1.2,
+                                 position_id=_PID, limit=1.2, price=1.2,
                                  order_type=_model.ProtoOAOrderType.LIMIT))
     res.position.append(_protected_position(volume=500))
     broker._reconcile_res = res
@@ -7621,3 +8486,760 @@ def __test_working_entry_placed_after_an_operator_resume_is_judged__(tmp_path):
 
     assert len(calls) == 1
     assert _store_events(broker, 'ctrader_order_accepted_by_resume') == []
+
+
+# === Close journal: what a held partial-bracket close settles from ========
+# ``execute_close`` journals the close persist-first under its client order id
+# and ends that row with what the evidence proves. The core settles a held
+# partial-bracket close from that row alone
+# (``OrderSyncEngine._held_trigger_close_outcome``): 'sent', 'refused',
+# 'pending' (hold) or 'unknown' (hold + quarantine).
+
+_TRIGGER_CLOSE = CloseIntent(
+    pine_id="__pyne_partial_trigger__L-X1\0L\0sl_partial", symbol="EURUSD",
+    side="sell", qty=5.0, synthetic_kind='partial_trigger', target_entry_id='L',
+)
+_CLOSE_COID = _envelope(_TRIGGER_CLOSE).client_order_id(KIND_CLOSE)
+
+
+def _close_journal_broker(tmp_path) -> _FakeBroker:
+    broker = _FakeBroker(reconcile=_open_eurusd_position())
+    _open_store(tmp_path, broker)
+    return broker
+
+
+def _held_outcome(broker) -> str:
+    """The core's verdict on the held close, read from the real store."""
+    engine = SimpleNamespace(_store_ctx=broker.store_ctx, _broker=SimpleNamespace())
+    engine._held_order_close_outcome = (
+        lambda close_coid: OrderSyncEngine._held_order_close_outcome(engine, close_coid))
+    return OrderSyncEngine._held_trigger_close_outcome(engine, _CLOSE_COID).outcome
+
+
+def _left_no_record(broker) -> bool:
+    return OrderSyncEngine._close_attempt_left_no_record(
+        SimpleNamespace(_store_ctx=broker.store_ctx), _CLOSE_COID)
+
+
+def _close_answer(exec_type, *, executed=0, order_id=888):
+    status = (_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED if executed
+              else _model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+    order = _make_order(order_id=order_id, volume=500, executed=executed, price=1.25,
+                        status=status, position_id=777, closing=True,
+                        side=_model.ProtoOATradeSide.SELL)
+    deal = None
+    if executed:
+        deal = _model.ProtoOADeal(
+            dealId=9001, orderId=order_id, positionId=777, filledVolume=executed,
+            executionPrice=1.25, executionTimestamp=int(time.time() * 1000),
+            closePositionDetail=_model.ProtoOAClosePositionDetail(closedVolume=executed))
+    return _exec_event(exec_type, order=order, deal=deal)
+
+
+def _send_trigger_close(broker) -> None:
+    asyncio.run(broker.execute_close(_envelope(_TRIGGER_CLOSE)))
+
+
+def _order_status_lookup(broker, status, *, executed=0, fail=False) -> list:
+    """Serve ``ProtoOAOrderDetailsReq`` for the close order with ``status``."""
+    requests: list = []
+
+    async def answer(req):
+        requests.append(req)
+        if fail:
+            raise TimeoutError("order details timed out")
+        return _oa.ProtoOAOrderDetailsRes(order=_make_order(
+            order_id=req.orderId, volume=500, executed=executed, status=status,
+            position_id=777, closing=True, side=_model.ProtoOATradeSide.SELL))
+
+    broker._account_request = answer
+    return requests
+
+
+def _resolve(broker) -> None:
+    asyncio.run(broker._resolve_close_rows())
+
+
+def _restart_close_journal(tmp_path, broker) -> _FakeBroker:
+    """A new process of the same run: the journal survives, the memory does not."""
+    broker.store_ctx.close()
+    restarted = _FakeBroker(reconcile=_open_eurusd_position())
+    _open_store(tmp_path, restarted)
+    return restarted
+
+
+def __test_close_row_is_written_before_the_close_goes_out__(tmp_path):
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+
+    _send_trigger_close(broker)
+
+    assert broker.coid_at_dispatch == _CLOSE_COID
+    assert broker.state_at_dispatch == 'ctrader_close'
+    assert _left_no_record(broker) is False
+
+
+def __test_close_the_answer_shows_filled_settles_as_sent__(tmp_path):
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(
+        _model.ProtoOAExecutionType.ORDER_FILLED, executed=500)
+
+    _send_trigger_close(broker)
+
+    assert _held_outcome(broker) == 'sent'
+    row = broker.store_ctx.get_order(_CLOSE_COID)
+    assert row is not None and row.closed_ts_ms is not None
+    # The row never carries the fill: no journal walk may read it as exposure.
+    assert row.filled_qty == 0.0
+    assert [payload['executed'] for _i, coid, _r, payload
+            in broker.store_ctx.iter_events_by_kind_for_run_id('confirmed')
+            if coid == _CLOSE_COID] == [pytest.approx(5.0)]
+
+
+def __test_close_accepted_and_still_working_holds__(tmp_path):
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+    _send_trigger_close(broker)
+    _order_status_lookup(broker, _model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+
+    _resolve(broker)
+
+    assert _held_outcome(broker) == 'pending'
+
+
+def __test_close_whose_order_fill_is_pushed_later_settles_as_sent__(tmp_path):
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+    _send_trigger_close(broker)
+    assert _held_outcome(broker) == 'pending'
+
+    broker._translate_exec_event(
+        _close_answer(_model.ProtoOAExecutionType.ORDER_FILLED, executed=500))
+
+    assert _held_outcome(broker) == 'sent'
+
+
+def __test_close_the_venue_refused_settles_as_refused__(tmp_path):
+    broker = _close_journal_broker(tmp_path)
+    reject = ExchangeOrderRejectedError("cTrader rejected the order (TRADING_BAD_VOLUME)")
+    reject.__cause__ = CTraderProtocolError('TRADING_BAD_VOLUME', '')
+    broker._raise_on_dispatch = reject
+
+    with pytest.raises(ExchangeOrderRejectedError):
+        _send_trigger_close(broker)
+
+    assert _held_outcome(broker) == 'refused'
+
+
+def __test_close_whose_answer_was_lost_has_no_record_of_its_outcome__(tmp_path):
+    broker = _close_journal_broker(tmp_path)
+    broker._raise_on_dispatch = OrderDispositionUnknownError(
+        "close timed out", client_order_id=_CLOSE_COID)
+
+    with pytest.raises(OrderDispositionUnknownError):
+        _send_trigger_close(broker)
+
+    assert _held_outcome(broker) == 'unknown'
+    assert [payload['reason'] for _i, coid, _r, payload
+            in broker.store_ctx.iter_events_by_kind_for_run_id('ctrader_close_unresolved')
+            if coid == _CLOSE_COID] == ['answer_lost']
+
+
+@pytest.mark.parametrize(('status', 'executed', 'fail', 'expected'), [
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, 500, False, 'sent'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED, 200, False, 'partial'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED, 1000, False, 'sent'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_REJECTED, 0, False, 'refused'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED, 0, False, 'refused'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED, 0, False, 'refused'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED, 0, False, 'pending'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, 500, True, 'pending'),
+], ids=['filled', 'cancelled-after-a-fill', 'cancelled-after-a-full-fill', 'rejected',
+        'cancelled-unfilled', 'expired-unfilled', 'still-accepted', 'lookup-failed'])
+@pytest.mark.parametrize('restart', [False, True], ids=['running', 'restart'])
+def __test_answered_close_settles_from_its_order_status__(
+        tmp_path, status, executed, fail, expected, restart):
+    """The answer named the close order without a fill; its venue status,
+    read by the reconcile pass of this process or of a restarted one, decides.
+
+    A cancelled or expired order with nothing executed carries the core's
+    ended-unfilled mark (the leg re-arms, no quarantine); one that executed
+    part of the close carries the ended-partially mark with the executed
+    units, the row's quantity unit."""
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+    _send_trigger_close(broker)
+    if restart:
+        broker = _restart_close_journal(tmp_path, broker)
+        assert _held_outcome(broker) == 'pending', "the re-homed row holds"
+    requests = _order_status_lookup(broker, status, executed=executed, fail=fail)
+
+    _resolve(broker)
+
+    assert _held_outcome(broker) == expected
+    assert [req.orderId for req in requests] == [888]
+    marks = {kind: [payload for _i, coid, _r, payload
+                    in broker.store_ctx.iter_events_by_kind_for_run_id(kind)
+                    if coid == _CLOSE_COID]
+             for kind in (CLOSE_ENDED_UNFILLED_EVENT, CLOSE_ENDED_PARTIALLY_EVENT,
+                          'ctrader_close_unresolved')}
+    assert len(marks[CLOSE_ENDED_UNFILLED_EVENT]) == (
+        1 if expected == 'refused' and executed == 0
+        and status != _model.ProtoOAOrderStatus.ORDER_STATUS_REJECTED else 0)
+    assert [payload[CLOSE_EXECUTED_QTY_KEY] for payload in marks[CLOSE_ENDED_PARTIALLY_EVENT]] == (
+        [pytest.approx(2.0)] if expected == 'partial' else [])
+    assert marks['ctrader_close_unresolved'] == []
+
+
+def __test_close_interrupted_mid_send_has_no_record_of_its_outcome_after_a_restart__(
+        tmp_path):
+    """The process stopped between the persist-first write and the answer."""
+    broker = _close_journal_broker(tmp_path)
+    broker._open_own_close(777, 5.0, coid=_CLOSE_COID, volume_cents=500,
+                           row=('EURUSD', 'sell'))
+    _resolve(broker)
+    assert _held_outcome(broker) == 'pending', "in flight in this process"
+
+    broker = _restart_close_journal(tmp_path, broker)
+    _resolve(broker)
+
+    assert _held_outcome(broker) == 'unknown'
+
+
+def __test_reconcile_pass_ends_a_settled_close_row__(tmp_path):
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+    _send_trigger_close(broker)
+    _order_status_lookup(broker, _model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, executed=500)
+    broker._wire = object()
+
+    _snapshot_pass(broker)
+
+    assert _held_outcome(broker) == 'sent'
+
+
+def __test_close_row_is_not_an_entry_of_the_bot_s__(tmp_path):
+    """A live close row carries no venue order id, position link, fill or Pine
+    identity: the cancel probe, the entry-row walks and the working-order
+    lookup pass it by."""
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+    _send_trigger_close(broker)
+    row = broker.store_ctx.get_order(_CLOSE_COID)
+    assert row is not None and row.closed_ts_ms is None
+
+    assert row.exchange_order_id is None and row.pine_entry_id is None
+    assert row.from_entry is None and row.intent_key is None and row.filled_qty == 0.0
+    assert set(row.extras or {}) == {'ctrader_close'}
+    assert broker._find_working_order_id(_TRIGGER_CLOSE.pine_id) is None
+    assert broker._cancel_target_row(_TRIGGER_CLOSE.pine_id) is None
+
+
+def _failing_store_write(monkeypatch, method, *, kind=None):
+    """Make one store write of the close's persist-first transaction fail."""
+    original = getattr(RunContext, method)
+
+    def failing(self, *args, **kwargs):
+        if method == 'upsert_order' and args and args[0] == _CLOSE_COID:
+            raise sqlite3.OperationalError("disk I/O error")
+        if method == 'log_event' and args and args[0] == kind:
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(RunContext, method, failing)
+
+
+@pytest.mark.parametrize(('method', 'kind'), [
+    ('upsert_order', None), ('log_event', 'ctrader_own_close'),
+], ids=['row-write-fails', 'record-write-fails'])
+def __test_failed_persist_first_close_write_sends_nothing_and_leaves_no_row__(
+        tmp_path, monkeypatch, method, kind):
+    """The row and the record share one transaction: either failing rolls both
+    back, nothing is sent, the process tracks no close, and the core sees no
+    record of a send (it re-arms the leg with the unused id)."""
+    broker = _close_journal_broker(tmp_path)
+    _failing_store_write(monkeypatch, method, kind=kind)
+
+    with pytest.raises(JournalWriteError):
+        _send_trigger_close(broker)
+
+    assert broker.sent == []
+    assert broker.store_ctx.get_order(_CLOSE_COID) is None
+    assert _left_no_record(broker) is True
+    assert broker._own_closes == [] and broker._own_close_history == []
+    assert list(broker.store_ctx.iter_events_by_kind_for_run_id('ctrader_own_close')) == []
+
+
+def __test_close_resent_under_the_id_a_refused_send_spent_is_journalled_afresh__(tmp_path):
+    """A second send under the same id after the venue refused the first one
+    starts a fresh lifecycle of the row: its own answer decides it."""
+    broker = _close_journal_broker(tmp_path)
+    reject = ExchangeOrderRejectedError("cTrader rejected the order (TRADING_BAD_VOLUME)")
+    reject.__cause__ = CTraderProtocolError('TRADING_BAD_VOLUME', '')
+    broker._raise_on_dispatch = reject
+    with pytest.raises(ExchangeOrderRejectedError):
+        _send_trigger_close(broker)
+    assert _held_outcome(broker) == 'refused'
+    broker._raise_on_dispatch = None
+    broker._canned_event = _close_answer(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+
+    _send_trigger_close(broker)
+
+    assert broker.state_at_dispatch == 'ctrader_close'
+    assert _held_outcome(broker) == 'pending'
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['running', 'restart'])
+@pytest.mark.parametrize(('status', 'executed', 'expected'), [
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED, 200, 'partial'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_EXPIRED, 200, 'partial'),
+    (_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, 500, 'sent'),
+], ids=['cancelled-rest', 'expired-rest', 'filled-rest'])
+def __test_close_answered_with_a_partial_fill_holds_until_its_order_ends__(
+        tmp_path, status, executed, expected, restart):
+    """The answer reports part of the close executed while its order still
+    works: the row stays live, the held close is not settled as sent, and the
+    order's final status decides how much of it executed."""
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(
+        _model.ProtoOAExecutionType.ORDER_PARTIAL_FILL, executed=200)
+
+    _send_trigger_close(broker)
+
+    row = broker.store_ctx.get_order(_CLOSE_COID)
+    assert row is not None and row.closed_ts_ms is None
+    assert _held_outcome(broker) in ('working', 'pending')
+    if restart:
+        broker = _restart_close_journal(tmp_path, broker)
+    _order_status_lookup(broker, _model.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED, executed=200)
+    _resolve(broker)
+    assert _held_outcome(broker) != 'sent', "the order still works"
+    _order_status_lookup(broker, status, executed=executed)
+
+    _resolve(broker)
+
+    assert _held_outcome(broker) == expected
+    partial = [payload[CLOSE_EXECUTED_QTY_KEY] for _i, coid, _r, payload
+               in broker.store_ctx.iter_events_by_kind_for_run_id(CLOSE_ENDED_PARTIALLY_EVENT)
+               if coid == _CLOSE_COID]
+    assert partial == ([pytest.approx(2.0)] if expected == 'partial' else [])
+
+
+@pytest.mark.parametrize(('executed', 'expected'), [(200, 'partial'), (0, 'refused')],
+                         ids=['after-a-part', 'nothing-executed'])
+def __test_close_order_the_venue_cancels_ends_its_row_from_its_final_volume__(
+        tmp_path, executed, expected):
+    """A pushed cancel of the close order, after part of it executed or none,
+    ends the row with the order's own final executed volume: never as a close
+    that executed in whole."""
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(
+        _model.ProtoOAExecutionType.ORDER_PARTIAL_FILL if executed
+        else _model.ProtoOAExecutionType.ORDER_ACCEPTED, executed=executed)
+    _send_trigger_close(broker)
+    assert _held_outcome(broker) in ('working', 'pending')
+
+    broker._translate_exec_event(_exec_event(
+        _model.ProtoOAExecutionType.ORDER_CANCELLED,
+        order=_make_order(order_id=888, volume=1000, executed=executed,
+                          status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED,
+                          position_id=777, closing=True, side=_model.ProtoOATradeSide.SELL)))
+
+    assert _held_outcome(broker) == expected
+    row = broker.store_ctx.get_order(_CLOSE_COID)
+    assert row is not None and row.closed_ts_ms is not None
+
+
+def _pushed_close_cancel(*, executed: int | None):
+    """A pushed cancel of close order 888; ``executed=None`` omits its executed volume."""
+    order = _make_order(order_id=888, volume=1000, executed=executed or 0,
+                        status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED,
+                        position_id=777, closing=True, side=_model.ProtoOATradeSide.SELL)
+    if executed is None:
+        order.ClearField('executedVolume')
+    return _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED, order=order)
+
+
+def _close_partial_events(broker) -> list:
+    return [payload[CLOSE_EXECUTED_QTY_KEY] for _i, coid, _r, payload
+            in broker.store_ctx.iter_events_by_kind_for_run_id(CLOSE_ENDED_PARTIALLY_EVENT)
+            if coid == _CLOSE_COID]
+
+
+@pytest.mark.parametrize('executed', [None, 100], ids=['volume-omitted', 'volume-below-proof'])
+def __test_close_cancel_never_ends_below_the_part_its_own_fills_proved__(tmp_path, executed):
+    """Part of the close executed (its own fill, 2 units) before the venue
+    cancelled the order. A cancel that omits the executed volume, or reports
+    less than the fill proved, never ends the close as executing less than
+    that part: without the volume the row waits for the order's status, and a
+    lower volume is read as the proven part."""
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(
+        _model.ProtoOAExecutionType.ORDER_PARTIAL_FILL, executed=200)
+    _send_trigger_close(broker)
+
+    broker._translate_exec_event(_pushed_close_cancel(executed=executed))
+
+    row = broker.store_ctx.get_order(_CLOSE_COID)
+    assert row is not None
+    if executed is None:
+        assert row.closed_ts_ms is None
+        assert _held_outcome(broker) not in ('sent', 'partial', 'refused')
+        _order_status_lookup(broker, _model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED,
+                             executed=200)
+        _resolve(broker)
+    assert _held_outcome(broker) == 'partial'
+    assert _close_partial_events(broker) == [pytest.approx(2.0)]
+
+
+def __test_close_cancel_without_volume_or_proof_ends_nothing__(tmp_path):
+    """A cancel of a close order that carries no executed volume, of a close
+    no own fill was seen for, proves nothing: the row stays live until the
+    order's status shows the volume, and an order-details answer without it
+    proves nothing either."""
+    broker = _close_journal_broker(tmp_path)
+    broker._canned_event = _close_answer(_model.ProtoOAExecutionType.ORDER_ACCEPTED)
+    _send_trigger_close(broker)
+
+    broker._translate_exec_event(_pushed_close_cancel(executed=None))
+    row = broker.store_ctx.get_order(_CLOSE_COID)
+    assert row is not None and row.closed_ts_ms is None
+
+    async def omitted(_req):
+        order = _make_order(order_id=888, volume=500,
+                            status=_model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED,
+                            position_id=777, closing=True, side=_model.ProtoOATradeSide.SELL)
+        order.ClearField('executedVolume')
+        return _oa.ProtoOAOrderDetailsRes(order=order)
+
+    broker._account_request = omitted
+    _resolve(broker)
+    row = broker.store_ctx.get_order(_CLOSE_COID)
+    assert row is not None and row.closed_ts_ms is None
+    assert _held_outcome(broker) not in ('sent', 'partial', 'refused')
+
+    _order_status_lookup(broker, _model.ProtoOAOrderStatus.ORDER_STATUS_CANCELLED, executed=0)
+    _resolve(broker)
+    row = broker.store_ctx.get_order(_CLOSE_COID)
+    assert row is not None and row.closed_ts_ms is not None
+    assert _close_partial_events(broker) == []
+
+
+def __test_cancel_retirement_lands_with_its_cancelled_evidence_or_not_at_all__(
+        tmp_path, monkeypatch):
+    """A failed ``cancelled`` write leaves the row live: the row is never
+    closed without the evidence the restart cancel probe settles it from."""
+    broker = _FakeBroker(reconcile=_probe_position_open())
+    _open_store(tmp_path, broker)
+    _probe_working(broker)
+    coid = _only_live_order(broker).client_order_id
+    original = RunContext.log_event
+
+    def failing(self, kind, *args, **kwargs):
+        if kind == 'cancelled':
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(self, kind, *args, **kwargs)
+
+    monkeypatch.setattr(RunContext, 'log_event', failing)
+    with pytest.raises(sqlite3.OperationalError):
+        broker._retire_cancelled_working_order(111, executed=0.0)
+    monkeypatch.setattr(RunContext, 'log_event', original)
+
+    row = broker.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is None
+    broker._retire_cancelled_working_order(111, executed=0.0)
+    row = broker.store_ctx.get_order(coid)
+    assert row is not None and row.closed_ts_ms is not None
+    assert [event_coid for _i, event_coid, _r, _p
+            in broker.store_ctx.iter_events_by_kind_for_run_id('cancelled')] == [coid]
+
+
+# === Cancel probe: the outcome of an order no cancel reaches ==============
+# The cancel-tentative retry asks the plugin again, in the process that placed
+# the order and after a restart that re-armed it from the journal. Only what
+# the journal and the venue prove is an answer; anything else is UNKNOWN.
+
+_PROBE_POSITION = 777
+
+
+def _probe_position_open() -> _oa.ProtoOAReconcileRes:
+    return _open_eurusd_position(position_id=_PROBE_POSITION)
+
+
+def _probe_working(broker) -> None:
+    """A LIMIT entry the venue accepted: its row holds the order working."""
+    _dispatch_limit_entry(broker)
+
+
+def _probe_filled(broker, filled: float) -> str:
+    """The working LIMIT of :func:`_probe_working` with ``filled`` units journalled."""
+    _probe_working(broker)
+    row = _only_live_order(broker)
+    extras = dict(row.extras or {})
+    extras['position_id'] = _PROBE_POSITION
+    broker.store_ctx.upsert_order(row.client_order_id, filled_qty=filled, extras=extras)
+    return row.client_order_id
+
+
+def _probe_state(state: str, broker) -> None:
+    """Drive the entry ``Long`` into ``state`` through the plugin's own paths."""
+    if state == 'working':
+        _probe_working(broker)
+    elif state == 'cancelled-zero-fill':
+        _probe_working(broker)
+        broker._retire_cancelled_working_order(111, executed=0.0)
+    elif state == 'cancelled-after-partial-fill':
+        _probe_filled(broker, 4.0)
+        # The venue cancelled the unfilled rest: the row keeps the position.
+        broker._retire_cancelled_working_order(111, executed=0.0)
+    elif state == 'rejected':
+        reject = ExchangeOrderRejectedError("cTrader rejected the order (NOT_ENOUGH_MONEY)")
+        reject.__cause__ = CTraderProtocolError('NOT_ENOUGH_MONEY', '')
+        broker._raise_on_dispatch = reject
+        with pytest.raises(ExchangeOrderRejectedError):
+            _probe_working(broker)
+        broker._raise_on_dispatch = None
+    elif state == 'filled-open':
+        _probe_filled(broker, 10.0)
+    elif state == 'filled-closed':
+        _probe_filled(broker, 10.0)
+        broker._mark_position_closed(_PROBE_POSITION)
+    elif state == 'filled-position-gone-unjudged':
+        _probe_filled(broker, 10.0)
+    elif state == 'filled-then-closed-while-down':
+        # The deal history showed the order's fill and the close of its
+        # position: the pass retired the row with its cursor still at zero.
+        _probe_working(broker)
+        broker._retire_filled_then_closed(
+            _only_live_order(broker), None, _PROBE_POSITION, 1000)
+    elif state == 'closed-without-a-recorded-end':
+        _probe_working(broker)
+        broker.store_ctx.close_order(_only_live_order(broker).client_order_id)
+    elif state == 'never-reached-venue':
+        broker._raise_on_dispatch = ExchangeConnectionError("not written")
+        with pytest.raises(ExchangeConnectionError):
+            _probe_working(broker)
+        broker._raise_on_dispatch = None
+    elif state == 'rejected-on-absence':
+        _probe_unknown_disposition(broker)
+        coid = _only_live_order(broker).client_order_id
+        resolver = ParkedDispatchResolver(
+            venue='cTrader', log=logging.getLogger(__name__), grace_s=0.0,
+            misses_to_reject=1)
+        assert asyncio.run(resolver.resolve(broker.store_ctx, _probe_absent)) == [coid]
+    elif state == 'abandoned-unknown':
+        _probe_unknown_disposition(broker)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(ctrader_recovery, '_ABANDON_TTL_S', -1.0)
+            broker._maybe_abandon_unknown(_only_live_order(broker))
+    else:
+        raise AssertionError(state)
+
+
+def _probe_unknown_disposition(broker) -> None:
+    """A LIMIT entry whose send timed out: its row waits with an unknown disposition."""
+    broker._raise_on_dispatch = OrderDispositionUnknownError(
+        "cTrader entry timed out; disposition unknown", client_order_id="x")
+    with pytest.raises(OrderDispositionUnknownError):
+        _probe_working(broker)
+    broker._raise_on_dispatch = None
+
+
+async def _probe_absent(_row) -> ParkedVerdict:
+    """A complete venue read that does not know the order."""
+    return ParkedVerdict(ParkedOutcome.ABSENT)
+
+
+#: order state -> (venue positions at the probe, the venue's answer to a cancel
+#: sent, the expected outcome). One table for the running process and for the
+#: restart: the probe reads the journal across processes and the venue alike.
+_CANCEL_PROBE_MATRIX = {
+    'working': (
+        _oa.ProtoOAReconcileRes(), _model.ProtoOAExecutionType.ORDER_CANCELLED,
+        CancelDispositionOutcome.CANCEL_CONFIRMED),
+    'cancelled-zero-fill': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.CANCEL_CONFIRMED),
+    'cancelled-after-partial-fill': (
+        _probe_position_open(), 'not-found', CancelDispositionOutcome.ALREADY_FILLED),
+    'rejected': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.CANCEL_CONFIRMED),
+    'filled-open': (
+        _probe_position_open(), None, CancelDispositionOutcome.ALREADY_FILLED),
+    'filled-closed': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.FILLED_AND_CLOSED),
+    'filled-position-gone-unjudged': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.UNKNOWN),
+    'filled-then-closed-while-down': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.FILLED_AND_CLOSED),
+    'closed-without-a-recorded-end': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.UNKNOWN),
+    'never-reached-venue': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.UNKNOWN),
+    # Rejected only because the venue did not show the order: it may still
+    # have landed and filled.
+    'rejected-on-absence': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.UNKNOWN),
+    'abandoned-unknown': (
+        _oa.ProtoOAReconcileRes(), None, CancelDispositionOutcome.UNKNOWN),
+}
+
+
+@pytest.mark.parametrize('state', list(_CANCEL_PROBE_MATRIX))
+@pytest.mark.parametrize('restart', [False, True], ids=['running', 'restart'])
+def __test_cancel_probe_answers_only_what_the_evidence_proves__(tmp_path, state, restart):
+    positions, answer, expected = _CANCEL_PROBE_MATRIX[state]
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _probe_state(state, broker)
+    if restart:
+        broker.store_ctx.close()
+        broker = _FakeBroker()
+        _open_store(tmp_path, broker)
+    broker._reconcile_res = positions
+    broker.sent = []
+    if answer == 'not-found':
+        gone = ExchangeOrderRejectedError("order gone")
+        gone.__cause__ = CTraderProtocolError('ORDER_NOT_FOUND', '')
+        broker._raise_on_dispatch = gone
+    elif answer is not None:
+        broker._canned_event = _exec_event(answer, order=_make_order(
+            order_id=111, order_type=_model.ProtoOAOrderType.LIMIT))
+
+    outcome = _cancel(broker)
+
+    assert outcome is expected
+    # A cancel goes out only to an order the journal holds working.
+    assert [type(req) for req in broker.sent] == (
+        [_oa.ProtoOACancelOrderReq] if answer is not None else [])
+
+
+@pytest.mark.parametrize('state', ['rejected', 'rejected-on-absence', 'abandoned-unknown'])
+def __test_only_a_rejection_the_venue_answered_proves_a_refusal__(tmp_path, state):
+    """A ``rejected`` row the venue refused proves that nothing of it
+    executed; one rejected because the order was not found, by the core's
+    resolver or by the startup recovery's TTL, does not: the order may still
+    show up executed."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _probe_state(state, broker)
+
+    [row] = [row for row in broker.store_ctx.iter_orders_closed_since_for_run_id(0)
+             if row.pine_entry_id == 'Long']
+
+    assert row.state == 'rejected'
+    assert is_proven_refusal(row) is (state == 'rejected')
+
+
+def __test_cancel_probe_of_a_filled_entry_without_a_snapshot_gets_no_answer__(tmp_path):
+    """The positions snapshot could not be read: the probe raises the unknown
+    disposition (no venue answer) instead of guessing either way."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _probe_filled(broker, 10.0)
+
+    async def unreadable():
+        raise TimeoutError("reconcile timed out")
+
+    broker._reconcile = unreadable
+
+    with pytest.raises(OrderDispositionUnknownError):
+        _cancel(broker)
+
+
+def __test_fill_taken_by_a_close_with_lost_answer_carries_no_client_order_id__(tmp_path):
+    """A close whose answer is lost proves no fill its order: a fill it takes
+    by its window keeps the close's label but never its id, neither on the
+    event nor in the delivery record a restart replays."""
+    broker = _owned_broker(tmp_path)
+    broker._raise_on_dispatch = OrderDispositionUnknownError(
+        "timed out", client_order_id=_LEG_COID)
+    with pytest.raises(OrderDispositionUnknownError):
+        asyncio.run(broker.close_leg("EURUSD", str(_PID), 1000, _LEG_COID))
+    broker._raise_on_dispatch = None
+    assert broker._own_close_fill_coid(70400000, _PID) is None
+
+    out = broker._translate_exec_event(_closing_fill(
+        order_id=70400000, closed_cents=400, remaining_cents=600, partial=True,
+        deal_id=9100))
+    released = [out] if out is not None else _released(broker)
+    assert len(released) == 1 and released[0].leg_type is LegType.CLOSE
+    assert released[0].order.client_order_id is None
+    record = __test_helper_delivery_records(broker).get(f"fill:{released[0].fill_id}")
+    assert record is not None and record['order']['client_order_id'] is None
+
+
+def __test_cancel_disposition_counts_a_fill_booked_while_the_cancel_was_in_flight__(
+        tmp_path):
+    """The fill push books part of the entry while its cancel is awaited and
+    the answer reports nothing executed (as of its own state): the journal
+    after the await decides, so the parent is kept as executed."""
+    broker = _HookedBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+
+    async def fill_lands_meanwhile(_req):
+        broker.store_ctx.set_filled('coid-111', 4.0)
+
+    broker.on_dispatch = fill_lands_meanwhile
+    broker._canned_event = _exec_event(_model.ProtoOAExecutionType.ORDER_CANCELLED,
+                                       order=_make_order(order_id=111, executed=0))
+    assert _cancel(broker) is CancelDispositionOutcome.ALREADY_FILLED
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+
+
+@pytest.mark.parametrize('exec_type', [
+    _model.ProtoOAExecutionType.ORDER_CANCELLED,
+    _model.ProtoOAExecutionType.ORDER_EXPIRED,
+    _model.ProtoOAExecutionType.ORDER_REJECTED,
+], ids=['cancelled', 'expired', 'rejected'])
+@pytest.mark.parametrize('volume', ['reported-zero', 'omitted'])
+def __test_terminal_push_reports_its_executed_quantity_as_known_only_from_the_venue__(
+        tmp_path, exec_type, volume):
+    """A terminal push of an entry proves nothing executed only with the
+    order's executed volume: without it the event's quantity is a lower bound
+    (filled_qty_known False) and the row stays live for the reconcile pass."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    message = _exec_event(exec_type, order=_make_order(order_id=111, executed=0))
+    if volume == 'omitted':
+        message.order.ClearField('executedVolume')
+    event = broker._translate_exec_event(message)
+    assert event is not None and event.event_type in ('cancelled', 'rejected')
+    assert event.order.filled_qty == 0.0
+    assert event.order.filled_qty_known is (volume == 'reported-zero')
+    assert event.order.proven_unexecuted is (volume == 'reported-zero')
+    if volume == 'omitted' or exec_type == _model.ProtoOAExecutionType.ORDER_REJECTED:
+        assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == [
+            'coid-111']
+
+
+def __test_order_error_event_never_proves_the_order_unexecuted__(tmp_path):
+    """An order error names no executed volume: its rejected event carries
+    the journal's cursor as a lower bound, and the row stays live."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    event = broker._translate_exec_event(_oa.ProtoOAOrderErrorEvent(
+        ctidTraderAccountId=999, errorCode='TRADING_BAD_VOLUME', orderId=111))
+    assert event is not None and event.event_type == 'rejected'
+    assert event.order.filled_qty_known is False
+    assert not event.order.proven_unexecuted
+    assert [r.client_order_id for r in broker.store_ctx.iter_live_orders()] == ['coid-111']
+
+
+def __test_order_error_event_carries_the_execution_floor__(tmp_path):
+    """An earlier read recorded that the venue reported 1 unit executed
+    (``executed_cents``) though the cursor counts none: the order error's
+    rejected event carries that unit, never less than the evidence proves."""
+    broker = _FakeBroker()
+    _open_store(tmp_path, broker)
+    _seed_working_entry(broker)
+    row = broker.store_ctx.get_order('coid-111')
+    broker.store_ctx.upsert_order('coid-111', extras={**(row.extras or {}), 'executed_cents': 100})
+    event = broker._translate_exec_event(_oa.ProtoOAOrderErrorEvent(
+        ctidTraderAccountId=999, errorCode='TRADING_BAD_VOLUME', orderId=111))
+    assert event is not None and event.event_type == 'rejected'
+    assert event.order.filled_qty == pytest.approx(1.0)
+    assert event.order.filled_qty_known is False
+    assert broker.store_ctx.get_order('coid-111').filled_qty == 0.0
