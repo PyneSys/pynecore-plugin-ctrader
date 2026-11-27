@@ -32,9 +32,12 @@ from pynecore.core.broker.models import (
     OrderType,
 )
 from pynecore.core.broker.store_helpers import (
+    ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
     EXTRAS_KEY_BRACKET_OWN_LEG_ID,
     iter_active_bracket_ownerships,
 )
+from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
 
 from .helpers import (
     REQUEST_TIMEOUT,
@@ -66,6 +69,12 @@ from .state import _ORDER_STATUS_MAP, _ORDER_TYPE_MAP
 from .wire import CTraderConnectionError
 
 logger = logging.getLogger(__name__)
+
+#: Audit event of an own fill no journal row tracked, adopted as the run's own
+#: exposure while the run goes on (:meth:`~_EventStreamMixin._adopt_own_fill_in_run`).
+_OWN_FILL_ADOPTED_EVENT = 'ctrader_own_fill_adopted'
+#: Audit event of an own fill no journal row tracked and nothing adopted.
+_OWN_FILL_UNTRACKED_EVENT = 'ctrader_own_fill_untracked'
 
 #: ``ProtoOAExecutionType`` -> :class:`OrderEvent` ``event_type``.
 _EXEC_TYPE_TO_EVENT = {
@@ -123,8 +132,10 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         A manual close found while translating a fill is reported only after
         that fill was yielded, and one recovered by a reconcile pass after the
         pass's events were yielded, so the events are queued in the engine
-        before the external-intervention policy acts; a halt raises from here
-        and the engine books the queued events before the run stops. Reports
+        before the external-intervention policy acts; the fail-safe signal of
+        a ``stop`` policy without a working quarantine sink raises from here,
+        the engine books the queued events, latches the quarantine on it and
+        reopens the stream. Reports
         an earlier process queued but never handled are handled first, before
         the stream waits for anything; venue writes wait for them. The events
         of closing fills an own close took while it was in flight are yielded
@@ -209,7 +220,8 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             try:
                 event = self._translate_exec_event(message)
             except BrokerManualInterventionError:
-                # A deliberate halt must reach the engine's graceful stop.
+                # A report the engine latches its quarantine on: it reaches the
+                # engine, which reopens the stream.
                 raise
             except Exception as exc:  # noqa: BLE001 - one message must not kill the stream
                 # A translation failure on one PUSH message is recoverable:
@@ -251,12 +263,12 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
         grace window). A recoverable reconcile error — a transport hiccup on
         the snapshot or the deal-history bridge request — is logged and
         swallowed so the PUSH stream (the primary order-event source) is never
-        torn down by the gap-filler. A deliberate halt from the
-        disappearance-grace tracker (``on_unexpected_cancel='halt'``, or a
-        quarantining policy with no engine sink wired ->
-        :class:`BrokerManualInterventionError`) is NOT a transient failure: it
-        propagates so the engine performs its graceful stop — swallowing it
-        would strand the strategy out of sync. ``asyncio.CancelledError`` is a
+        torn down by the gap-filler. The fail-safe signal of the
+        disappearance-grace tracker (the ``stop`` policy with no working
+        quarantine sink -> :class:`BrokerManualInterventionError`) is NOT a
+        transient failure: it propagates so the engine latches the
+        external-intervention quarantine on it and reopens the stream —
+        swallowing it would leave an intervention unanswered. ``asyncio.CancelledError`` is a
         ``BaseException`` and so still propagates for a clean teardown.
 
         The transient-failure warning is rate-limited on the failure streak:
@@ -458,8 +470,17 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             # ambiguous timeout never recorded its refs, so :meth:`_resolve_identity`
             # misses even though the order filled and the PUSH echoes our coid.
             recovered_pine_id = self._recover_parked_entry_by_coid(order)
+            own = (self._is_run_client_order_id(order.clientOrderId)
+                   or order.tradeData.label == self.store_ctx.run_tag)
+            adopted_coid = (self._adopt_own_fill_in_run(order, deal)
+                            if recovered_pine_id is None and own else None)
             if recovered_pine_id is not None:
                 pine_id, from_entry, leg_type = recovered_pine_id, None, LegType.ENTRY
+            elif adopted_coid is not None:
+                # The bot's own exposure, booked now under the entry id the
+                # engine's startup adoption gives exposure no entry names.
+                pine_id, from_entry, leg_type = ADOPTED_STARTUP_ENTRY_ID, None, LegType.ENTRY
+                exch_order = replace(exch_order, client_order_id=adopted_coid)
             else:
                 # A fill that reverse-maps to no order this run placed is external
                 # activity (manual broker action, or another bot on the same
@@ -470,9 +491,8 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                 # external-order policy (see broker-plugin-responsibility-review.md).
                 # ``store_ctx is None`` (tests / persistence off) keeps the legacy
                 # emit path so identity-less fixtures still observe the event.
-                # An order carrying the run's tag is the bot's own whose journal
-                # row was lost: nothing can book it now, so ERROR + audit; the
-                # next start adopts the position by its label.
+                # An own fill :meth:`_adopt_own_fill_in_run` did not adopt is
+                # audited as the bot's own (its reason is logged there).
                 payload = {
                     'execution_type': event_type,
                     'order_id': order.orderId,
@@ -481,16 +501,14 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
                 self.store_ctx.log_event(
                     'external_activity_ignored',
                     exchange_order_id=str(order.orderId) or None, payload=payload)
-                if (self._is_run_client_order_id(order.clientOrderId)
-                        or order.tradeData.label == self.store_ctx.run_tag):
-                    logger.error(
-                        "cTrader: order %d (%s) of this run filled, but no live journal row "
-                        "of the run tracks it; not booked (the next start adopts its "
-                        "position)", order.orderId, order.clientOrderId)
+                if own:
                     self.store_ctx.log_event(
-                        'ctrader_own_fill_untracked',
+                        _OWN_FILL_UNTRACKED_EVENT,
                         exchange_order_id=str(order.orderId) or None, payload=payload)
                 return None
+        if (event_type in ('filled', 'partial') and leg_type is LegType.ENTRY
+                and deal is not None and self._held_for_adoption_read(message, order, deal)):
+            return None
         if event_type in ('cancelled', 'rejected'):
             # The cancel, expiry or rejection of an order part of which executed
             # carries that part: the core keeps the protection of a partly
@@ -1255,6 +1273,160 @@ class _EventStreamMixin(_ProtectionMixin, ABC):
             payload={'position_id': position_id or None},
         )
         return row.pine_entry_id
+
+    def _adopt_own_fill_in_run(self, order, deal) -> str | None:
+        """Journal an own fill no journal row tracks as the run's own exposure.
+
+        The order carries the run's client order id or label, but no row of
+        this process maps it: its dispatch row was ended without the venue's
+        evidence of this execution (abandoned, or judged cancelled or rejected
+        on the venue's earlier word), or the journal lost it. The volume is the
+        bot's exposure on the venue all the same. Booking it now keeps the
+        engine's book equal to the venue while the run goes on, instead of
+        leaving it out until a restart adopts the position: the startup's own
+        leg adoption (``_RecoveryMixin._adopt_own_leg``) done for one fill.
+
+        A row of its own (``<run tag>-own-<order id>``) is journalled for the
+        order under the synthetic entry id the engine's adoption uses for
+        exposure no entry names
+        (:data:`~pynecore.types.strategy.ADOPTED_STARTUP_ENTRY_ID`), with the
+        order's ``order_id`` ref, so this fill and every later one of the same
+        order are reverse-mapped, cursored and protected like any entry fill.
+        A row of an order still working on the venue is a working row under its
+        venue order id: no intent manages it, so the engine's stray-order
+        invariant cancels the remainder before it opens more. When the order
+        executed more before this fill than the fill itself (a stream gap, or
+        an earlier process), the row's cursor stays at zero and the fill is
+        held: the reconcile pass reads the order's deals and books every one of
+        them once, in execution order at its own price
+        (:meth:`_held_for_adoption_read`).
+
+        Nothing is adopted, and the fill stays out of the book, for a fill
+        without volume or price, a closing fill (it reduces a position no row
+        of the run holds), an order the engine holds for its execution
+        evidence (:meth:`~pynecore.core.broker.storage.RunContext.held_execution_order_ids`:
+        the hold's recovery books it, adopting it as well would book it
+        twice), or a row id already taken.
+
+        :param order: The fill's ``ProtoOAOrder``.
+        :param deal: The fill's ``ProtoOADeal``, if any.
+        :return: The coid of the adopted row, or ``None`` when nothing was adopted.
+        """
+        store = self.store_ctx
+        if store is None or not order.orderId:
+            return None
+        if (deal is None or deal.filledVolume <= 0 or not deal.executionPrice
+                or not order.positionId or order.closingOrder
+                or self._is_closing_fill(order, deal)):
+            logger.error(
+                "cTrader: order %d (%s) of this run executed, but no journal row of the "
+                "run tracks it and the execution opens no exposure to adopt; not booked",
+                order.orderId, order.clientOrderId)
+            return None
+        order_id = str(order.orderId)
+        if order_id in store.held_execution_order_ids():
+            logger.warning(
+                "cTrader: order %d (%s) of this run filled with no journal row tracking it; "
+                "the engine holds it for its execution evidence, whose recovery books it",
+                order.orderId, order.clientOrderId)
+            return None
+        coid = f"{store.run_tag}-own-{order_id}"
+        if store.get_order(coid) is not None:
+            logger.error(
+                "cTrader: order %d (%s) of this run filled with no journal row tracking it, "
+                "and its adoption row %s is taken already; not booked",
+                order.orderId, order.clientOrderId, coid)
+            return None
+        position_id = order.positionId
+        working = (order.orderStatus != OpenApiModelMessages.ProtoOAOrderStatus.ORDER_STATUS_FILLED
+                   and order.executedVolume < order.tradeData.volume)
+        side = ('buy' if order.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
+                else 'sell')
+        qty = volume_to_units(max(order.tradeData.volume, order.executedVolume))
+        symbol = self._symbol_name_for(order.tradeData.symbolId)
+        extras: dict = {'kind': ENTRY_KIND_WORKING if working else ENTRY_KIND_POSITION,
+                        'entry_filled_at': epoch_time(), 'order_id': order_id,
+                        'position_id': position_id, 'adopted_in_run': True,
+                        'executed_cents': max(int(order.executedVolume),
+                                              int(deal.filledVolume))}
+        # The order's deal history starts no later than its creation; a push
+        # that names no creation time leaves the read the default window.
+        if order.tradeData.openTimestamp:
+            extras['submitted_at_ms'] = order.tradeData.openTimestamp
+        store.upsert_order(
+            coid, symbol=symbol, side=side, qty=qty, filled_qty=0.0, state='confirmed',
+            pine_entry_id=ADOPTED_STARTUP_ENTRY_ID,
+            exchange_order_id=order_id if working else str(position_id),
+            extras=extras,
+        )
+        store.add_ref(coid, 'order_id', order_id)
+        self._link_position_ref(coid, position_id)
+        logger.error(
+            "cTrader: order %d (%s) of this run filled %s units into position %d, but no "
+            "journal row of the run tracked it; adopted as the bot's own (row %s)",
+            order.orderId, order.clientOrderId, volume_to_units(deal.filledVolume),
+            position_id, coid)
+        store.log_event(
+            _OWN_FILL_ADOPTED_EVENT, client_order_id=coid, exchange_order_id=order_id,
+            payload={'order_id': order.orderId, 'client_order_id': order.clientOrderId,
+                     'position_id': position_id, 'deal_id': deal.dealId, 'side': side,
+                     'qty': volume_to_units(deal.filledVolume), 'working': working})
+        return coid
+
+    def _held_for_adoption_read(self, message, order, deal) -> bool:
+        """Hold a fill of an order adopted in the run while earlier executions are unbooked.
+
+        A row :meth:`_adopt_own_fill_in_run` journalled counts the order's
+        executions oldest first, like every entry row. When the order executed
+        more before this fill (the push's cumulative ``executedVolume`` less
+        the deal) than the row's cursor counts, or the push names no
+        cumulative at all for a row that counts nothing yet, booking the fill
+        would move the cursor past executions the engine never booked. The
+        fill is held instead: its deal is left out of the de-dup, the row's
+        ``executed_cents`` floor is raised to what the order executed, and the
+        reconcile pass books the order's executions from its deal history,
+        each once under its deal id at its own price (``_ReconcileMixin``,
+        paced by ``_ReconcileMixin._adoption_read_due``). The venue's
+        protection view of the position is taken now, as for a booked fill.
+
+        :param message: The ``ProtoOAExecutionEvent``.
+        :param order: Its ``ProtoOAOrder``.
+        :param deal: Its ``ProtoOADeal``.
+        :return: ``True`` when the fill is held and must not be emitted.
+        """
+        store = self.store_ctx
+        if store is None or not order.orderId:
+            return False
+        row = store.find_by_ref('order_id', str(order.orderId))
+        extras = (row.extras or {}) if row is not None else {}
+        if row is None or row.closed_ts_ms is not None or not extras.get('adopted_in_run'):
+            return False
+        executed = int(order.executedVolume)
+        if executed > 0:
+            if row.filled_qty >= volume_to_units(executed - deal.filledVolume) - _VOLUME_TOL:
+                return False
+        elif row.filled_qty > _VOLUME_TOL:
+            return False
+        self._seen_deal_ids.discard(deal.dealId)
+        patched = dict(extras)
+        patched['executed_cents'] = max(
+            int(extras.get('executed_cents') or 0), executed, int(deal.filledVolume))
+        if ('submitted_at_ms' not in patched and message.HasField('position')
+                and message.position.tradeData.openTimestamp):
+            # No creation time of the order: its deals into this position are
+            # no older than the position.
+            patched['submitted_at_ms'] = message.position.tradeData.openTimestamp
+        if patched != extras:
+            store.upsert_order(row.client_order_id, extras=patched)
+        if message.HasField('position'):
+            self._take_own_fill_protection(message.position)
+        logger.warning(
+            "cTrader: order %d adopted in the run as row %s executed %s units before deal %d, "
+            "which its cursor does not count; the deal is held and the reconcile pass books "
+            "the order's executions from its deal history",
+            order.orderId, row.client_order_id,
+            volume_to_units(max(0, executed - deal.filledVolume)), deal.dealId)
+        return True
 
     def _coid_for_order(self, order) -> str | None:
         """Best-effort BrokerStore lookup of the client-order-id for an order."""

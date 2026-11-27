@@ -3952,7 +3952,8 @@ class _ProtectionMixin(_CTraderBase, ABC):
 
         Reported by :meth:`_flush_external_interventions` once the stream has
         yielded the fill event, so the event reaches the engine's queue before
-        a halting policy raises; the engine books it before the run stops.
+        the policy's fail-safe signal can raise; the engine books it before it
+        latches the quarantine.
 
         :param share: ``share`` / ``venue_after`` / ``booked_qty`` when the share
             is known.
@@ -5131,11 +5132,15 @@ class _ProtectionMixin(_CTraderBase, ABC):
     def _flush_external_interventions(self) -> None:
         """Report the queued manual closes, and those an earlier process left unhandled.
 
-        Each report is journalled as handled once the policy ran, the halt
-        included; its position is then open to the next report. Views of working entry orders pushed while an own amend was
+        Each report is journalled as handled once the policy ran, its
+        fail-safe signal included, so neither the stream the engine reopens
+        nor a restart reports it again; its position is then open to the next
+        report. Views of working entry orders pushed while an own amend was
         in flight are judged here once the amend is answered.
 
-        :raises UnexpectedCancelError: When the policy requires the halt.
+        :raises UnexpectedCancelError: The fail-safe signal of a ``stop``
+            policy whose quarantine sink is missing or raised; the engine
+            latches the external-intervention quarantine on it.
         """
         self._load_close_evidence()
         self._judge_held_replaced_orders()
@@ -5158,7 +5163,7 @@ class _ProtectionMixin(_CTraderBase, ABC):
 
         A queued manual-close report — this process's, or one an earlier
         process queued but never handled — is handled by the order-event
-        stream, the halt included; until then the intervention it reports may
+        stream, its fail-safe signal included; until then the intervention it reports may
         require the quarantine, so no write leaves.
 
         :raises VenueWritesQuarantinedError: While a queued report is not

@@ -13,11 +13,11 @@ NETTING accounts hold at most one open position per symbol, so
 """
 import logging
 from abc import ABC
-from time import time as epoch_time
+from time import monotonic, time as epoch_time
 from typing import TYPE_CHECKING, cast
 
 from pynecore.core.broker.emulator import aggregate_positions
-from pynecore.core.broker.exceptions import ExchangeConnectionError
+from pynecore.core.broker.exceptions import BrokerError, ExchangeConnectionError
 from pynecore.core.broker.models import (
     CapabilityLevel,
     ExchangeCapabilities,
@@ -39,6 +39,8 @@ from .helpers import money_value, parse_protocol_id, round_price, volume_to_unit
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
 from .protection import _accepted_by_resume
+from .reconcile import _EXECUTED_DEAL_STATUSES
+from .wire import CTraderWireError
 
 if TYPE_CHECKING:
     from pynecore.core.broker.storage import OrderRow
@@ -53,6 +55,30 @@ _OWN_LEG_GROWN_EVENT = 'ctrader_own_leg_grown'
 _OWN_LEG_GROWTH_UNATTRIBUTED_EVENT = 'ctrader_own_leg_growth_unattributed'
 #: ``extras['kind']`` of the entry rows that can hold exposure in a position.
 _ENTRY_KINDS = frozenset({ENTRY_KIND_POSITION, ENTRY_KIND_WORKING})
+#: Seconds before a read of the venue position asks the venue again which
+#: position a held entry's order executed into, while that is not known yet.
+_HELD_ORDER_LINK_RECHECK_S = 5.0
+
+
+def _order_details_positions(res: OpenApiMessages.ProtoOAOrderDetailsRes) -> frozenset[int]:
+    """The positions an entry order executed into, from its ``ProtoOAOrderDetailsRes``.
+
+    The answer carries the order and "all deals created by filling" it; every
+    ``ProtoOADeal`` names the position it executed into (``positionId``,
+    "source position of the deal"). A deal that executed volume links its
+    position, and so does the order's own ``positionId`` ("the position linked
+    to the order") once the order reports executed volume. A closing order
+    opens nothing and links none.
+    """
+    order = res.order
+    if order.closingOrder:
+        return frozenset()
+    positions = {deal.positionId for deal in res.deal
+                 if deal.positionId and deal.filledVolume > 0
+                 and deal.dealStatus in _EXECUTED_DEAL_STATUSES}
+    if order.positionId and order.executedVolume > 0:
+        positions.add(order.positionId)
+    return frozenset(positions)
 
 #: ``ProtoOAOrderType`` -> PyneCore order type. Only the order kinds the broker
 #: layer places are mapped; anything else (STOP_LOSS_TAKE_PROFIT protection
@@ -136,7 +162,7 @@ class _StateMixin(_CTraderBase, ABC):
             # engine-taxonomy error — the dispatch pre-reads (symbol rules /
             # open-position lookup) run through here, and a raw
             # ``CTraderConnectionError`` escaping a dispatch is an untranslated
-            # fault the sync engine halts on.
+            # fault the sync engine quarantines the run on.
             raise ExchangeConnectionError("cTrader live connection not established")
         # Route through ``_account_request`` so a mid-session account de-auth is
         # transparently re-authorized and the (idempotent) snapshot retried,
@@ -560,6 +586,12 @@ class _StateMixin(_CTraderBase, ABC):
         attributes the position to exactly one entry (:meth:`_leg_entry_ids`),
         ``None`` otherwise.
 
+        The legs are this run's (:meth:`_read_owned_position_ids`): the ones
+        its journal owns, and the leg an order whose execution the engine
+        still owes its book opened, which the journal may own no row of. The
+        engine's close over such an entry (``held_execution_close``) closes
+        the venue legs through the one-way emulator, that leg included.
+
         Unrealized P&L is left at ``0.0`` per leg (the reconcile snapshot does
         not carry it; the sync engine drives off size / side / entry price),
         matching :meth:`get_position`'s existing M2 behaviour.
@@ -570,10 +602,10 @@ class _StateMixin(_CTraderBase, ABC):
         res = await self._reconcile()
         self._apply_adoption_baseline(res)
         digits = self._symbol_rules[symbol].digits if symbol in self._symbol_rules else 5
-        # Run-ownership isolation: return only legs THIS run's journal owns, so
-        # the one-way emulator's close / reversal planner never plans over a
-        # concurrent run's leg on a shared account+symbol scope.
-        owned = self._owned_position_ids()
+        # Run-ownership isolation: return only legs of THIS run, so the one-way
+        # emulator's close / reversal planner never plans over a concurrent
+        # run's leg on a shared account+symbol scope.
+        owned = await self._read_owned_position_ids()
         entry_ids = self._leg_entry_ids()
         legs: list[PositionLeg] = []
         for position in res.position:
@@ -597,6 +629,111 @@ class _StateMixin(_CTraderBase, ABC):
             ))
         legs.sort(key=lambda leg: leg.open_time)
         return legs
+
+    async def _read_owned_position_ids(self) -> set[int] | None:
+        """The venue positions a read of this run's position counts as its own.
+
+        :meth:`_owned_position_ids` (what the journal owns) plus the positions
+        the orders whose execution the engine still owes its book executed
+        into (:meth:`_held_entry_position_ids`). Such an order ended without
+        the venue's executed quantity reaching the engine, so its journal row
+        may record no ``positionId``; its execution is still the bot's
+        exposure, which the engine's ``held_execution_close`` sizes from this
+        read and closes.
+
+        :return: ``None`` (do not filter) when no journal is available.
+        """
+        owned = self._owned_position_ids()
+        if owned is None:
+            return None
+        return owned | await self._held_entry_position_ids()
+
+    async def _held_entry_position_ids(self) -> set[int]:
+        """The ``positionId``s the orders whose execution the engine still owes executed into.
+
+        See :meth:`_held_entry_links`.
+
+        :return: The linked positions; empty without a journal or such an order.
+        """
+        linked, _unread = await self._held_entry_links()
+        return linked
+
+    async def _held_entry_links(self) -> tuple[set[int], set[int]]:
+        """The positions of the orders whose execution the engine still owes, and the unread ones.
+
+        The orders come from
+        :meth:`~pynecore.core.broker.storage.RunContext.held_execution_order_ids`,
+        read fresh on every call: the orders of the entries the engine holds
+        for their execution evidence, and the orders a venue close over an
+        expired hold took the execution of, until that close is retired. The
+        store keeps them, so they survive a restart. The link is the venue's
+        own (:meth:`_read_held_order_positions`), never inferred from a
+        symbol, side or size. A link once read is kept for as long as the
+        store names the order; an order whose link is not known yet is asked
+        again at most every :data:`_HELD_ORDER_LINK_RECHECK_S`.
+
+        :return: The linked positions, and the orders whose link the venue
+            could not be asked for (a read that failed, or one not asked
+            again yet after a failure): what they executed into is unknown.
+        """
+        store = self.store_ctx
+        if store is None:
+            return set(), set()
+        held = {int(order_id) for order_id in store.held_execution_order_ids()
+                if order_id.isdigit()}
+        for order_id in [*self._held_order_positions, *self._held_order_link_read]:
+            if order_id not in held:
+                self._held_order_positions.pop(order_id, None)
+                self._held_order_link_read.pop(order_id, None)
+        self._held_order_link_unread &= held
+        linked: set[int] = set()
+        now = monotonic()
+        for order_id in sorted(held):
+            known = self._held_order_positions.get(order_id)
+            if known is not None:
+                linked.update(known)
+                continue
+            last = self._held_order_link_read.get(order_id)
+            if last is not None and now - last < _HELD_ORDER_LINK_RECHECK_S:
+                continue
+            self._held_order_link_read[order_id] = now
+            positions = await self._read_held_order_positions(order_id)
+            if positions is None:
+                self._held_order_link_unread.add(order_id)
+                continue
+            self._held_order_link_unread.discard(order_id)
+            if positions:
+                self._note_held_order_link(order_id, positions)
+                linked.update(positions)
+        return linked, set(self._held_order_link_unread)
+
+    def _note_held_order_link(self, order_id: int, positions: frozenset[int]) -> None:
+        """Keep the positions the venue named for a held order (see :meth:`_held_entry_links`)."""
+        self._held_order_positions[order_id] = positions
+        self._held_order_link_read.pop(order_id, None)
+        self._held_order_link_unread.discard(order_id)
+
+    async def _read_held_order_positions(self, order_id: int) -> frozenset[int] | None:
+        """The positions one held entry order executed into, on the venue's word.
+
+        ``ProtoOAOrderDetailsReq`` answers with the order and "all deals
+        created by filling" it (:func:`_order_details_positions`).
+
+        :param order_id: The held entry's venue ``orderId``.
+        :return: The linked positions; empty when nothing executed yet,
+            ``None`` when the read failed (logged at DEBUG, asked again later).
+        """
+        if self._live_account_id is None:
+            return None
+        try:
+            res = cast(OpenApiMessages.ProtoOAOrderDetailsRes, await self._account_request(
+                OpenApiMessages.ProtoOAOrderDetailsReq(
+                    ctidTraderAccountId=self._live_account_id, orderId=order_id)))
+        except (BrokerError, CTraderWireError, TimeoutError) as exc:
+            logger.debug("cTrader held entry order %d position lookup deferred: %s",
+                         order_id, exc)
+            return None
+        return _order_details_positions(res)
 
     def _leg_entry_ids(self) -> dict[int, str]:
         """The Pine entry that opened each attributable venue position.
@@ -664,6 +801,11 @@ class _StateMixin(_CTraderBase, ABC):
         ``0.0`` in M2 — it is informational for the sync engine, which drives
         off size / side / entry price; a dedicated
         ``ProtoOAGetPositionUnrealizedPnLReq`` can populate it later.
+
+        The position is this run's when its journal owns it, or when an order
+        whose execution the engine still owes its book executed into it
+        (:meth:`_read_owned_position_ids`): the engine sizes its
+        ``held_execution_close`` from this read.
         """
         if self.hedging_enabled:
             return aggregate_positions(symbol, await self.fetch_raw_positions(symbol))
@@ -674,11 +816,11 @@ class _StateMixin(_CTraderBase, ABC):
             return None
         res = await self._reconcile()
         self._apply_adoption_baseline(res)
-        # Run-ownership isolation: adopt only a position THIS run's journal owns
-        # so a concurrent run's leg on the same account+symbol is never folded
-        # into this run's netted snapshot (startup adoption, periodic
-        # shrink-to-zero reconcile).
-        owned = self._owned_position_ids()
+        # Run-ownership isolation: adopt only a position of THIS run so a
+        # concurrent run's leg on the same account+symbol is never folded into
+        # this run's netted snapshot (startup adoption, periodic shrink-to-zero
+        # reconcile).
+        owned = await self._read_owned_position_ids()
         for position in res.position:
             if position.positionStatus != OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue

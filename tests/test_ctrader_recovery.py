@@ -11,7 +11,7 @@ import pynecore_ctrader.recovery as _recovery
 from pynecore import lib
 from pynecore.core.broker.disappearance import accept_missing_before_resume
 from pynecore.core.broker.idempotency import KIND_ENTRY
-from pynecore.core.broker.models import DispatchEnvelope, EntryIntent, OrderType
+from pynecore.core.broker.models import DispatchEnvelope, EntryIntent, LegType, OrderType
 from pynecore.core.broker.position import BrokerPosition
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
@@ -43,7 +43,8 @@ class _RecoveryWire:
 
     ``orders`` answers ``ProtoOAOrderDetailsReq`` for the closing orders of a
     position closed while the bot was down; the lookup of any other order
-    times out.
+    times out. ``offsets`` answers ``ProtoOADealOffsetListReq`` by deal id;
+    the ledger of any other deal times out.
     """
 
     def __init__(self, *, order_res=None, deal_res=None, order_fail=False,
@@ -53,6 +54,9 @@ class _RecoveryWire:
         self._order_fail = order_fail
         self._deal_fail = deal_fail
         self.orders = {order.orderId: order for order in orders}
+        #: The deals ``ProtoOAOrderDetailsRes`` lists for an order of ``orders``.
+        self.order_deals: dict[int, list] = {}
+        self.offsets: dict[int, _oa.ProtoOADealOffsetListRes] = {}
         self.requests: list = []
         #: Answer a deal-history read with only the deals of its time window,
         #: as the venue does.
@@ -75,7 +79,12 @@ class _RecoveryWire:
         if isinstance(req, _oa.ProtoOAOrderDetailsReq):
             if req.orderId not in self.orders:
                 raise TimeoutError("order details down")
-            return _oa.ProtoOAOrderDetailsRes(order=self.orders[req.orderId])
+            return _oa.ProtoOAOrderDetailsRes(order=self.orders[req.orderId],
+                                              deal=self.order_deals.get(req.orderId, []))
+        if isinstance(req, _oa.ProtoOADealOffsetListReq):
+            if req.dealId not in self.offsets:
+                raise TimeoutError("offset ledger down")
+            return self.offsets[req.dealId]
         raise AssertionError(f"unexpected request {type(req).__name__}")
 
 
@@ -1887,7 +1896,7 @@ def _filled_into_adopted(broker, coid) -> None:
     broker.store_ctx._store._conn.commit()
 
 
-def _assert_takeover_held(broker, coid, adopted, adopted_qty) -> None:
+def _assert_takeover_waits(broker, coid, adopted, adopted_qty) -> None:
     """The inherited dispatch stays parked and the adopted leg keeps its size."""
     assert broker.store_ctx.get_order(coid).state == 'disposition_unknown'
     assert broker.store_ctx.get_order(coid).filled_qty == 0.0
@@ -1896,21 +1905,84 @@ def _assert_takeover_held(broker, coid, adopted, adopted_qty) -> None:
     assert donor.filled_qty == pytest.approx(adopted_qty)
     assert not {5501, 5502} & broker._seen_deal_ids
     assert _events(broker, 'ctrader_adopted_leg_taken_over') == []
-    assert len(_events(broker, 'ctrader_adopted_leg_takeover_held')) == 1
 
 
-def __test_an_inherited_send_filled_beyond_the_adopted_leg_stays_parked__(tmp_path):
+def _offset_requests(broker) -> list[int]:
+    return [req.dealId for req in broker._wire.requests
+            if isinstance(req, _oa.ProtoOADealOffsetListReq)]
+
+
+def _ledger(broker, deal_id, *, offset_by=(), offsetting=()) -> None:
+    """The venue's offset ledger of ``deal_id``: ``(deal, cents, executed_ms)`` pairs."""
+    broker._wire.offsets[deal_id] = _oa.ProtoOADealOffsetListRes(
+        ctidTraderAccountId=999,
+        offsetBy=[_model.ProtoOADealOffset(dealId=d, volume=v, executionTimestamp=t)
+                  for d, v, t in offset_by],
+        offsetting=[_model.ProtoOADealOffset(dealId=d, volume=v, executionTimestamp=t)
+                    for d, v, t in offsetting])
+
+
+def __test_an_inherited_send_filled_beyond_the_adopted_leg_waits_for_the_offset_ledger__(
+        tmp_path):
     # The inherited order filled more before the adoption than the adopted leg
-    # holds. Part of it may have been closed before the restart, but the leg's
-    # shortfall does not prove which deals it covers: the dispatch stays
-    # parked, its entry held, and nothing is moved, retired or booked. The
-    # held takeover is reported once, not on every lookup.
+    # holds. Part of it may have been closed before the restart; until the
+    # venue's offset ledger can tell which, the dispatch stays parked and
+    # nothing is moved, retired or booked. The ledger is asked again on the
+    # next lookup: no human step.
     broker, coid, adopted = _adopted_and_inherited(tmp_path, position_volume=1000)
     _filled_into_adopted(broker, coid)
 
     _resolve_parked(broker, passes=2)
 
-    _assert_takeover_held(broker, coid, adopted, volume_to_units(1000))
+    _assert_takeover_waits(broker, coid, adopted, volume_to_units(1000))
+    assert _offset_requests(broker) == [5501, 5501]
+
+
+def __test_an_inherited_send_partly_closed_before_the_restart_takes_its_open_part_over__(
+        tmp_path):
+    # The venue's offset ledger shows 10 of the order's 20 closed before the
+    # adoption snapshot: the other 10 is the adopted leg, which the row takes
+    # over; the closed 10 is retired on the row. Nothing is booked again.
+    adopted_ts = 1_700_000_000_000
+    broker, coid, adopted = _adopted_and_inherited(
+        tmp_path, position_volume=1000, position_ts=adopted_ts)
+    _filled_into_adopted(broker, coid)
+    _ledger(broker, 5501, offset_by=[(5601, 1000, adopted_ts - 1)])
+
+    _resolve_parked(broker)
+
+    row = broker.store_ctx.get_order(coid)
+    assert row.state == 'confirmed'
+    assert row.filled_qty == pytest.approx(volume_to_units(2000))
+    assert row.extras[JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY] == pytest.approx(volume_to_units(1000))
+    assert broker._row_exposure(row) == pytest.approx(volume_to_units(1000))
+    assert broker.store_ctx.get_order(adopted).closed_ts_ms is not None
+    assert 5501 in broker._seen_deal_ids
+    assert _events(broker, 'ctrader_adopted_leg_takeover_short') == []
+    taken = _events(broker, 'ctrader_adopted_leg_taken_over')
+    assert len(taken) == 1 and taken[0]['closed_before_adoption'] == pytest.approx(10.0)
+
+    broker._recon = _recon(positions=[_labelled_position(broker.store_ctx.run_tag,
+                                                         volume=1000)])
+    assert [e for e in _reconcile_events(broker)
+            if e.event_type in ('filled', 'partial')] == []
+
+
+def __test_a_close_after_the_adoption_is_not_counted_as_closed_before_it__(tmp_path):
+    # The ledger's closing deal came after the adoption snapshot: at the
+    # adoption the whole order was open, and more than the leg holds.
+    adopted_ts = 1_700_000_000_000
+    broker, coid, adopted = _adopted_and_inherited(
+        tmp_path, position_volume=1000, position_ts=adopted_ts)
+    _filled_into_adopted(broker, coid)
+    _ledger(broker, 5501, offset_by=[(5601, 1000, adopted_ts + 1)])
+
+    _resolve_parked(broker)
+
+    row = broker.store_ctx.get_order(coid)
+    assert JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY not in (row.extras or {})
+    assert row.filled_qty == pytest.approx(volume_to_units(1000))
+    assert len(_events(broker, 'ctrader_adopted_leg_takeover_short')) == 1
 
 
 def __test_an_inherited_send_s_fill_after_the_adoption_is_booked_as_a_fill__(tmp_path):
@@ -2014,21 +2086,24 @@ def __test_an_inherited_send_s_fill_between_recovery_and_adoption_is_owned_once_
         volume_to_units(2000))
 
 
-def __test_an_unattributed_growth_keeps_the_inherited_send_parked__(tmp_path):
+def _other_entry(broker):
+    create_entry_order_row(
+        broker.store_ctx, coid='other-entry', symbol='EURUSD', side='buy', qty=10.0,
+        intent_key='S', pine_entry_id='S', kind=ENTRY_KIND_WORKING, order_type='limit')
+    broker.store_ctx.upsert_order('other-entry', state='confirmed',
+                                  extras={'kind': ENTRY_KIND_WORKING, 'order_id': '991'})
+
+
+def __test_an_unattributed_growth_keeps_the_inherited_send_parked_without_a_ledger__(
+        tmp_path):
     # Another entry row of the symbol carries an order neither the adoption
     # snapshot nor any position link accounts for: the growth may be its fill,
     # so the adopted leg keeps its size. Its shortfall against the inherited
-    # order's adopted deals then proves no close: the dispatch stays parked
-    # and nothing is retired, booked or seeded.
-    def other_entry(broker):
-        create_entry_order_row(
-            broker.store_ctx, coid='other-entry', symbol='EURUSD', side='buy', qty=10.0,
-            intent_key='S', pine_entry_id='S', kind=ENTRY_KIND_WORKING, order_type='limit')
-        broker.store_ctx.upsert_order('other-entry', state='confirmed',
-                                      extras={'kind': ENTRY_KIND_WORKING, 'order_id': '991'})
-
+    # order's adopted deals proves no close: until the venue's offset ledger
+    # says which part is open the dispatch stays parked and nothing is
+    # retired, booked or seeded.
     broker, coid, adopted = _adopted_and_inherited(
-        tmp_path, position_volume=1000, adopted_volume=2000, before_adoption=other_entry)
+        tmp_path, position_volume=1000, adopted_volume=2000, before_adoption=_other_entry)
     assert broker.store_ctx.get_order(adopted).filled_qty == pytest.approx(
         volume_to_units(1000))
     assert len(_events(broker, 'ctrader_own_leg_growth_unattributed')) == 1
@@ -2036,7 +2111,47 @@ def __test_an_unattributed_growth_keeps_the_inherited_send_parked__(tmp_path):
 
     _resolve_parked(broker)
 
-    _assert_takeover_held(broker, coid, adopted, volume_to_units(1000))
+    _assert_takeover_waits(broker, coid, adopted, volume_to_units(1000))
+
+
+def __test_an_unattributed_growth_the_offset_ledger_shows_open_is_booked_as_a_fill__(
+        tmp_path):
+    # The ledger shows both of the order's deals open: the growth the adoption
+    # could not attribute was this order's. The row takes over what the
+    # adopted leg holds, and the rest, which the engine never booked, comes
+    # as the order's fill from the next reconcile pass. Nothing is retired.
+    broker, coid, adopted = _adopted_and_inherited(
+        tmp_path, position_volume=1000, adopted_volume=2000, before_adoption=_other_entry)
+    _filled_in_two_deals(broker, coid)
+    _ledger(broker, 5501)
+    _ledger(broker, 5502)
+
+    _resolve_parked(broker)
+
+    row = broker.store_ctx.get_order(coid)
+    assert row.state == 'confirmed'
+    assert row.filled_qty == pytest.approx(volume_to_units(1000))
+    assert JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY not in (row.extras or {})
+    assert broker.store_ctx.get_order(adopted).closed_ts_ms is not None
+    assert 5501 in broker._seen_deal_ids and 5502 not in broker._seen_deal_ids
+    short = _events(broker, 'ctrader_adopted_leg_takeover_short')
+    assert len(short) == 1 and short[0]['short'] == pytest.approx(10.0)
+
+    broker._recon = _recon(positions=[_labelled_position(broker.store_ctx.run_tag,
+                                                         volume=2000)])
+    fills = [e for e in _reconcile_events(broker) if e.event_type in ('filled', 'partial')]
+    assert len(fills) == 1 and fills[0].fill_qty == pytest.approx(volume_to_units(1000))
+    assert broker.store_ctx.get_order('other-entry').filled_qty == 0.0
+    assert _reconcile_events(broker) == []
+
+
+def _opposite_entry(broker):
+    create_entry_order_row(
+        broker.store_ctx, coid='short-entry', symbol='EURUSD', side='sell', qty=5.0,
+        intent_key='S', pine_entry_id='S', kind=ENTRY_KIND_POSITION, order_type='market')
+    broker.store_ctx.upsert_order('short-entry', state='confirmed', filled_qty=5.0,
+                                  extras={'kind': ENTRY_KIND_POSITION, 'order_id': '992',
+                                          'position_id': '58367450'})
 
 
 def __test_a_growth_beside_an_opposite_side_row_keeps_the_inherited_send_parked__(tmp_path):
@@ -2044,18 +2159,11 @@ def __test_a_growth_beside_an_opposite_side_row_keeps_the_inherited_send_parked_
     # long position, and the position grew between the startup recovery and
     # the adoption. How much of the long side the adopted leg stands for
     # cannot be told from the two snapshots: the leg keeps its size, and the
-    # inherited buy, which filled more than the leg holds, stays parked
-    # instead of retiring the difference as closed.
-    def opposite_entry(broker):
-        create_entry_order_row(
-            broker.store_ctx, coid='short-entry', symbol='EURUSD', side='sell', qty=5.0,
-            intent_key='S', pine_entry_id='S', kind=ENTRY_KIND_POSITION, order_type='market')
-        broker.store_ctx.upsert_order('short-entry', state='confirmed', filled_qty=5.0,
-                                      extras={'kind': ENTRY_KIND_POSITION, 'order_id': '992',
-                                              'position_id': '58367450'})
-
+    # inherited buy, which filled more than the leg holds, stays parked until
+    # the venue's offset ledger says which part is open, instead of retiring
+    # the difference as closed.
     broker, coid, adopted = _adopted_and_inherited(
-        tmp_path, position_volume=1000, adopted_volume=1500, before_adoption=opposite_entry)
+        tmp_path, position_volume=1000, adopted_volume=1500, before_adoption=_opposite_entry)
     assert broker.store_ctx.get_order(adopted).filled_qty == pytest.approx(
         volume_to_units(1000))
     assert _events(broker, 'ctrader_own_leg_grown') == []
@@ -2064,9 +2172,31 @@ def __test_a_growth_beside_an_opposite_side_row_keeps_the_inherited_send_parked_
 
     _resolve_parked(broker)
 
-    _assert_takeover_held(broker, coid, adopted, volume_to_units(1000))
+    _assert_takeover_waits(broker, coid, adopted, volume_to_units(1000))
     row = broker.store_ctx.get_order(coid)
     assert JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY not in (row.extras or {})
+
+
+def __test_a_growth_beside_an_opposite_side_row_is_split_by_the_offset_ledger__(tmp_path):
+    # The ledger shows the order's first deal open and its second one closed
+    # before the adoption: the open 10 moves from the adopted leg, the closed
+    # 10 is retired on the row, and nothing is booked again.
+    broker, coid, adopted = _adopted_and_inherited(
+        tmp_path, position_volume=1000, adopted_volume=1500, before_adoption=_opposite_entry)
+    _filled_in_two_deals(broker, coid)
+    _ledger(broker, 5501)
+    _ledger(broker, 5502, offset_by=[(5602, 1000, 1_700_000_000_000)])
+
+    _resolve_parked(broker)
+
+    row = broker.store_ctx.get_order(coid)
+    assert row.state == 'confirmed'
+    assert row.filled_qty == pytest.approx(volume_to_units(2000))
+    assert row.extras[JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY] == pytest.approx(volume_to_units(1000))
+    assert broker._row_exposure(row) == pytest.approx(volume_to_units(1000))
+    assert broker.store_ctx.get_order(adopted).closed_ts_ms is not None
+    assert {5501, 5502} <= broker._seen_deal_ids
+    assert _events(broker, 'ctrader_adopted_leg_takeover_short') == []
 
 
 def __test_an_inherited_send_against_the_adopted_leg_s_side_stays_parked__(tmp_path):
@@ -2081,7 +2211,48 @@ def __test_an_inherited_send_against_the_adopted_leg_s_side_stays_parked__(tmp_p
 
     _resolve_parked(broker)
 
-    _assert_takeover_held(broker, coid, adopted, volume_to_units(2000))
+    _assert_takeover_waits(broker, coid, adopted, volume_to_units(2000))
+
+
+def __test_an_inherited_send_fully_closed_against_a_short_leg_is_retired_on_its_row__(
+        tmp_path):
+    # The inherited buy filled into a position startup adopted as a short leg;
+    # the ledger shows its deal closed whole by the sells that flipped the
+    # position before the adoption. Nothing of it is in the adopted leg: the
+    # leg keeps its size, the row lands with its fill retired, nothing booked.
+    broker, coid, adopted = _adopted_and_inherited(tmp_path, short=True)
+    _filled_into_adopted(broker, coid)
+    broker._wire._deal_res = _deal_res(_deal(deal_id=5501, order_id=55,
+                                             position_id=58367450, filled_volume=1000))
+    _ledger(broker, 5501, offsetting=[(5401, 1000, 1_700_000_000_000)])
+
+    _resolve_parked(broker)
+
+    row = broker.store_ctx.get_order(coid)
+    assert row.state == 'confirmed'
+    assert row.filled_qty == pytest.approx(volume_to_units(1000))
+    assert broker._row_exposure(row) == pytest.approx(0.0)
+    donor = broker.store_ctx.get_order(adopted)
+    assert donor.closed_ts_ms is None
+    assert donor.filled_qty == pytest.approx(volume_to_units(2000))
+    assert 5501 in broker._seen_deal_ids
+
+
+def __test_a_ledger_that_puts_an_inherited_buy_open_in_a_short_leg_changes_nothing__(
+        tmp_path):
+    # The ledger shows the buy's deal open, but the position it filled into
+    # was adopted short: the two venue views contradict each other, so
+    # nothing is moved and the lookup is repeated.
+    broker, coid, adopted = _adopted_and_inherited(tmp_path, short=True)
+    _filled_into_adopted(broker, coid)
+    broker._wire._deal_res = _deal_res(_deal(deal_id=5501, order_id=55,
+                                             position_id=58367450, filled_volume=1000))
+    _ledger(broker, 5501)
+
+    _resolve_parked(broker, passes=2)
+
+    _assert_takeover_waits(broker, coid, adopted, volume_to_units(2000))
+    assert _offset_requests(broker) == [5501, 5501]
 
 
 def __test_a_parked_send_of_this_process_never_takes_an_adopted_leg_over__(tmp_path):
@@ -2262,3 +2433,261 @@ def __test_parked_terminal_order_is_refused_only_on_a_reported_zero__(tmp_path, 
         assert row.state == 'disposition_unknown'
         assert row.extras['order_id'] == '44'
         assert _resolution_of(broker, 'k8') is None
+
+
+# === Executions the stream cannot report, handed to the engine ===============
+
+def _hold_requests(broker) -> dict:
+    return {coid: request['order_id']
+            for coid, request in broker.store_ctx.execution_hold_requests().items()}
+
+
+def _filled_order(*, order_id, coid, executed=2000, position_id=222, status=_FILLED):
+    order = _order(order_id=order_id, coid=coid, volume=2000, executed=executed,
+                   position_id=position_id, status=status)
+    order.orderType = _model.ProtoOAOrderType.MARKET
+    return order
+
+
+def __test_an_inherited_send_whose_closed_position_s_history_is_short_is_handed_over__(
+        tmp_path):
+    # The crashed send filled 20 units into position 222, which closed while
+    # no process ran; the complete deal history shows only 10 of them. The
+    # fills cannot be delivered from it: the entry is handed to the engine's
+    # held-execution recovery before its first sync, and nothing is judged.
+    coid = _crashed_entry_send(tmp_path, state='disposition_unknown')
+    broker = _RestartBroker(
+        _recon(), order_res=_order_res(_filled_order(order_id=55, coid=coid)),
+        deal_res=_deal_res(
+            _deal(deal_id=5501, order_id=55, position_id=222, filled_volume=1000),
+            _close_deal(deal_id=5601, order_id=999, position_id=222, closed_volume=2000)))
+    _open(tmp_path, broker)
+
+    _recover(broker)
+
+    assert _hold_requests(broker) == {coid: '55'}
+    assert broker.store_ctx.get_order(coid).state == 'disposition_unknown'
+    assert len(_events(broker, 'ctrader_execution_hold_requested')) == 1
+    assert 5601 not in broker._seen_deal_ids
+
+
+def __test_an_inherited_terminal_send_executed_by_its_details_only_is_handed_over__(tmp_path):
+    # The order history lists the crashed send cancelled without its executed
+    # volume and the complete deal history no fill of it; its own details show
+    # it executed 20 units. The history cannot deliver them: handed over.
+    coid = _crashed_entry_send(tmp_path, state='disposition_unknown')
+    listed = _filled_order(order_id=55, coid=coid, executed=0, status=_CANCELLED)
+    listed.ClearField('executedVolume')
+    broker = _RestartBroker(
+        _recon(), order_res=_order_res(listed), deal_res=_deal_res(),
+        orders=[_filled_order(order_id=55, coid=coid, status=_CANCELLED)])
+    _open(tmp_path, broker)
+
+    _recover(broker)
+
+    assert _hold_requests(broker) == {coid: '55'}
+
+
+@pytest.mark.parametrize('history', ['failed', 'unexecuted'])
+def __test_an_inherited_terminal_send_is_not_handed_over_without_proof__(tmp_path, history):
+    # A failed history read is retried by the reconcile pass; an order its
+    # details show unexecuted is judged there as before. Neither is handed over.
+    coid = _crashed_entry_send(tmp_path, state='disposition_unknown')
+    listed = _filled_order(order_id=55, coid=coid, executed=0, status=_CANCELLED)
+    listed.ClearField('executedVolume')
+    broker = _RestartBroker(
+        _recon(), order_res=_order_res(listed), deal_res=_deal_res(),
+        deal_fail=history == 'failed',
+        orders=[_filled_order(order_id=55, coid=coid, executed=0, status=_CANCELLED)])
+    _open(tmp_path, broker)
+
+    _recover(broker)
+
+    assert _hold_requests(broker) == {}
+
+
+def _taken_over_working_entry(tmp_path) -> str:
+    """An earlier process's resting LIMIT entry ``L``, confirmed as venue order 77."""
+    store = BrokerStore(tmp_path / "broker.sqlite", plugin_name='ctrader')
+    ctx = store.open_run(RunIdentity(strategy_id="recov", symbol="EURUSD", timeframe="60",
+                                     account_id="recov-account"),
+                         script_source="// recov")
+    intent = EntryIntent(pine_id='L', symbol='EURUSD', side='buy', qty=20.0,
+                         order_type=OrderType.LIMIT, limit=1.1)
+    coid = DispatchEnvelope(intent=intent, run_tag=ctx.run_tag, bar_ts_ms=_RESTART_BAR_TS,
+                            retry_seq=0).client_order_id(KIND_ENTRY)
+    ctx.record_envelope('L', _RESTART_BAR_TS, 0)
+    create_entry_order_row(
+        ctx, coid=coid, symbol='EURUSD', side='buy', qty=20.0, intent_key='L',
+        pine_entry_id='L', kind=ENTRY_KIND_WORKING, order_type='limit')
+    ctx.upsert_order(coid, state='confirmed', exchange_order_id='77',
+                     extras={'kind': ENTRY_KIND_WORKING, 'order_id': '77',
+                             'position_id': None, 'submitted_at_ms': _RESTART_BAR_TS})
+    ctx.add_ref(coid, 'order_id', '77')
+    store.close()
+    return coid
+
+
+def _restarted_with_working_entry(tmp_path, *, positions=(), deals=()):
+    """The process restarted over :func:`_taken_over_working_entry`, order 77 filled since."""
+    coid = _taken_over_working_entry(tmp_path)
+    filled = _filled_order(order_id=77, coid=coid, position_id=222)
+    filled.orderType = _model.ProtoOAOrderType.LIMIT
+    broker = _RestartBroker(_recon(positions=list(positions)), order_res=_order_res(),
+                            deal_res=_deal_res(*deals), orders=[filled])
+    broker._wire.order_deals[77] = [
+        _deal(deal_id=7701, order_id=77, position_id=222, filled_volume=2000)]
+    _open(tmp_path, broker)
+    return broker, coid
+
+
+def __test_a_taken_over_working_entry_executed_unseen_is_handed_over_before_the_first_sync__(
+        tmp_path, monkeypatch):
+    # The resting entry filled while no process ran and its position closed;
+    # the deal history no longer reaches the fill. Startup hands it to the
+    # engine, which books the order's execution from its details instead of
+    # sending the re-declared entry again.
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker, coid = _restarted_with_working_entry(tmp_path)
+
+    _recover(broker)
+
+    assert _hold_requests(broker) == {coid: '77'}
+    assert broker.store_ctx.get_order(coid).closed_ts_ms is None
+    engine = OrderSyncEngine(broker=broker, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=broker.store_ctx.run_tag, mintick=0.00001,
+                             store_ctx=broker.store_ctx)
+    engine._position.entry_orders['L'] = Order('L', 20.0, order_type=_order_type_entry,
+                                               limit=1.1)
+    engine.sync(_RESTART_BAR_TS + 3_600_000)
+
+    assert _new_orders(broker) == []
+    assert '77' in broker.store_ctx.held_execution_order_ids()
+
+
+@pytest.mark.parametrize('evidence', ['deal_history', 'open_position'])
+def __test_a_taken_over_working_entry_whose_fill_is_provable_is_not_handed_over__(
+        tmp_path, evidence):
+    # The deal history lists the fill (the reconcile pass delivers it), or the
+    # position is open (the engine's startup adoption books it): as before.
+    broker, _coid = _restarted_with_working_entry(
+        tmp_path,
+        positions=[_position(position_id=222, volume=2000)] if evidence == 'open_position'
+        else (),
+        deals=[_deal(deal_id=7701, order_id=77, position_id=222, filled_volume=2000)]
+        if evidence == 'deal_history' else ())
+
+    _recover(broker)
+
+    assert _hold_requests(broker) == {}
+
+
+def __test_a_handed_over_entry_s_absence_is_no_startup_orphan__(tmp_path):
+    # The engine holds the entry's order: its absence from the startup
+    # snapshot proves nothing, so its row is not retired as an orphan.
+    broker, coid = _restarted_with_working_entry(tmp_path)
+    broker.store_ctx.upsert_order(coid, filled_qty=20.0, extras={
+        **(broker.store_ctx.get_order(coid).extras or {}), 'position_id': 222})
+    broker.store_ctx.held_execution_order_ids = lambda: frozenset({'77'})
+
+    _recover(broker)
+
+    assert broker.store_ctx.get_order(coid).closed_ts_ms is None
+
+
+def __test_an_in_process_entry_whose_closed_position_s_history_is_short_is_held_by_the_engine__(
+        tmp_path, monkeypatch):
+    # A LIMIT entry this process sent and the venue confirmed fills 20 units
+    # and its position closes while the stream is down. The order leaves the
+    # venue; the deal history shows 10 of its 20 units and the close, its own
+    # details all 20. The reconcile pass hands the entry to the engine instead
+    # of judging the close against a 10-unit share; the engine holds it, books
+    # the order's two deals once from its details, never sends the entry
+    # again, and nobody is reported. Once the engine settled it, the next pass
+    # delivers the position's close (its own SL / TP) from the deal history:
+    # the book ends flat with the close's P&L, the entry block ends, and a
+    # late stream copy of the close is a replay.
+    monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
+    broker = _RestartBroker(_recon(), order_res=_order_res(), deal_res=_deal_res())
+    reports: list = []
+    broker.quarantine_sink = lambda reason, context, *, kind, cause=None: reports.append(
+        (reason, context, kind))
+    _open(tmp_path, broker)
+    engine = OrderSyncEngine(broker=broker, position=BrokerPosition(), symbol='EURUSD',
+                             run_tag=broker.store_ctx.run_tag, mintick=0.00001,
+                             store_ctx=broker.store_ctx)
+    engine.reconcile()
+    engine._position.entry_orders['L'] = Order('L', 20.0, order_type=_order_type_entry,
+                                               limit=1.1)
+    engine.sync(_RESTART_BAR_TS)
+    [sent] = _new_orders(broker)
+    coid = sent.clientOrderId
+    row = broker.store_ctx.get_order(coid)
+    assert row.state == 'confirmed' and row.exchange_order_id == '901'
+
+    filled = _filled_order(order_id=901, coid=coid)
+    filled.orderType = _model.ProtoOAOrderType.LIMIT
+    broker._wire.orders[901] = filled
+    broker._wire.order_deals[901] = [
+        _deal(deal_id=9011, order_id=901, position_id=222, filled_volume=1000, price=1.1),
+        _deal(deal_id=9012, order_id=901, position_id=222, filled_volume=1000, price=1.09)]
+    close = _close_deal(deal_id=9601, order_id=999, position_id=222, closed_volume=2000,
+                        price=1.12)
+    close.tradeSide = _model.ProtoOATradeSide.SELL
+    broker._wire._deal_res = _deal_res(
+        _deal(deal_id=9011, order_id=901, position_id=222, filled_volume=1000, price=1.1),
+        close)
+    broker._wire.orders[999] = _closing_order(
+        999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)
+
+    assert _reconcile_events(broker) == []
+
+    assert {c: r['order_id'] for c, r in broker.store_ctx.execution_hold_requests().items()} \
+        == {coid: '901'}
+    assert 9601 not in broker._seen_deal_ids
+    engine.sync(_RESTART_BAR_TS + 3_600_000)
+    engine.reconcile()
+    engine.sync(_RESTART_BAR_TS + 7_200_000)
+
+    assert _new_orders(broker) == [sent]
+    assert reports == []
+    assert broker.store_ctx.held_execution_order_ids() == frozenset()
+    assert engine._position.size == pytest.approx(20.0)
+    assert [(trade.size, trade.entry_price) for trade in engine._position.open_trades] == [
+        (pytest.approx(10.0), pytest.approx(1.1)), (pytest.approx(10.0), pytest.approx(1.09))]
+
+    # The engine settled it: the next pass syncs the row from the order's
+    # details, delivers the position's close and retires the row; it is never
+    # handed over again, and nothing is booked twice.
+    closes = _reconcile_events(broker)
+
+    assert [(e.leg_type, e.fill_id, e.from_entry, e.fill_qty, e.fill_price)
+            for e in closes] == [
+        (LegType.CLOSE, '9601', 'L', pytest.approx(20.0), pytest.approx(1.12))]
+    row = broker.store_ctx.get_order(coid)
+    assert row.closed_ts_ms is not None and row.filled_qty == pytest.approx(20.0)
+    assert {9011, 9012, 9601} <= broker._seen_deal_ids
+    assert broker.store_ctx.execution_hold_requests() == {}
+    assert len(_events(broker, 'ctrader_execution_hold_requested')) == 1
+    assert len(_events(broker, 'ctrader_execution_hold_settled')) == 1
+    assert _reconcile_events(broker) == []
+
+    for event in closes:
+        engine.on_order_event(event)
+    engine.apply_async_events()
+    engine.sync(_RESTART_BAR_TS + 10_800_000)
+    engine.reconcile()
+    engine.sync(_RESTART_BAR_TS + 14_400_000)
+
+    assert engine._position.size == pytest.approx(0.0)
+    assert engine._position.netprofit == pytest.approx(20.0 * (1.12 - 1.095))
+    assert [q for q in broker.store_ctx.iter_open_quarantines()
+            if q.cause and q.cause.startswith('fill_evidence:')] == []
+    assert _new_orders(broker) == [sent]
+    assert reports == []
+
+    late = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    late.order.CopyFrom(_closing_order(
+        999, order_type=_model.ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT))
+    late.deal.CopyFrom(close)
+    assert broker._translate_exec_event(late) is None

@@ -902,7 +902,7 @@ def __test_empty_account_list_refreshes_and_relists_before_resolving__(monkeypat
     # The venue answers a token it no longer serves with an EMPTY list, not an
     # error, so the refresh-on-error path never fires for it. The handshake
     # refreshes once, persists the rotated pair, and resolves the account from
-    # the fresh listing instead of halting on NO_TRADING_ACCOUNTS.
+    # the fresh listing instead of failing on NO_TRADING_ACCOUNTS.
     saved: list = []
     monkeypatch.setattr(
         'pynecore_ctrader.session.save_session',

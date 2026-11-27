@@ -31,11 +31,12 @@ from pynecore.core.broker.protection_guard import ProtectionLevels
 from pynecore.core.broker.sync_engine import OrderSyncEngine
 from pynecore.core.broker.run_identity import RunIdentity
 from pynecore.core.broker.storage import BrokerStore
-from pynecore.types.strategy import ADOPTED_STARTUP_EXTRA_KEY
+from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID, ADOPTED_STARTUP_EXTRA_KEY
 
 from pynecore_ctrader import CTrader, CTraderConfig
 from pynecore_ctrader import events as ctrader_events
 from pynecore_ctrader import reconcile as ctrader_reconcile
+from pynecore_ctrader._base import _UNKNOWN_DISPATCH_TTL_S
 from pynecore_ctrader.helpers import volume_to_units
 from pynecore_ctrader.messages import OpenApiMessages_pb2 as _oa
 from pynecore_ctrader.messages import OpenApiModelMessages_pb2 as _model
@@ -1857,7 +1858,7 @@ def __test_deal_bridge_from_ms_uses_submitted_at_anchor__(tmp_path):
 # === Disappearance-grace synthetic cancel (2.4) ===========================
 
 def _drive_tracker(broker) -> tuple[list, UnexpectedCancelError | None]:
-    """Drive ``_emit_unexpected_cancellations``; capture events and any halt."""
+    """Drive ``_emit_unexpected_cancellations``; capture events and any fail-safe signal."""
     async def collect():
         events: list = []
         err: UnexpectedCancelError | None = None
@@ -1899,7 +1900,7 @@ def __test_grace_expired_missing_settled_position_retires_benignly__(tmp_path):
 
 
 def __test_grace_not_expired_missing_pending_is_noop__(tmp_path):
-    # A freshly-stamped row is still inside the grace window: no cancel, no halt.
+    # A freshly-stamped row is still inside the grace window: no cancel, no fail-safe signal.
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(_recon())
     _open(tmp_path, broker)
@@ -1917,7 +1918,7 @@ def __test_grace_expired_natural_close_booked_as_close_not_cancel__(tmp_path):
     # A native TP/SL (or external) close fired while the stream was down: the
     # grace-expired position's final deal-history re-check shows closedVolume>0,
     # so it is booked as a terminal CLOSE, never a synthetic unexpected_cancel —
-    # no cancel event, no halt; the close itself is delivered as a fill.
+    # no cancel event, no fail-safe signal; the close itself is delivered as a fill.
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(
         _recon(),
@@ -1931,7 +1932,7 @@ def __test_grace_expired_natural_close_booked_as_close_not_cancel__(tmp_path):
     events, err = _drive_tracker(broker)
 
     assert [(e.event_type, e.fill_id) for e in events] == [('filled', '900')]
-    assert err is None                        # no halt
+    assert err is None                        # no fail-safe signal
     assert 'c3' not in _live_coids(broker)    # retired as a close
     assert 900 in broker._seen_deal_ids       # close deal recorded on the de-dup channel
 
@@ -2144,21 +2145,32 @@ def _foreign_expiry_wire() -> _OrderStatusWire:
                             expiry=1_700_000_900_000)
 
 
-def _vanished_working_broker(tmp_path, wire) -> tuple[_ReconcileBroker, list]:
+def _vanished_working_broker(tmp_path, wire, *, missing_since=0.0,
+                             causes=None) -> tuple[_ReconcileBroker, list]:
     """A zero-fill working entry stamped missing past the grace window, with
-    the external-intervention reports captured."""
+    the external-intervention reports captured (and the quarantine causes, in
+    ``causes``, when given: ``('latch', cause)`` / ``('release', cause)``)."""
     broker = _ReconcileBroker(_recon())
     broker._wire = wire
     _open(tmp_path, broker)
     _seed_working(broker, 'w1', order_id=600, qty=volume_to_units(2000),
-                  extras={'missing_pending_since': 0.0})
+                  extras={'missing_pending_since': missing_since})
     reports: list = []
 
-    def sink(reason, context, *, kind):
+    def sink(reason, context, *, kind, cause=None):
         reports.append((reason, context, kind))
+        if causes is not None:
+            causes.append(('latch', cause))
         _store_test_latch(broker, reason, context, kind)
 
+    def release(cause, resolution):
+        assert resolution
+        if causes is not None:
+            causes.append(('release', cause))
+        return True
+
     broker.quarantine_sink = sink
+    broker.quarantine_release_sink = release
     return broker, reports
 
 
@@ -2237,10 +2249,14 @@ def _not_found_wire() -> _OrderStatusWire:
 
 def __test_grace_expired_working_order_the_venue_does_not_find_quarantines__(tmp_path, caplog):
     """The venue no longer knows a vanished pending entry: no status, executed
-    volume or deal list proves it unexecuted. The row stays live with its
-    stamp, the bot is quarantined (entry block) once with an ERROR, and no
-    cancel is booked; a later pass neither books nor quarantines again."""
-    broker, reports = _vanished_working_broker(tmp_path, _not_found_wire())
+    volume or deal list proves it unexecuted, and the deal history listing no
+    fill may still lag. The row stays live with its stamp, the bot is
+    quarantined (entry block) once with an ERROR under the order's own cause,
+    and no cancel is booked; a later pass neither books nor quarantines again."""
+    missed = epoch_time() - 60.0
+    causes: list = []
+    broker, reports = _vanished_working_broker(
+        tmp_path, _not_found_wire(), missing_since=missed, causes=causes)
 
     with caplog.at_level(logging.ERROR, logger='pynecore_ctrader.reconcile'):
         events, err = _drive_tracker(broker)
@@ -2249,12 +2265,88 @@ def __test_grace_expired_working_order_the_venue_does_not_find_quarantines__(tmp
     assert events == [] and again == [] and err is None and err_again is None
     assert [(reason, kind) for reason, _context, kind in reports] == [
         ('vanished_order_not_found', QuarantineKind.ENTRY_BLOCK)]
+    assert causes == [('latch', 'vanished_order:600')]
     assert reports[0][1]['order_id'] == 600
     assert 'w1' in _live_coids(broker)
-    assert broker.store_ctx.get_order('w1').extras.get('missing_pending_since') == 0.0
+    assert broker.store_ctx.get_order('w1').extras.get('missing_pending_since') == missed
     assert _store_events(broker, 'ctrader_cancel_unattributed') == []
     assert sum(record.levelno == logging.ERROR and 'not found' in record.getMessage()
                for record in caplog.records) == 1
+
+
+def __test_not_found_vanished_order_is_decided_by_its_deal_history__(tmp_path, monkeypatch):
+    """The bot gets out of the not-found quarantine by itself: once the venue's
+    indexing bound passed since the order was missed and the complete deal
+    history still lists no execution, the order executed nothing. It is
+    retired as an unattributed cancel (no policy) and the cause is released."""
+    missed = epoch_time() - 60.0
+    clock = [epoch_time()]
+    monkeypatch.setattr(ctrader_reconcile, 'epoch_time', lambda: clock[0])
+    causes: list = []
+    broker, reports = _vanished_working_broker(
+        tmp_path, _not_found_wire(), missing_since=missed, causes=causes)
+
+    assert _drive_tracker(broker) == ([], None)
+    assert causes == [('latch', 'vanished_order:600')]
+    clock[0] = missed + _UNKNOWN_DISPATCH_TTL_S + 1.0
+    events, err = _drive_tracker(broker)
+
+    assert err is None
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    assert events[0].cancel_reason in VENUE_DRIVEN_CANCEL_REASONS
+    assert 'w1' not in _live_coids(broker)
+    assert len(_store_events(broker, 'ctrader_cancel_unattributed')) == 1
+    assert causes == [('latch', 'vanished_order:600'), ('release', 'vanished_order:600')]
+    assert broker._vanished_not_found_warned == set()
+    assert len(reports) == 1
+
+
+def __test_not_found_vanished_order_missed_long_ago_is_decided_at_once__(tmp_path):
+    """A row missed longer ago than the indexing bound needs no quarantine."""
+    causes: list = []
+    broker, reports = _vanished_working_broker(tmp_path, _not_found_wire(), causes=causes)
+
+    events, err = _drive_tracker(broker)
+
+    assert err is None and reports == [] and causes == []
+    assert len(events) == 1 and events[0].event_type == 'cancelled'
+    assert 'w1' not in _live_coids(broker)
+
+
+def __test_not_found_vanished_order_whose_fill_the_history_shows_ends_its_cause__(tmp_path):
+    """The deal history later lists the order's fill: no cancel, the row waits
+    for its promotion, and the quarantine cause is released."""
+    causes: list = []
+    wire = _not_found_wire()
+    broker, _reports = _vanished_working_broker(
+        tmp_path, wire, missing_since=epoch_time() - 60.0, causes=causes)
+    assert _drive_tracker(broker) == ([], None)
+
+    wire._deal_res = _deal_res(_deal(deal_id=61, order_id=600, position_id=777,
+                                     filled_volume=2000))
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None
+    assert 'w1' in _live_coids(broker)
+    assert causes == [('latch', 'vanished_order:600'), ('release', 'vanished_order:600')]
+
+
+def __test_vanished_order_cause_ends_when_another_path_retires_its_row__(tmp_path):
+    """A row the stream or another pass retired, or whose order is back (its
+    missing stamp gone), no longer waits: the next snapshot pass releases."""
+    causes: list = []
+    broker, _reports = _vanished_working_broker(
+        tmp_path, _not_found_wire(), missing_since=epoch_time() - 60.0, causes=causes)
+    assert _drive_tracker(broker) == ([], None)
+    row = broker.store_ctx.get_order('w1')
+
+    broker._release_settled_vanished_causes([(row, 600)])
+    assert causes == [('latch', 'vanished_order:600')], "still missing: still held"
+    broker.store_ctx.close_order('w1')
+    broker._release_settled_vanished_causes([])
+
+    assert causes == [('latch', 'vanished_order:600'), ('release', 'vanished_order:600')]
+    assert broker._vanished_not_found_warned == set()
 
 
 def __test_not_found_vanished_order_is_retired_once_a_resume_accepts_it__(tmp_path):
@@ -2498,7 +2590,7 @@ def __test_partial_close_still_open_position_not_terminal_closed__(tmp_path):
     assert 'missing_pending_since' not in (row.extras or {})  # stamp cleared by pass 1
 
 
-def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
+def __test_policy_stop_with_quarantine_sink_raises_no_fail_safe_signal__(tmp_path):
     # With the runner-wired quarantine sink present, the default 'stop' policy
     # latches the engine's external-intervention quarantine instead of raising:
     # the event stream (and the process) stays alive while the bot leaves the
@@ -2521,7 +2613,7 @@ def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
     events, err = _drive_tracker(broker)
 
     assert len(events) == 1 and events[0].event_type == 'cancelled'
-    assert err is None                      # no halt: the process stays alive
+    assert err is None                      # no fail-safe signal: the stream stays open
     assert 'q1' not in _live_coids(broker)  # row still retired
     assert len(latched) == 1
     reason, context, kind = latched[0]
@@ -2533,7 +2625,7 @@ def __test_policy_stop_with_quarantine_sink_does_not_halt__(tmp_path):
                    for r in broker._wire.requests)
 
 
-def __test_policy_ignore_retires_without_halting__(tmp_path):
+def __test_policy_ignore_retires_without_a_fail_safe_signal__(tmp_path):
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(_recon())
     broker._wire = _foreign_expiry_wire()
@@ -2549,7 +2641,7 @@ def __test_policy_ignore_retires_without_halting__(tmp_path):
     assert 'c4' not in _live_coids(broker)
 
 
-def __test_policy_re_place_retires_without_halting__(tmp_path):
+def __test_policy_re_place_retires_without_a_fail_safe_signal__(tmp_path):
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(_recon())
     broker._wire = _foreign_expiry_wire()
@@ -2565,10 +2657,12 @@ def __test_policy_re_place_retires_without_halting__(tmp_path):
     assert 'c5' not in _live_coids(broker)
 
 
-def __test_reconcile_pass_propagates_unexpected_cancel_halt__(tmp_path):
+def __test_reconcile_pass_propagates_the_unexpected_cancel_signal__(tmp_path):
     # Integration: the snapshot pass does NOT re-clear a still-missing stamp,
-    # and the halt from the grace tracker propagates through _run_reconcile_pass
-    # (it is NOT swallowed by the transient gap-filler guard).
+    # and the fail-safe signal of the grace tracker (``stop`` without a wired
+    # quarantine sink) propagates through _run_reconcile_pass (it is NOT
+    # swallowed by the transient gap-filler guard): the engine latches the
+    # external-intervention quarantine on it.
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(_recon(positions=[]))
     broker._wire = _foreign_expiry_wire()
@@ -2719,6 +2813,9 @@ class _VenueWire(_FakeWire):
                 raise self.details_errors_once.pop(0)
             if self.details_error is not None:
                 raise self.details_error
+            if req.orderId not in self.orders:
+                # An order the test gives no details of: the read times out.
+                raise TimeoutError("order details down")
             return _oa.ProtoOAOrderDetailsRes(order=self.orders[req.orderId])
         return await super().send_request(req, timeout=timeout)
 
@@ -3186,12 +3283,25 @@ def __test_recovered_report_a_dead_process_never_delivered_is_replayed__(tmp_pat
     assert third_reports == []
 
 
-def __test_recovered_report_that_halted_is_not_replayed__(tmp_path):
+def _raising_sink(reason, context, *, kind):
+    raise RuntimeError("quarantine sink down")
+
+
+@pytest.mark.parametrize('sink', [None, _raising_sink], ids=['unwired-sink', 'raising-sink'])
+def __test_recovered_report_raised_as_the_fail_safe_signal_is_not_replayed__(tmp_path, sink):
+    """The ``stop`` policy cannot latch the quarantine through the sink (none is
+    wired, or it raises): the report leaves the stream as the fail-safe
+    :class:`UnexpectedCancelError`, on which the engine latches the
+    external-intervention quarantine and reopens the stream. The report is
+    journalled as handled before the signal leaves, so neither the reopened
+    stream of the same process nor a restarted process reports it again."""
     first, _ = _recovered_close_broker(tmp_path, _closing_order(999))
-    first.on_unexpected_cancel = 'halt'
+    first.on_unexpected_cancel = 'stop'
+    first.quarantine_sink = sink
     _drive_tracker(first)
     with pytest.raises(UnexpectedCancelError):
         first._flush_external_interventions()
+    first._flush_external_interventions()
     first.store_ctx.close()
 
     restarted, reports = _recovered_close_broker(tmp_path, _closing_order(999), seed=False)
@@ -3278,8 +3388,9 @@ def __test_recovered_working_close_lookup_failure_defers_the_retire__(tmp_path):
 
 def __test_watch_orders_reports_a_recovered_manual_close_after_the_pass__(
         tmp_path, monkeypatch):
-    """Without a quarantine sink the policy halts: the halt leaves the stream
-    after the pass that retired the position."""
+    """Without a quarantine sink the ``stop`` policy raises its fail-safe
+    signal: it leaves the stream after the pass that retired the position, and
+    the engine latches the external-intervention quarantine on it."""
     monkeypatch.setattr(ctrader_events, '_RECONCILE_CADENCE_S', 0.0)
     broker, _reports = _recovered_close_broker(tmp_path, _closing_order(999))
     broker.quarantine_sink = None
@@ -6663,3 +6774,211 @@ def __test_unpriced_close_of_the_share_is_judged_once_priced__(tmp_path):
         (LegType.CLOSE, pytest.approx(1.15), '906'),
     ]
     assert 'c14' not in _live_coids(broker)
+
+
+# === Own fill adopted in the run with an earlier unseen execution ============
+
+def _adopted_gap_broker(tmp_path):
+    """The stream delivers only the second deal of order 555 of the run.
+
+    Its first deal (10 units at 1.1) was never delivered: the push of the
+    second one (10 units at 1.2) shows 20 executed. The order filled and left
+    ``order[]``; its position 54302872 holds the 20.
+    """
+    first = _deal(deal_id=5551, order_id=555, position_id=54302872, filled_volume=1000,
+                  price=1.1)
+    second = _deal(deal_id=5552, order_id=555, position_id=54302872, filled_volume=1000,
+                   price=1.2)
+    second.executionTimestamp = first.executionTimestamp + 1000
+    deals = _deal_res(first, second)
+    broker = _ReconcileBroker(
+        _recon(positions=[_position(position_id=54302872, volume=2000)]), deal_res=deals)
+    _open(tmp_path, broker)
+    broker._symbol_rules = {'EURUSD': _RULES}
+    order = _model.ProtoOAOrder(
+        orderId=555, orderType=_model.ProtoOAOrderType.MARKET,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, executedVolume=2000,
+        positionId=54302872, clientOrderId=f"{broker.store_ctx.run_tag}-7rxpdapr-0mv9ub05c-e0",
+        tradeData=_model.ProtoOATradeData(symbolId=1, volume=2000,
+                                          tradeSide=_model.ProtoOATradeSide.BUY))
+    push = _oa.ProtoOAExecutionEvent(executionType=_model.ProtoOAExecutionType.ORDER_FILLED)
+    push.order.CopyFrom(order)
+    push.deal.CopyFrom(_model.ProtoOADeal(dealId=5552, orderId=555, positionId=54302872,
+                                          filledVolume=1000, executionPrice=1.2))
+    return broker, push, f"{broker.store_ctx.run_tag}-own-555"
+
+
+def _fills(events) -> list[tuple[str | None, float | None, float | None]]:
+    return [(e.fill_id, e.fill_qty, e.fill_price) for e in events
+            if e.event_type in ('filled', 'partial')]
+
+
+def __test_an_adopted_fill_after_an_unseen_execution_books_both_deals_once__(tmp_path):
+    # The push of the second deal is held: booking it would move the cursor
+    # past the first deal the engine never booked. The reconcile pass reads
+    # the order's deals and books both, in execution order at their own
+    # prices; a later pass and a late copy of either push book nothing.
+    broker, push, coid = _adopted_gap_broker(tmp_path)
+
+    assert broker._translate_exec_event(push) is None
+
+    row = broker.store_ctx.get_order(coid)
+    assert row.filled_qty == 0.0
+    assert row.pine_entry_id == ADOPTED_STARTUP_ENTRY_ID
+    assert 5552 not in broker._seen_deal_ids
+
+    events = _run(broker)
+
+    assert _fills(events) == [('5551', pytest.approx(10.0), pytest.approx(1.1)),
+                              ('5552', pytest.approx(10.0), pytest.approx(1.2))]
+    assert all(e.pine_id == ADOPTED_STARTUP_ENTRY_ID for e in events)
+    assert broker.store_ctx.get_order(coid).filled_qty == pytest.approx(20.0)
+    assert coid not in broker._adoption_reads
+    assert _fills(_run(broker)) == []
+    assert broker._translate_exec_event(push) is None
+
+
+def __test_an_adopted_fill_whose_deal_read_fails_is_read_again_then_booked__(tmp_path):
+    # The deal history cannot be read: nothing is booked, the cursor stays,
+    # and the read waits out its backoff before it is asked again. Once it
+    # answers, both deals are booked once.
+    broker, push, coid = _adopted_gap_broker(tmp_path)
+    assert broker._translate_exec_event(push) is None
+    broker._wire._fail = True
+
+    assert _fills(_run(broker)) == []
+
+    assert broker.store_ctx.get_order(coid).filled_qty == 0.0
+    next_at, delay = broker._adoption_reads[coid]
+    assert delay == pytest.approx(10.0)
+    requests = len(broker._wire.requests)
+    broker._wire._fail = False
+    assert _fills(_run(broker)) == []
+    assert len(broker._wire.requests) == requests
+    broker._adoption_reads[coid] = (0.0, delay)
+
+    assert _fills(_run(broker)) == [('5551', pytest.approx(10.0), pytest.approx(1.1)),
+                                    ('5552', pytest.approx(10.0), pytest.approx(1.2))]
+    assert broker.store_ctx.get_order(coid).filled_qty == pytest.approx(20.0)
+    assert coid not in broker._adoption_reads
+
+
+# === Executions handed to the engine's held-execution recovery ==============
+
+def _entry_row(broker, coid) -> None:
+    """Give a seeded working row the entry shape the engine's hold applies to."""
+    row = broker.store_ctx.get_order(coid)
+    broker.store_ctx.upsert_order(coid, intent_key='long',
+                                  extras={**(row.extras or {}), 'kind': 'working'})
+
+
+def __test_a_vanished_order_executed_by_its_details_only_is_handed_over__(tmp_path):
+    # The complete deal history lists no fill of the vanished order, but its
+    # details show it filled: the history cannot deliver the fill, so the
+    # entry goes to the engine's held-execution recovery. No cancel, no policy.
+    broker, reports = _vanished_working_broker(
+        tmp_path, _OrderStatusWire(status=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+                                   executed=2000))
+    _entry_row(broker, 'w1')
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None and reports == []
+    assert {coid: request['order_id'] for coid, request
+            in broker.store_ctx.execution_hold_requests().items()} == {'w1': '600'}
+
+
+def __test_a_handed_over_order_s_absence_is_no_disappearance__(tmp_path):
+    # The engine holds the order: a complete history without its fill stamps
+    # nothing, a stamp left from before is cleared, and a grace-expired check
+    # concludes nothing.
+    broker = _ReconcileBroker(_recon(positions=[]), deal_res=_deal_res())
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c5', order_id=111, qty=volume_to_units(2000),
+                  extras={'missing_pending_since': 0.0})
+    broker.store_ctx.held_execution_order_ids = lambda: frozenset({'111'})
+
+    events, err = _drive_tracker(broker)
+
+    assert events == [] and err is None
+    assert _run(broker) == []
+    assert 'missing_pending_since' not in (broker.store_ctx.get_order('c5').extras or {})
+    assert _run(broker) == []
+    assert 'missing_pending_since' not in (broker.store_ctx.get_order('c5').extras or {})
+    assert 'c5' in _live_coids(broker)
+
+
+def __test_a_vanished_order_whose_closed_position_s_history_is_short_is_handed_over__(
+        tmp_path):
+    # The order reported 20 executed earlier; its position closed, and the
+    # complete deal history shows only 10 of them: the fills cannot be
+    # delivered from it, so the entry goes to the engine's recovery and
+    # nothing is booked or judged here.
+    broker = _ReconcileBroker(_recon(positions=[]), deal_res=_deal_res(
+        _deal(deal_id=901, order_id=111, position_id=222, filled_volume=1000),
+        _close_deal(deal_id=902, order_id=999, position_id=222, closed_volume=2000)))
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c7', order_id=111, qty=volume_to_units(2000),
+                  extras={'executed_cents': 2000})
+    _entry_row(broker, 'c7')
+
+    assert _run(broker) == []
+
+    assert {coid: request['order_id'] for coid, request
+            in broker.store_ctx.execution_hold_requests().items()} == {'c7': '111'}
+    assert 'c7' in _live_coids(broker)
+    assert 902 not in broker._seen_deal_ids
+
+
+def __test_a_settled_handed_over_entry_on_an_open_position_keeps_its_row__(tmp_path):
+    # The engine booked the handed-over order's execution; its position is
+    # still open. The row takes the executed volume and the position, and
+    # stays live as that position's row.
+    filled = _model.ProtoOAOrder(
+        orderId=111, orderType=_model.ProtoOAOrderType.LIMIT,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, executedVolume=2000,
+        positionId=222, tradeData=_model.ProtoOATradeData(
+            symbolId=1, volume=2000, tradeSide=_model.ProtoOATradeSide.BUY))
+    broker = _ReconcileBroker(_recon(positions=[_position(position_id=222, volume=2000)]))
+    broker._wire = _VenueWire(deal_res=_deal_res(), orders=[filled])
+    broker._symbol_rules = {'EURUSD': _RULES}
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c8', order_id=111, qty=volume_to_units(2000),
+                  extras={'execution_handed_over': '111'})
+    _entry_row(broker, 'c8')
+
+    assert _run(broker) == []
+
+    row = broker.store_ctx.get_order('c8')
+    assert row.closed_ts_ms is None
+    assert row.filled_qty == pytest.approx(volume_to_units(2000))
+    assert (row.extras or {}).get('position_id') == 222
+    assert 'execution_handed_over' not in (row.extras or {})
+    assert broker.store_ctx.execution_hold_requests() == {}
+
+
+def __test_a_settled_handed_over_entry_whose_close_the_history_lacks_leaves_it_to_the_engine__(
+        tmp_path, caplog):
+    # The engine booked the handed-over order's execution; its position is
+    # closed, but the deal history shows no close of it. No close fill is
+    # invented: the row is retired and the close is left to the engine's own
+    # fallback, which the log says.
+    filled = _model.ProtoOAOrder(
+        orderId=111, orderType=_model.ProtoOAOrderType.LIMIT,
+        orderStatus=_model.ProtoOAOrderStatus.ORDER_STATUS_FILLED, executedVolume=2000,
+        positionId=222, tradeData=_model.ProtoOATradeData(
+            symbolId=1, volume=2000, tradeSide=_model.ProtoOATradeSide.BUY))
+    broker = _ReconcileBroker(_recon(positions=[]))
+    broker._wire = _VenueWire(deal_res=_deal_res(), orders=[filled])
+    _open(tmp_path, broker)
+    _seed_working(broker, 'c9', order_id=111, qty=volume_to_units(2000),
+                  extras={'execution_handed_over': '111'})
+    _entry_row(broker, 'c9')
+
+    with caplog.at_level(logging.WARNING):
+        assert _run(broker) == []
+
+    row = broker.store_ctx.get_order('c9')
+    assert row.closed_ts_ms is not None
+    assert row.filled_qty == pytest.approx(volume_to_units(2000))
+    assert "left to the engine's own fallback" in caplog.text

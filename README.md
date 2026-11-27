@@ -108,6 +108,29 @@ translation table in the config.
   trailing stop as position attributes. Netting (one-way) accounts use the
   direct execution path; hedging accounts run through PyneCore's one-way
   emulation layer, so Pine one-way semantics hold on both.
+- **Closing an execution PyneCore never booked**: when an entry's fill
+  evidence never arrives and the strategy asks to close that exposure,
+  PyneCore closes the venue position it reads (`held_execution_close`). Both
+  account modes support it. On a netting account the plugin closes the symbol's
+  position with `ProtoOAClosePositionReq`, never by more than the position
+  holds and never on the other side. On a hedging account the leg the held
+  entry's order opened is listed for PyneCore's one-way emulation, which
+  closes it with the bot's other legs. The plugin finds that leg through the
+  venue's order details (the position each of the order's deals executed
+  into).
+- **Recovering its own trouble without an operator**: when the order stream
+  missed an execution, PyneCore asks the plugin to read it back
+  (`fetch_order_execution`). The plugin reads the order details
+  (`ProtoOAOrderDetailsReq`) and returns the order's deals as the fills the
+  stream would have delivered, under the same deal ids. A close the bot sent
+  is judged from its journalled send and the position's deal history. A
+  vanished order the venue no longer finds blocks new entries only until its
+  deal history decides it, then the block is released. A fill of the bot's
+  own order that no journal row tracks any more is adopted as the bot's
+  exposure and booked at once, instead of waiting for a restart. After a
+  restart, a send that filled into a position the startup adopted takes that
+  position over, and the venue's offset ledger (`ProtoOADealOffsetListReq`)
+  tells which part of its execution is still open.
 - **Push order events**: order state and fills arrive over the
   `ProtoOAExecutionEvent` stream — no polling. Bracket changes go through
   native atomic amends instead of cancel-and-recreate.

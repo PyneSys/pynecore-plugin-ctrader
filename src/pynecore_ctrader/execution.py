@@ -117,6 +117,14 @@ _SIDE_TO_TRADE_SIDE = {
     'sell': OpenApiModelMessages.ProtoOATradeSide.SELL,
 }
 
+#: Close kinds for which a position gone or busy on the venue is an
+#: :class:`~pynecore.core.broker.exceptions.OrderSkippedByPlugin` skip, after
+#: which the run goes on: a script
+#: close and an engine-trigger partial close re-evaluate against the settled
+#: book, and the engine reads the venue again before it sends another
+#: ``held_execution_close``. Defensive and reversal closes keep the reject.
+_SKIPPABLE_CLOSE_KINDS = frozenset({None, 'partial_trigger', 'held_execution_close'})
+
 
 class _ExecutionMixin(_ProtectionMixin, ABC):
     """Order execution mix-in: every ``execute_*`` and ``modify_*`` path."""
@@ -139,8 +147,8 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             # sent, so this must surface as the recoverable
             # ``ExchangeConnectionError`` the engine parks — a raw
             # ``CTraderConnectionError`` escaping an order dispatch is an
-            # untranslated fault the sync engine halts on (measured live:
-            # ctrader cycle 60, post-sleep offline window).
+            # untranslated fault the sync engine quarantines the run on
+            # (measured live: ctrader cycle 60, post-sleep offline window).
             raise ExchangeConnectionError("cTrader live connection not established")
         if symbol not in self._symbols_by_name:
             await self._fetch_light_symbols(
@@ -176,6 +184,17 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         close / fail-safe paths all target the single open position found by
         symbol. ``None`` when the symbol is flat.
         """
+        position = await self._find_open_position(symbol)
+        return position.positionId if position is not None else None
+
+    async def _find_open_position(
+            self, symbol: str,
+    ) -> OpenApiModelMessages.ProtoOAPosition | None:
+        """Return the open position for ``symbol`` from a fresh snapshot (NETTING).
+
+        The one position :meth:`_find_open_position_id` targets, with its own
+        volume and side. ``None`` when the symbol is flat.
+        """
         want_id = await self._resolve_state_symbol_id(symbol)
         if want_id is None:
             # Never fall back to a symbol-agnostic match: the exit / close /
@@ -194,7 +213,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
                 continue
             if position.tradeData.symbolId != want_id:
                 continue
-            return position.positionId
+            return position
         return None
 
     def _find_working_order_id(self, pine_id: str) -> int | None:
@@ -398,7 +417,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         once triggered). Size below
         ``minVolume`` or above ``maxVolume`` is declined with
         :class:`OrderSkippedByPlugin` (never silently clamped) so a single
-        out-of-range order cannot halt the bot. A protective bracket is NOT
+        out-of-range order never stops the bot's trading. A protective bracket is NOT
         attached here — it arrives as a separate ``strategy.exit`` →
         :meth:`execute_exit`.
 
@@ -690,9 +709,9 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             # The parent entry already filled (the position is OPEN — this amend
             # only attaches its protective levels), so a reject here leaves the
             # position open and UNPROTECTED. Surface it distinctly so the sync
-            # engine flattens it with a defensive market close instead of
-            # halting (a plain reject is treated as a no-fill, non-terminal
-            # condition and would strand the unprotected position).
+            # engine flattens it with a defensive market close (a plain reject
+            # is treated as a no-fill, non-terminal condition and would strand
+            # the unprotected position).
             raise self._bracket_attach_reject(intent, position_id, exc) from exc
 
         if self.store_ctx is not None:
@@ -875,7 +894,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         order (``*_NOT_FOUND``) is a benign no-op; wire trouble surfaces from
         :meth:`_dispatch_order` as :class:`ExchangeConnectionError` /
         :class:`OrderDispositionUnknownError` for the engine's retry loop; any
-        other reject propagates and halts. ``ORDER_CANCEL_REJECTED`` arrives
+        other reject propagates as the genuine rejection it is. ``ORDER_CANCEL_REJECTED`` arrives
         as a non-error execution event (a cancel/fill race — the order is
         still live and may yet fill), so it is raised as
         :class:`OrderDispositionUnknownError` to keep the engine retrying
@@ -955,8 +974,8 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             # The same races ``execute_close`` handles, on the one-way fan
             # path (measured live: ctrader cycle 121, the native fail-safe
             # fill locking the leg the engine-trigger partial close targeted).
-            # The core emulator decides whether the skip is non-halting for
-            # this close kind or must stay a definitive reject.
+            # The core emulator decides whether this close kind is skipped
+            # (the run goes on) or must stay a definitive reject.
             cause = exc.__cause__
             if not isinstance(cause, CTraderProtocolError):
                 raise
@@ -983,7 +1002,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
     async def reject_out_of_range(
             self, envelope: DispatchEnvelope, qty: float,
     ) -> None:
-        """Raise the non-halting volume-bounds skip when ``qty`` is out of range.
+        """Raise the volume-bounds skip (the run goes on) when ``qty`` is out of range.
 
         Core's reversal pre-flights the residual size through this before any
         leg close lands, so an out-of-range reversal skips while still true.
@@ -1028,7 +1047,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         propagates as :class:`ExchangeOrderRejectedError`; on the attach path the
         core emulator wraps it into a
         :class:`BracketAttachAfterFillRejectedError` so the open, now-unprotected
-        position is flattened defensively rather than halting the bot.
+        position is flattened defensively instead of staying unprotected.
 
         ``qty`` is unused: a position's SL/TP covers the whole position, which
         is all the core ever asks of this port (``sized_leg_bracket`` is
@@ -1327,7 +1346,8 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         entry it names (``None`` for ``strategy.close_all``), an engine-made
         close aimed at one entry (``partial_trigger``, ``marketable_exit``)
         its ``target_entry_id``, a ``defensive_close`` the entry of the
-        position row it targets, a ``reversal_close`` no entry.
+        position row it targets, a ``reversal_close`` and a
+        ``held_execution_close`` (both symbol-wide) no entry.
 
         :param intent: The close being dispatched.
         """
@@ -1351,10 +1371,12 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         :param why: Own-worded reason, e.g. ``"no open position"``.
         :param cause: The venue reject to chain, when the venue answered.
         :raises OrderSkippedByPlugin: For script and engine-trigger partial
-            closes — the book is flat on that side, nothing to close.
+            closes — the book is flat on that side, nothing to close — and for
+            a ``held_execution_close``: the venue holds nothing it could close,
+            and the engine reads the venue again before it sends another.
         :raises ExchangeOrderRejectedError: For defensive / reversal closes.
         """
-        if intent.synthetic_kind in (None, 'partial_trigger'):
+        if intent.synthetic_kind in _SKIPPABLE_CLOSE_KINDS:
             raise OrderSkippedByPlugin(
                 f"cTrader execute_close: {why} for symbol {intent.symbol!r}; "
                 f"nothing to close",
@@ -1366,6 +1388,45 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         raise ExchangeOrderRejectedError(
             f"cTrader execute_close: {why} for symbol {intent.symbol!r}"
         ) from cause
+
+    @staticmethod
+    def _held_execution_close_volume(
+            intent: CloseIntent, position: OpenApiModelMessages.ProtoOAPosition, volume: int,
+    ) -> int:
+        """The volume of a netting ``held_execution_close``, never more than the position holds.
+
+        The engine sized the close from the venue position it read right
+        before (``intent.qty``), which includes an execution no journal row
+        of the run may own. The close is a ``ProtoOAClosePositionReq`` of the
+        symbol's one position, a request for "closing or partially closing of
+        an existing position", and its volume is capped at that position's
+        own ``tradeData.volume`` in this snapshot: a position that shrank since
+        the engine's read is closed by what it still holds, so the close never
+        asks the venue for more than the position (what the venue does with a
+        larger volume is not documented). A position on the other side than
+        the close reduces is not the exposure the strategy asked to close:
+        nothing is sent.
+
+        :param intent: The ``held_execution_close``.
+        :param position: The symbol's open position in the snapshot the close
+            targets.
+        :param volume: ``intent.qty`` on the symbol's volume grid.
+        :return: The volume to send, in centi-units.
+        :raises OrderSkippedByPlugin: When the position is on the other side
+            (reason ``nothing_to_close``).
+        """
+        holds_long = position.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
+        if holds_long != (intent.side == 'sell'):
+            raise OrderSkippedByPlugin(
+                f"cTrader execute_close: the open position of {intent.symbol!r} is on the "
+                f"other side than the {intent.side} close reduces; nothing to close",
+                intent_key=intent.intent_key,
+                reason='nothing_to_close',
+                context={'symbol': intent.symbol, 'side': intent.side,
+                         'synthetic_kind': intent.synthetic_kind,
+                         'position_id': position.positionId},
+            )
+        return min(volume, int(position.tradeData.volume))
 
     @override
     async def execute_close(
@@ -1382,14 +1443,25 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         symbol, or the venue answering the close with a not-found code — is
         already satisfied: the book is flat there and the settling fill arrives
         on the event stream. Script closes and engine-trigger partial closes
-        surface that as a non-halting :class:`OrderSkippedByPlugin` so the
-        engine re-evaluates against the settled book; defensive and reversal
+        surface that as an :class:`OrderSkippedByPlugin` skip, the run going
+        on, so the engine re-evaluates against the settled book; defensive and reversal
         closes keep the loud reject, their producers own dedicated recovery
         contracts. A close the venue refuses because the position is busy
         (``POSITION_LOCKED``: another operation is executing on it) gets the
-        same non-halting treatment with its own reason — the position may
+        same skip with its own reason — the position may
         still hold size, so the engine re-evaluates against the next
         snapshot instead of retiring the close.
+
+        A ``held_execution_close`` (the engine's close of the venue position
+        over an entry whose execution evidence never arrived; netting
+        accounts, :attr:`~_CTraderBase.supports_held_execution_close`) closes
+        the symbol's one position by ``intent.qty``, capped at the volume that
+        position holds and refused when it is on the other side
+        (:meth:`_held_execution_close_volume`). A position that is gone or
+        busy is the same skip as a script close's: the engine
+        reads the venue again before it sends another. Its journal row, its
+        own-close record and its fills carry the close's client order id and
+        label like any close of the run.
 
         The close is journalled persist-first: a row under its client order id
         (:data:`~pynecore_ctrader.protection._CLOSE_ROW_STATE`) is written with
@@ -1410,10 +1482,13 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
         assert isinstance(intent, CloseIntent)
         coid = envelope.client_order_id(KIND_CLOSE)
         rules = await self._get_symbol_rules(intent.symbol)
-        position_id = await self._find_open_position_id(intent.symbol)
-        if position_id is None:
+        position = await self._find_open_position(intent.symbol)
+        if position is None:
             self._raise_nothing_to_close(intent, "no open position")
+        position_id = position.positionId
         volume = quantize_volume(intent.qty, rules.step_volume)
+        if intent.synthetic_kind == 'held_execution_close':
+            volume = self._held_execution_close_volume(intent, position, volume)
         # Same identity as ``close_leg``: the own-close record
         # ``_send_own_close`` opens takes this label and settlement entry, and
         # a startup-adopted position no entry row carries the ``position_id``
@@ -1447,7 +1522,7 @@ class _ExecutionMixin(_ProtectionMixin, ABC):
             # re-evaluates against the fresh snapshot.
             if (isinstance(cause, CTraderProtocolError)
                     and is_position_locked(cause.error_code)
-                    and intent.synthetic_kind in (None, 'partial_trigger')):
+                    and intent.synthetic_kind in _SKIPPABLE_CLOSE_KINDS):
                 raise OrderSkippedByPlugin(
                     f"cTrader execute_close: the position is busy with another "
                     f"venue operation for symbol {intent.symbol!r} "

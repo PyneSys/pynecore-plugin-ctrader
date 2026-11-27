@@ -84,7 +84,7 @@ class CTraderAccountsUnavailableError(CTraderWireError):
     account is intact, so the empty list is a venue-side availability fault
     (the account service not serving the grant), not a revoked or expired
     consent — the startup connect backoff and the live reconnect should wait
-    it out rather than halt on a user-actionable auth error.
+    it out rather than fail as on a user-actionable auth error.
 
     :ivar kind: ``"demo"`` or ``"live"`` — the account kind the host requires.
     """

@@ -57,29 +57,58 @@ Resolution rules:
 import asyncio
 import logging
 from abc import ABC
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from time import time as epoch_time
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from pynecore.core.broker.exceptions import BrokerError
 from pynecore.core.broker.journal import DispatchJournal, ReconcileOutcome
+from pynecore.core.broker.models import (
+    ExchangeOrder,
+    LegType,
+    OrderEvent,
+    OrderExecution,
+    OrderStatus,
+    OrderType,
+)
 from pynecore.core.broker.parked_dispatch import ParkedOutcome, ParkedVerdict
 from pynecore.core.broker.store_helpers import (
     ENTRY_KIND_POSITION,
+    ENTRY_KIND_WORKING,
     EXTRAS_KEY_REJECTED_ON_ABSENCE,
     PENDING_DISPATCH_STATES,
     find_pending_dispatch,
 )
-from pynecore.types.strategy import ADOPTED_STARTUP_ENTRY_ID
+from pynecore.core.plugin import override
+from pynecore.types.strategy import (
+    ADOPTED_STARTUP_ENTRY_ID,
+    JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY,
+)
 
-from ._base import _UNKNOWN_DISPATCH_TTL_S
-from .helpers import REQUEST_TIMEOUT, parse_protocol_id, reported_executed, volume_to_units
+from ._base import EXECUTION_HANDED_OVER_EXTRA, _UNKNOWN_DISPATCH_TTL_S
+from .exceptions import is_not_found
+from .helpers import (
+    REQUEST_TIMEOUT,
+    money_value,
+    parse_protocol_id,
+    reported_executed,
+    volume_to_units,
+)
 from .messages import OpenApiMessages_pb2 as OpenApiMessages
 from .messages import OpenApiModelMessages_pb2 as OpenApiModelMessages
-from .protection import _VOLUME_TOL, _PositionDeal, _accepted_by_resume
-from .reconcile import _SINCE_ANCHOR_SKEW_MS, _VANISHED_CLOSE_EVENT, _ReconcileMixin
-from .wire import CTraderWireError
+from .protection import _CLOSE_ROW_STATE, _VOLUME_TOL, _PositionDeal, _accepted_by_resume
+from .reconcile import (
+    _EXECUTED_DEAL_STATUSES,
+    _SINCE_ANCHOR_SKEW_MS,
+    _VANISHED_CLOSE_EVENT,
+    _ReconcileMixin,
+)
+from .state import _ENTRY_KINDS, _ORDER_STATUS_MAP, _ORDER_TYPE_MAP, _order_details_positions
+from .wire import CTraderProtocolError, CTraderWireError
+
+if TYPE_CHECKING:
+    from pynecore.core.broker.storage import OrderRow
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +118,17 @@ _ABANDON_TTL_S = _UNKNOWN_DISPATCH_TTL_S
 #: Audit event: an open position carrying the run's label that no journal row
 #: of the run tracked was adopted as the bot's own.
 _OWN_LEG_RECOVERED_EVENT = 'ctrader_own_leg_recovered'
+#: Audit event of a handed-over entry the engine settled, synced onto its row
+#: (:meth:`_RecoveryMixin._settle_handed_over_row`).
+_EXECUTION_HOLD_SETTLED_EVENT = 'ctrader_execution_hold_settled'
 #: Audit event: a dispatch the startup recovery left pending was found filled
 #: into a position startup had adopted as an untracked own leg; the dispatch
 #: row took that position over.
 _ADOPTED_LEG_TAKEN_OVER_EVENT = 'ctrader_adopted_leg_taken_over'
-#: Audit event, once per dispatch: such a dispatch's order filled into the
-#: adopted position, but the evidence does not prove which part of it the
-#: adopted row holds; the dispatch stays parked and its entry held.
-_ADOPTED_LEG_TAKEOVER_HELD_EVENT = 'ctrader_adopted_leg_takeover_held'
+#: Audit event: such a dispatch took over the part of its order the venue's
+#: offset ledger shows open, but the adopted row held less of it; the rest,
+#: which the engine's adoption did not book, is booked as the order's fill.
+_ADOPTED_LEG_TAKEOVER_SHORT_EVENT = 'ctrader_adopted_leg_takeover_short'
 #: Audit event: a working order carrying the run's label or client-order-id
 #: prefix that no journal row of the run tracked was cancelled (or could not be).
 _OWN_ORDER_DEBRIS_EVENT = 'ctrader_own_order_debris'
@@ -156,8 +188,259 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         for row in pending:
             if await self._recover_one_pending_row(row, orders_by_coid, open_positions):
                 promoted_coids.add(row.client_order_id)
+        await self._hand_over_unreported_working_executions(res, promoted_coids)
         await self._retire_startup_orphans(res, promoted_coids)
         await self._recover_untracked_venue_state(res)
+
+    @override
+    async def fetch_order_execution(
+            self, order_id: str | None, client_order_id: str | None,
+    ) -> OrderExecution | None:
+        """Read what the venue executed of one order, from its order details.
+
+        :meth:`~pynecore.core.plugin.broker.BrokerPlugin.fetch_order_execution`.
+        Read-only on the venue. The order is found by:
+
+        * its venue ``orderId``, or the one its journal row recorded;
+        * a close's client order id: ``ProtoOAClosePositionReq`` carries no
+          client order id, so the venue cannot be asked by it; the close's
+          own-close records, journalled before every send, name its position
+          and order (:meth:`_close_order_execution`);
+        * an entry's client order id: ``ProtoOANewOrderReq.clientOrderId`` is
+          echoed on ``ProtoOAOrder.clientOrderId``, so the order history is
+          searched for it from the row's dispatch on
+          (:meth:`_find_order_by_coid`). A complete search that finds nothing
+          proves the order never reached the venue once
+          :data:`~pynecore_ctrader._base._UNKNOWN_DISPATCH_TTL_S` (the venue's
+          indexing bound the plugin gives a lost dispatch) passed since the
+          dispatch: ``order=None``.
+
+        The order is then read with ``ProtoOAOrderDetailsReq``, whose answer
+        carries "all deals created by filling" it (:meth:`_order_execution`).
+        An order the venue does not find there proves nothing (the plugin
+        never sends without an order id, so it reached the venue): ``None``,
+        the engine asks again.
+
+        :raises BrokerError: Or a wire error, when a read fails; the engine
+            asks again.
+        """
+        store = self.store_ctx
+        if self._live_account_id is None:
+            return None
+        row = None
+        if store is not None:
+            if order_id is not None:
+                row = store.find_by_ref('order_id', order_id)
+            if row is None and client_order_id is not None:
+                row = store.get_order_for_run_id(client_order_id)
+        if order_id is None and client_order_id is not None:
+            records = self._close_send_records([client_order_id])
+            if records:
+                return await self._close_order_execution(client_order_id, records, row)
+        venue_id = int(order_id) if order_id is not None and order_id.isdigit() else None
+        if venue_id is None and row is not None:
+            raw = (row.extras or {}).get('order_id')
+            if raw is not None:
+                venue_id = parse_protocol_id(raw, field='order_id')
+        if venue_id is None:
+            if row is None or client_order_id is None:
+                return None
+            lookup = await self._find_order_by_coid(
+                client_order_id, self._recovery_lower_bound_ms(row))
+            if lookup.order is not None:
+                venue_id = lookup.order.orderId
+            elif (lookup.conclusive
+                  and epoch_time() - row.created_ts_ms / 1000.0 >= _UNKNOWN_DISPATCH_TTL_S):
+                return OrderExecution(order=None)
+            else:
+                return None
+        try:
+            res = cast(OpenApiMessages.ProtoOAOrderDetailsRes, await self._account_request(
+                OpenApiMessages.ProtoOAOrderDetailsReq(
+                    ctidTraderAccountId=self._live_account_id, orderId=venue_id)))
+        except CTraderProtocolError as exc:
+            if is_not_found(exc.error_code):
+                logger.debug("cTrader order %d execution read: not found (%s)",
+                             venue_id, exc.error_code)
+                return None
+            raise
+        return self._order_execution(res, row, client_order_id)
+
+    def _order_execution(
+            self, res: OpenApiMessages.ProtoOAOrderDetailsRes, row: 'OrderRow | None',
+            client_order_id: str | None,
+    ) -> OrderExecution:
+        """The :class:`~pynecore.core.broker.models.OrderExecution` of one order's details.
+
+        The executed quantity is the larger of the order's ``executedVolume``
+        and the sum of its executed deals (the answer lists every deal its
+        fills created). Each deal is a fill under its ``dealId``, the fill id
+        the stream's push of it carries, at its own price, time and
+        commission (``commission`` / ``moneyDigits``, as the stream reads
+        it); ``fee_reported`` is ``False`` when an executed deal carries no
+        commission. Of an entry order its journal row counts part of, only the
+        part beyond the row's fill cursor is returned, cut as the reconcile
+        pass cuts it (:meth:`~_ReconcileMixin._executions_after`): the part
+        below may have been booked from the order's totals under a fill id of
+        its own (:func:`~pynecore_ctrader.reconcile._snapshot_fill_id`), and a
+        second id for the same execution would book it twice.
+
+        A live entry row not linked to a position yet is linked to the one
+        position the deals executed into (``extras['position_id']``), as the
+        stream links it on a fill, so the position stays the run's once the
+        engine books the execution.
+
+        :param res: The order's details.
+        :param row: The order's journal row, when the run has one.
+        :param client_order_id: The client order id the engine asked with.
+        """
+        order = res.order
+        deals = sorted(
+            (deal for deal in res.deal
+             if deal.filledVolume > 0 and deal.dealStatus in _EXECUTED_DEAL_STATUSES),
+            key=lambda deal: (deal.executionTimestamp, deal.dealId))
+        executed_cents = max(int(order.executedVolume), sum(int(d.filledVolume) for d in deals))
+        fee_reported = all(deal.HasField('commission') for deal in deals)
+        fees = {deal.dealId: money_value(deal.commission, deal.moneyDigits) for deal in deals}
+        average = order.executionPrice or None
+        if average is None and deals:
+            average = (sum(d.executionPrice * d.filledVolume for d in deals)
+                       / sum(d.filledVolume for d in deals)) or None
+        qty = volume_to_units(order.tradeData.volume)
+        filled = volume_to_units(executed_cents)
+        side = ('buy' if order.tradeData.tradeSide == OpenApiModelMessages.ProtoOATradeSide.BUY
+                else 'sell')
+        symbol = self._symbol_name_for(order.tradeData.symbolId)
+        coid = (order.clientOrderId or client_order_id
+                or (row.client_order_id if row is not None else None))
+        exchange_order = ExchangeOrder(
+            id=str(order.orderId), symbol=symbol, side=side,
+            order_type=_ORDER_TYPE_MAP.get(order.orderType, OrderType.MARKET),
+            qty=qty, filled_qty=filled, remaining_qty=max(0.0, qty - filled),
+            price=order.limitPrice or None, stop_price=order.stopPrice or None,
+            average_fill_price=average,
+            status=_ORDER_STATUS_MAP.get(order.orderStatus, OrderStatus.OPEN),
+            timestamp=order.utcLastUpdateTimestamp / 1000.0,
+            fee=sum(fees.values()), fee_currency='', reduce_only=order.closingOrder,
+            client_order_id=coid,
+        )
+        terms = tuple((int(d.executionTimestamp), int(d.dealId), int(d.filledVolume),
+                       float(d.executionPrice), fees[d.dealId]) for d in deals)
+        if order.closingOrder or row is None or row.state == _CLOSE_ROW_STATE:
+            fills = tuple(self._execution_fill(
+                exchange_order, deal_id=deal_id, units=volume_to_units(cents), price=price,
+                fee=fee, executed_ms=executed_ms, row=row)
+                for executed_ms, deal_id, cents, price, fee in terms)
+        else:
+            parts = self._executions_after(terms, row.filled_qty, filled - row.filled_qty)
+            executed_at = {deal_id: executed_ms for executed_ms, deal_id, _c, _p, _f in terms}
+            fills = tuple(self._execution_fill(
+                exchange_order, deal_id=deal_id, units=units, price=price, fee=fee,
+                executed_ms=executed_at[deal_id], row=row)
+                for deal_id, units, price, fee in parts)
+            self._link_recovered_position(row, int(order.orderId), _order_details_positions(res))
+        return OrderExecution(order=exchange_order, fills=fills, fee_reported=fee_reported)
+
+    @staticmethod
+    def _execution_fill(
+            order: ExchangeOrder, *, deal_id: int, units: float, price: float, fee: float,
+            executed_ms: int, row: 'OrderRow | None',
+    ) -> OrderEvent:
+        """One execution of :meth:`_order_execution` as the stream's fill event."""
+        closing = order.reduce_only or (row is not None and row.state == _CLOSE_ROW_STATE)
+        timestamp = executed_ms / 1000.0 if executed_ms else order.timestamp
+        return OrderEvent(
+            order=order,
+            event_type='filled' if order.status is OrderStatus.FILLED else 'partial',
+            fill_price=price or None, fill_qty=units, timestamp=timestamp,
+            pine_id=None if closing or row is None else row.pine_entry_id,
+            from_entry=row.from_entry if row is not None and not closing else None,
+            leg_type=LegType.CLOSE if closing else LegType.ENTRY,
+            fee=fee, fill_id=str(deal_id),
+            # ``fill_qty`` is the rise of the row's ``filled_qty`` cursor.
+            journal_fill_qty=units,
+        )
+
+    def _link_recovered_position(
+            self, row: 'OrderRow', order_id: int, positions: frozenset[int],
+    ) -> None:
+        """Link a live entry row to the one position its order executed into.
+
+        The stream links a row on its order's fill
+        (:meth:`~_EventStreamMixin._link_position`); an execution the engine
+        recovers from the venue has no such fill, so its link is written here.
+        A row linked already, closed, or whose order executed into more than
+        one position is left as it is.
+        """
+        store = self.store_ctx
+        if store is None or len(positions) != 1:
+            return
+        self._note_held_order_link(order_id, positions)
+        current = store.get_order(row.client_order_id)
+        if (current is None or current.closed_ts_ms is not None
+                or (current.extras or {}).get('position_id') is not None
+                or (current.extras or {}).get('kind') not in _ENTRY_KINDS):
+            return
+        position_id = next(iter(positions))
+        store.upsert_order(current.client_order_id,
+                           extras={**(current.extras or {}), 'position_id': position_id})
+        self._link_position_ref(current.client_order_id, position_id)
+
+    async def _close_order_execution(
+            self, client_order_id: str, records: Sequence[Mapping], row: 'OrderRow | None',
+    ) -> OrderExecution | None:
+        """The execution of one close the run sent, by its client order id.
+
+        What its sends executed is judged as for a leg close
+        (:meth:`~_ReconcileMixin.close_leg_executed`): a refused send nothing,
+        a send whose answer named its order that order's own figures once it
+        ended, a send whose answer was lost the closing deals of its position
+        since the send, whoever sent them (an over-count leaves the position
+        less reduced; an under-count would close it twice). The close's
+        journal row gives its symbol, side and quantity; the figures are
+        totals (``fills`` ``None``) without the commission
+        (``fee_reported`` ``False``).
+
+        :param client_order_id: The close's client order id.
+        :param records: The latest journalled state of each of its sends.
+        :param row: The close's journal row.
+        :return: The close as one order, ``None`` while its outcome cannot
+            be told yet or without its row.
+        """
+        if row is None:
+            return None
+        positions = {payload.get('position_id') for payload in records}
+        sent = [payload.get('sent_ms') for payload in records]
+        if len(positions) != 1 or not all(isinstance(at, int) for at in sent):
+            return None
+        position_id = next(iter(positions))
+        if not isinstance(position_id, int):
+            return None
+        if all(payload.get('refused') for payload in records):
+            executed_cents = 0
+            status = OrderStatus.REJECTED
+        else:
+            executed = await self.close_leg_executed(
+                row.symbol, str(position_id), [client_order_id],
+                min(cast(list[int], sent)))
+            if executed is None:
+                return None
+            executed_cents = executed
+            status = None
+        qty = row.qty
+        filled = min(volume_to_units(executed_cents), qty)
+        if status is None:
+            status = OrderStatus.FILLED if filled >= qty - _VOLUME_TOL else OrderStatus.CANCELLED
+        return OrderExecution(
+            order=ExchangeOrder(
+                id=next((str(p['order_id']) for p in records if p.get('order_id')),
+                        client_order_id),
+                symbol=row.symbol, side=row.side, order_type=OrderType.MARKET,
+                qty=qty, filled_qty=filled, remaining_qty=max(0.0, qty - filled),
+                price=None, stop_price=None, average_fill_price=None, status=status,
+                timestamp=epoch_time(), fee=0.0, fee_currency='', reduce_only=True,
+                client_order_id=client_order_id),
+            fills=None, fee_reported=False)
 
     async def _recover_untracked_venue_state(
             self, res: 'OpenApiMessages.ProtoOAReconcileRes',
@@ -185,6 +468,13 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
           party's, but nothing tells whose (ERROR + audit, once per
           position). One carrying another label is another run's.
 
+        A position an order whose execution the engine still owes its book
+        executed into (:meth:`~_StateMixin._held_entry_links`) is not
+        untracked: the engine's recovery of that order books it, so adopting
+        it too would book it twice. It is left out, and while the venue cannot
+        be asked what such an order executed into, no untracked position is
+        adopted at all (WARNING): any of them may be its.
+
         Never raises for a venue failure: what it cannot do stays as it was,
         logged and audited.
         """
@@ -192,14 +482,22 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             return
         run_tag = self.store_ctx.run_tag
         owned = self._owned_position_ids() or set()
+        held, unread = await self._held_entry_links()
         symbol_id = self._symbols_by_name.get(self.symbol) if self.symbol else None
         for position in res.position:
             if (position.positionStatus
                     != OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN
-                    or position.positionId in owned):
+                    or position.positionId in owned or position.positionId in held):
                 continue
             label = position.tradeData.label
-            if label == run_tag:
+            if label == run_tag and unread:
+                logger.warning(
+                    "cTrader startup: open position %d carries this run's label and no "
+                    "journal row tracks it, but the venue could not be asked which "
+                    "position the held order(s) %s executed into; it is not adopted, "
+                    "the engine's recovery of those orders books their execution",
+                    position.positionId, sorted(unread))
+            elif label == run_tag:
                 self._adopt_own_leg(position)
             elif not label and position.tradeData.symbolId == symbol_id:
                 self._note_unlabelled_leg(position)
@@ -415,6 +713,13 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                                  or int(epoch_time() * 1000)),
                 executed_cents=0,
             )
+            if bridge.conclusive:
+                # The complete history lists no fill of it: when the order's
+                # own details show it executed, the history cannot deliver it.
+                details = await self._order_details_execution(order.orderId)
+                if details is not None and details[0] > 0:
+                    self._hand_over_execution(
+                        row, order.orderId, 'deal history lists no fill of the order')
             return False
         position_id = (order.positionId
                        or (bridge.deal.positionId if bridge.deal else 0)
@@ -440,8 +745,9 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                 group = None
                 pending_orders = None
                 widened = None
-                if not self._fill_history_short(
-                        bridge, row, order.orderId, order.executedVolume):
+                short = self._fill_history_short(
+                    bridge, row, order.orderId, order.executedVolume)
+                if not short:
                     widened = await self._with_group_position_history(
                         bridge, position_id, from_ms)
                 if widened is not None:
@@ -478,6 +784,13 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                                          or int(epoch_time() * 1000)),
                         executed_cents=order.executedVolume,
                     )
+                    if short:
+                        # The position is closed and the complete history shows
+                        # less than the order executed: its fills cannot be
+                        # delivered from it.
+                        self._hand_over_execution(
+                            row, order.orderId,
+                            'deal history shows less than the order executed')
                     return False
                 # Seed the shared de-dup with the entry fills AND the closing
                 # deals BEFORE retiring, so a reconnect PUSH replay of either is
@@ -675,6 +988,234 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         if position_id:
             self._link_position_ref(coid, position_id)
 
+    async def _order_details_execution(self, order_id: int) -> tuple[int, frozenset[int]] | None:
+        """What an order executed, by its own details (``ProtoOAOrderDetailsReq``).
+
+        The answer lists every deal the order's fills created, whatever its
+        age, so it is the venue's word on the order's execution where the
+        time-windowed deal history falls short.
+
+        :param order_id: The venue order.
+        :return: ``(executed cents, positions its deals executed into)``: the
+            larger of the order's ``executedVolume`` and its executed deals'
+            sum; ``None`` when the read failed or the venue does not find the
+            order.
+        """
+        res = await self._order_details_response(order_id)
+        if res is None:
+            return None
+        return self._details_executed_cents(res), _order_details_positions(res)
+
+    async def _hand_over_unreported_working_executions(
+            self, res: 'OpenApiMessages.ProtoOAReconcileRes', promoted_coids: set[str],
+    ) -> None:
+        """Hand taken-over working orders that executed unseen to the engine, before its first sync.
+
+        A ``confirmed`` working entry row an earlier process placed whose order
+        left the venue's working orders while no process watched: after a
+        restart nothing maps that order to its entry, so a re-declared entry
+        would be sent again next to the execution. Each one is judged here:
+
+        * its order executed nothing beyond the row's cursor, or its details
+          cannot be read: left to the reconcile pass, as before (a cancel is
+          judged there);
+        * it executed into a position the snapshot still holds: the engine's
+          startup adoption books that position, as before;
+        * the deal history covers what it executed: the reconcile pass
+          delivers those fills, as before;
+        * otherwise (the position is closed and the complete history shows
+          less than the order executed) its fills cannot be delivered: it is
+          handed to the engine's held-execution recovery
+          (:meth:`~_CTraderBase._hand_over_execution`), which reads them from
+          the order's details. A history read that fails is left to the
+          reconcile pass's retries.
+
+        :param res: The startup snapshot.
+        :param promoted_coids: Rows the in-flight recovery just confirmed.
+        """
+        store = self.store_ctx
+        if store is None:
+            return
+        live_order_ids = {o.orderId for o in res.order}
+        open_positions = {
+            p.positionId for p in res.position
+            if p.positionStatus == OpenApiModelMessages.ProtoOAPositionStatus.POSITION_STATUS_OPEN}
+        for row in list(store.iter_live_orders()):
+            extras = row.extras or {}
+            raw = extras.get('order_id')
+            if (row.client_order_id in promoted_coids or row.state != 'confirmed'
+                    or extras.get('kind') != ENTRY_KIND_WORKING or raw is None
+                    or row.filled_qty >= row.qty - _VOLUME_TOL):
+                continue
+            order_id = parse_protocol_id(raw, field='order_id')
+            linked = extras.get('position_id')
+            if (order_id in live_order_ids or extras.get(EXECUTION_HANDED_OVER_EXTRA)
+                    or self._execution_handed_over(order_id)
+                    or (linked is not None
+                        and parse_protocol_id(linked, field='position_id') in open_positions)):
+                continue
+            details = await self._order_details_execution(order_id)
+            if details is None:
+                continue
+            executed, positions = details
+            if (volume_to_units(executed) <= row.filled_qty + _VOLUME_TOL
+                    or positions & open_positions):
+                continue
+            bridge = await self._find_fill_deal(
+                order_id, self._deal_since_ms(extras),
+                deadline=asyncio.get_running_loop().time() + REQUEST_TIMEOUT)
+            if not bridge.conclusive or bridge.filled_cents >= executed:
+                continue
+            self._hand_over_execution(
+                row, order_id, 'its position is closed and the deal history shows less '
+                               'than the order executed')
+
+    @override
+    async def _settle_handed_over_row(
+            self, row: 'OrderRow', order_id: int, open_positions: Iterable[int],
+    ) -> list[OrderEvent]:
+        """Sync a row whose entry the engine's held-execution recovery settled.
+
+        The engine read the order's execution from the venue
+        (:meth:`fetch_order_execution`) and booked it, or released the entry
+        as unexecuted; the order is no longer held, so the opening is in the
+        engine's book before anything here reaches it. The row takes the
+        outcome from the order's details: its cursor counts what the order
+        executed and the order's deals are taken as seen, so neither a push
+        replay nor a reconcile pass books them again.
+
+        * The order executed into a position the snapshot still holds: the row
+          stays live as that position's row.
+        * Nothing executed: the row is retired.
+        * The position is closed: its closes are judged from the position's
+          deal history like any vanished position's
+          (:meth:`~_ProtectionMixin._judge_recovered_close_deals`: the bot's
+          own close, the venue's SL / TP, or someone else's, reported as an
+          intervention), and the closes of the bot's share are delivered as
+          CLOSE fills under their deal ids at their own prices, journalled
+          with the row's retirement in one transaction, so they reach the
+          engine once. A history that shows no close of the position leaves
+          the close to the engine's own fallback (logged); the row is retired
+          without close fills.
+
+        A details or history read that fails, or a closing order that cannot
+        be looked up yet, is tried again on the next pass: the row keeps its
+        mark meanwhile.
+
+        :param row: The row (``extras[EXECUTION_HANDED_OVER_EXTRA]`` set).
+        :param order_id: Its venue order.
+        :param open_positions: The snapshot's open positions.
+        :return: The close fills to deliver, in execution order.
+        """
+        store = self.store_ctx
+        if store is None:
+            return []
+        res = await self._order_details_response(order_id)
+        if res is None:
+            return []
+        executed = min(row.qty, volume_to_units(self._details_executed_cents(res)))
+        positions = _order_details_positions(res)
+        held_open = sorted(positions & set(open_positions))
+        deal_ids = {deal.dealId for deal in res.deal
+                    if deal.filledVolume > 0 and deal.dealStatus in _EXECUTED_DEAL_STATUSES}
+        extras = {key: value for key, value in (row.extras or {}).items()
+                  if key not in (EXECUTION_HANDED_OVER_EXTRA, 'missing_pending_since')}
+        if executed > _VOLUME_TOL and len(held_open) == 1:
+            extras['position_id'] = held_open[0]
+            if executed >= row.qty - _VOLUME_TOL:
+                extras['kind'] = ENTRY_KIND_POSITION
+            with store.transaction():
+                store.upsert_order(row.client_order_id, filled_qty=max(row.filled_qty, executed),
+                                   exchange_order_id=str(held_open[0]), extras=extras)
+                self._link_position_ref(row.client_order_id, held_open[0])
+                self._log_hold_settled(row, order_id, executed, 'open', positions, [])
+            self._seen_deal_ids.update(deal_ids)
+            return []
+        closed_pid = (next(iter(positions))
+                      if executed > _VOLUME_TOL and len(positions) == 1 else None)
+        if closed_pid is None:
+            with store.transaction():
+                self._retire_settled_row(row, executed, extras)
+                self._log_hold_settled(row, order_id, executed, 'retired', positions, [])
+            self._seen_deal_ids.update(deal_ids)
+            return []
+        bridge = await self._find_fill_deal(
+            order_id, self._deal_since_ms(row.extras or {}), close_position_id=closed_pid,
+            deadline=self._reconcile_pass_deadline)
+        if not bridge.conclusive:
+            return []
+        if row.filled_qty < executed - _VOLUME_TOL:
+            # The share the closes are judged against counts what the engine
+            # booked of the order.
+            store.upsert_order(row.client_order_id, filled_qty=executed,
+                               extras={**(row.extras or {}), 'position_id': closed_pid})
+            self._link_position_ref(row.client_order_id, closed_pid)
+        fresh = store.get_order(row.client_order_id)
+        if fresh is None or fresh.closed_ts_ms is not None:
+            return []
+        current: 'OrderRow' = fresh
+        if bridge.closed_cents <= 0:
+            logger.warning(
+                "cTrader: entry %s (order %d) settled by the engine; its position %d is closed "
+                "but the deal history shows no close of it, so the close is left to the "
+                "engine's own fallback", row.client_order_id, order_id, closed_pid)
+            with store.transaction():
+                self._retire_settled_row(current, executed, extras)
+                self._log_hold_settled(current, order_id, executed, 'retired', positions, [])
+            self._seen_deal_ids.update(deal_ids)
+            return []
+        events: list[OrderEvent] = []
+
+        def settle(verdict) -> None:
+            for deal, cents in verdict.booked:
+                if deal.deal_id in self._seen_deal_ids:
+                    continue
+                events.append(self._recovered_close_event(
+                    current, deal, cents,
+                    from_entry=self._vanished_close_label(closed_pid, deal,
+                                                          current.pine_entry_id)))
+            self._retire_settled_row(current, executed, extras)
+            self._journal_recovered_deliveries(events)
+            self._log_hold_settled(current, order_id, executed, 'closed', positions,
+                                   [int(event.fill_id or 0) for event in events])
+
+        replay = await self._judge_recovered_close_deals(
+            closed_pid, bridge.position_deals, from_entry=current.pine_entry_id,
+            share_now=self._share_with_recovered_fills(closed_pid, [(current, executed)]),
+            counted=bridge.deal_ids, own_orders=(order_id,), settle=settle)
+        if replay is None:
+            return []
+        self._seen_deal_ids.update(deal_ids)
+        self._seen_deal_ids.update(bridge.closing_deal_ids)
+        return events
+
+    def _retire_settled_row(self, row: 'OrderRow', executed: float, extras: dict) -> None:
+        """Retire a handed-over row the engine settled, with the cursor at what its order executed."""
+        store = self.store_ctx
+        assert store is not None
+        store.upsert_order(row.client_order_id, filled_qty=max(row.filled_qty, executed),
+                           extras=extras)
+        store.close_order(row.client_order_id)
+        if row.intent_key:
+            store.record_complete(row.intent_key)
+
+    def _log_hold_settled(self, row: 'OrderRow', order_id: int, executed: float, outcome: str,
+                          positions: frozenset[int], close_deals: list[int]) -> None:
+        """Audit (and log) how a handed-over row took the engine's settlement."""
+        store = self.store_ctx
+        assert store is not None
+        store.log_event(
+            _EXECUTION_HOLD_SETTLED_EVENT, client_order_id=row.client_order_id,
+            exchange_order_id=str(order_id), intent_key=row.intent_key,
+            payload={'order_id': order_id, 'executed': executed, 'outcome': outcome,
+                     'positions': sorted(positions), 'close_deals': close_deals})
+        logger.info(
+            "cTrader: entry %s (order %d) settled by the engine's held-execution recovery: "
+            "%s units executed, row %s%s", row.client_order_id, order_id, executed,
+            {'open': 'kept for its open position', 'retired': 'retired',
+             'closed': 'retired with its position\'s closes'}[outcome],
+            f" (close deals {close_deals})" if close_deals else '')
+
     def _retire_recovered_terminal(self, row, order) -> None:
         """Land a rejected / cancelled / expired recovered row in ``rejected``."""
         if self.store_ctx is None:
@@ -808,8 +1349,9 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         and leave two rows owning one position. Instead the row is confirmed
         from the order's own deals, as the startup recovery would have
         confirmed it (no fill event, those deals seeded into the de-dup), and
-        the adopted leg gives up exactly that volume: it is closed when
-        nothing of it is left. One position, one owner, booked once.
+        the adopted leg gives up the part of them still open in it: it is
+        closed when nothing of it is left. One position, one owner, booked
+        once.
 
         Only the order's deals the adoption booked are taken over: those
         executed no later than the position's last change in the adoption
@@ -818,18 +1360,28 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         books every later deal of the order as a fill.
 
         The transfer moves exposure between two rows and never creates or
-        retires any, so it runs only when the evidence proves the adopted leg
-        holds the order's adopted deals: the leg is on the order's side and
-        holds at least their volume. Otherwise (part of the fill was closed
-        before the restart, or the position grew by a volume the adoption
-        could not attribute to the leg, see
-        ``_StateMixin._grow_recovered_own_legs``) which deals the leg covers
-        is not known, and the dispatch is held: it stays parked, the engine
-        holds its entry, and a WARNING with an audit event says why, once.
+        retires any. When the adopted leg is on the order's side and holds at
+        least the volume of those deals, all of it is still open and moves.
+        Otherwise part of the order's execution left the position before the
+        adoption (a close of it, or, on a netting account, an order that
+        reduced the position instead of adding to it), and the venue's own
+        offset ledger tells which part is still in it
+        (:meth:`_adopted_open_cents`): that part moves, and the rest is
+        retired on the row as exposure that was closed before the restart
+        (:data:`~pynecore.types.strategy.JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY`).
+        The adopted leg never gives more than it holds. An open part beyond
+        it is exposure of the bot's the engine's adoption did not book (the
+        leg was not raised to a growth it could not attribute): the row's
+        cursor stops short of it, so the reconcile snapshot books it as the
+        order's fill, with a WARNING and an audit event
+        (:meth:`_note_takeover_short`). An open part the ledger places on the
+        other side of the leg contradicts the position's side: nothing is
+        changed and the lookup is repeated. No human step: a ledger read that
+        fails is asked again on a later lookup.
 
-        The deal history is read before the store is touched; both rows are
-        then read again and the donor's reduction, the row's confirmation and
-        the audit events commit in one transaction
+        The deal history and the ledger are read before the store is touched;
+        both rows are then read again and the donor's reduction, the row's
+        confirmation and the audit events commit in one transaction
         (:meth:`~pynecore_ctrader.protection._ProtectionMixin._judgment_span`), whose
         rollback also puts back what this process noted of them. The de-dup is seeded only
         after that commit, so a failed transfer suppresses no fill and is
@@ -841,9 +1393,9 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         :return: ``True`` when the row took its part over. ``None`` when no
             deal of the order is in the adopted size: nothing is changed and
             the order is recovered like any other. ``False`` when the startup
-            adoption has not run yet, the order's deal history could not be
-            read completely, a row changed while it was read, the transfer is
-            held, or the store write failed: nothing is changed and the lookup
+            adoption has not run yet, the order's deal history or offset
+            ledger could not be read completely, a row changed while it was
+            read, or the store write failed: nothing is changed and the lookup
             is repeated later.
         """
         store = self.store_ctx
@@ -863,8 +1415,15 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         if not booked_cents:
             return None
         booked_price = sum(fill[3] * fill[2] for fill in booked) / booked_cents
-        filled = 0.0
-        held: str | None = None
+        filled = min(row.qty, volume_to_units(booked_cents))
+        open_units: float | None = None
+        if adopted.side != row.side or filled - self._row_exposure(adopted) > 1e-9:
+            open_cents = await self._adopted_open_cents(booked, adopted_through_ms)
+            if open_cents is None:
+                return False
+            open_units = min(filled, volume_to_units(open_cents))
+        moved = 0.0
+        cursor = 0.0
         try:
             with self._judgment_span():
                 current = store.get_order(row.client_order_id)
@@ -877,74 +1436,142 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
                     return False
                 filled = min(current.qty, volume_to_units(booked_cents))
                 donor_exposure = self._row_exposure(donor)
-                if current.side != donor.side:
-                    held = f"the adopted row is a {donor.side} leg, the order a {current.side}"
-                elif filled - donor_exposure > 1e-9:
-                    held = (f"the adopted row holds {donor_exposure} units, less than the "
-                            f"{filled} the order filled before the adoption")
-                if held is None:
-                    if donor_exposure - filled > 1e-9:
-                        store.upsert_order(
-                            donor.client_order_id, qty=donor.filled_qty - filled,
-                            filled_qty=donor.filled_qty - filled)
-                    else:
-                        store.close_order(donor.client_order_id)
-                    self._confirm_recovered_entry(
-                        current, order_id=order.orderId, position_id=order.positionId,
-                        filled=filled, avg_price=booked_price,
-                        submitted_at_ms=order.utcLastUpdateTimestamp or int(epoch_time() * 1000),
-                        source='adopted_leg',
-                    )
-                    store.log_event(
-                        _ADOPTED_LEG_TAKEN_OVER_EVENT, client_order_id=current.client_order_id,
-                        exchange_order_id=str(order.orderId), intent_key=current.intent_key,
-                        payload={'position_id': order.positionId,
-                                 'adopted_coid': donor.client_order_id,
-                                 'qty': filled,
-                                 'adopted_remaining': max(0.0, donor_exposure - filled),
-                                 'adopted_through_ms': adopted_through_ms})
+                if open_units is None:
+                    if current.side != donor.side or filled - donor_exposure > 1e-9:
+                        # The rows changed since the ledger was skipped: read again.
+                        return False
+                    open_units = filled
+                if current.side != donor.side and open_units > 1e-9:
+                    logger.warning(
+                        "cTrader dispatch %s: the venue's offset ledger puts %s units of "
+                        "order %d open in position %d, which startup adopted on the other "
+                        "side; nothing is changed, the lookup is repeated",
+                        current.client_order_id, open_units, order.orderId,
+                        order.positionId)
+                    return False
+                moved = min(open_units, donor_exposure)
+                short = round(open_units - moved, 12)
+                closed_before = round(filled - open_units, 12)
+                cursor = round(closed_before + moved, 12)
+                if donor_exposure - moved > 1e-9:
+                    store.upsert_order(
+                        donor.client_order_id, qty=donor.filled_qty - moved,
+                        filled_qty=donor.filled_qty - moved)
+                else:
+                    store.close_order(donor.client_order_id)
+                self._confirm_recovered_entry(
+                    current, order_id=order.orderId, position_id=order.positionId,
+                    filled=cursor, avg_price=booked_price,
+                    submitted_at_ms=order.utcLastUpdateTimestamp or int(epoch_time() * 1000),
+                    source='adopted_leg',
+                )
+                if closed_before > 1e-9:
+                    confirmed = store.get_order(current.client_order_id)
+                    assert confirmed is not None
+                    store.upsert_order(confirmed.client_order_id, extras={
+                        **(confirmed.extras or {}),
+                        JOURNAL_EXPOSURE_RETIRED_EXTRA_KEY: closed_before})
+                store.log_event(
+                    _ADOPTED_LEG_TAKEN_OVER_EVENT, client_order_id=current.client_order_id,
+                    exchange_order_id=str(order.orderId), intent_key=current.intent_key,
+                    payload={'position_id': order.positionId,
+                             'adopted_coid': donor.client_order_id,
+                             'qty': filled, 'moved': moved,
+                             'closed_before_adoption': closed_before,
+                             'adopted_remaining': max(0.0, donor_exposure - moved),
+                             'adopted_through_ms': adopted_through_ms})
+                if short > 1e-9:
+                    self._note_takeover_short(current, order, donor, short)
         except Exception as exc:  # noqa: BLE001 - a rolled-back transfer is retried whole
             logger.error(
                 "cTrader dispatch %s: taking over adopted row %s failed, nothing changed: %s",
                 row.client_order_id, adopted.client_order_id, exc)
             return False
-        if held is not None:
-            self._note_takeover_held(row, order, adopted, held)
-            return False
-        self._seen_deal_ids.update(fill[1] for fill in booked)
+        covered = 0
+        for fill in booked:
+            covered += fill[2]
+            if volume_to_units(covered) > cursor + 1e-9:
+                break
+            self._seen_deal_ids.add(fill[1])
         logger.warning(
             "cTrader dispatch %s: its order %d filled %s units before the restart into "
-            "position %d, which startup adopted as row %s; the dispatch takes them over",
+            "position %d, which startup adopted as row %s; the dispatch takes them over "
+            "(%s still open in the position move from the adopted row)",
             row.client_order_id, order.orderId, filled, order.positionId,
-            adopted.client_order_id)
+            adopted.client_order_id, moved)
         return True
 
-    def _note_takeover_held(self, row, order, adopted, reason: str) -> None:
-        """Report, once per dispatch, an adopted-leg takeover the evidence does not prove.
+    async def _adopted_open_cents(
+            self, deals: Sequence[tuple[int, int, int, float, float]], through_ms: int,
+    ) -> int | None:
+        """How much of an order's deals was still open in its position at the adoption.
 
-        :param row: The inherited dispatch row, which stays parked.
+        The venue's offset ledger (``ProtoOADealOffsetListReq``) names, for one
+        deal, the deals "which closed the specified deal" (``offsetBy``) and
+        those "which were closed by the specified deal" (``offsetting``), each
+        with its matched volume and execution time. A deal's volume less what
+        it closed and less what closed it no later than the adoption snapshot
+        is its part still open in the position the adoption booked.
+
+        :param deals: The order's deals the adoption booked, as
+            ``(executed_ms, deal_id, volume_cents, price, fee)``.
+        :param through_ms: The venue time the adoption snapshot covers.
+        :return: The open volume (cents); ``None`` when a ledger read failed,
+            or a closing deal it lists carries no execution time (it cannot be
+            placed before or after the adoption).
+        """
+        if self._live_account_id is None:
+            return None
+        open_cents = 0
+        for _executed_ms, deal_id, cents, _price, _fee in deals:
+            try:
+                async with asyncio.timeout_at(self._reconcile_pass_deadline):
+                    res = cast(OpenApiMessages.ProtoOADealOffsetListRes,
+                               await self._account_request(
+                                   OpenApiMessages.ProtoOADealOffsetListReq(
+                                       ctidTraderAccountId=self._live_account_id,
+                                       dealId=deal_id)))
+            except (BrokerError, CTraderWireError, TimeoutError) as exc:
+                logger.debug("cTrader deal %d offset ledger read deferred: %s", deal_id, exc)
+                return None
+            closed_by = 0
+            for offset in res.offsetBy:
+                if not offset.executionTimestamp:
+                    return None
+                if offset.executionTimestamp <= through_ms:
+                    closed_by += int(offset.volume)
+            closing = sum(int(offset.volume) for offset in res.offsetting)
+            open_cents += max(0, cents - closing - closed_by)
+        return open_cents
+
+    def _note_takeover_short(self, row, order, adopted, short: float) -> None:
+        """Report an open part of an inherited send the adopted row did not hold.
+
+        The venue's offset ledger puts ``short`` units more of the order's
+        execution in the position than the adopted row holds: the engine's
+        adoption did not book them. The row's cursor stops short of them, so
+        the reconcile snapshot books them as the order's fill (the order's
+        executions beyond the cursor, oldest first). WARNING and an audit
+        event.
+
+        :param row: The inherited dispatch row, now confirmed.
         :param order: Its venue order.
         :param adopted: The ``recovered_own_leg`` row of the order's position.
-        :param reason: Why the transfer is not proven.
+        :param short: The open units the adopted row did not hold.
         """
         store = self.store_ctx
         assert store is not None
-        coid = row.client_order_id
-        if any(event_coid == coid for _intent, event_coid, _xoid, _payload
-               in store.iter_events_by_kind_for_run_id(_ADOPTED_LEG_TAKEOVER_HELD_EVENT)):
-            return
         logger.warning(
-            "cTrader dispatch %s (intent %s): its order %d filled into position %d before the "
-            "adoption, which startup adopted as row %s, but %s; which deals that row covers "
-            "is not proven, so the dispatch stays parked and its entry is held. Check the "
-            "position on the venue",
-            coid, row.intent_key, order.orderId, order.positionId, adopted.client_order_id,
-            reason)
+            "cTrader dispatch %s (intent %s): the venue's offset ledger puts %s units more "
+            "of order %d in position %d than the adopted row %s holds; the engine's "
+            "adoption did not book them, the reconcile pass books them as the order's fill",
+            row.client_order_id, row.intent_key, short, order.orderId, order.positionId,
+            adopted.client_order_id)
         store.log_event(
-            _ADOPTED_LEG_TAKEOVER_HELD_EVENT, client_order_id=coid,
+            _ADOPTED_LEG_TAKEOVER_SHORT_EVENT, client_order_id=row.client_order_id,
             exchange_order_id=str(order.orderId), intent_key=row.intent_key,
             payload={'position_id': order.positionId, 'adopted_coid': adopted.client_order_id,
-                     'reason': reason})
+                     'short': short})
 
     def _maybe_abandon_unknown(self, row) -> None:
         """Retire a still-unknown row once past the evidence-gated TTL.
@@ -1179,8 +1806,8 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
         the live ``order[]`` and ``position[]`` snapshots is an orphan: its
         position was closed while the bot was stopped. Close it + delete its
         envelope anchor so the runtime ``_reconcile_snapshot`` does not later
-        stamp ``missing_pending_since`` and the grace tracker raise a false
-        ``UnexpectedCancelError`` that halts a clean restart.
+        stamp ``missing_pending_since`` and the grace tracker report a false
+        intervention that quarantines a clean restart.
 
         Who closed the position is judged first, from its deal history
         (:meth:`_judge_recovered_closes`): someone else's close is reported
@@ -1227,6 +1854,11 @@ class _RecoveryMixin(_ReconcileMixin, ABC):
             return False
         extras = row.extras or {}
         order_id = extras.get('order_id')
+        if extras.get(EXECUTION_HANDED_OVER_EXTRA) or self._execution_handed_over(order_id):
+            # The engine's held-execution recovery owns the order (or settled
+            # it, and the reconcile pass syncs the row): its absence from the
+            # venue proves nothing.
+            return False
         position_id = extras.get('position_id')
         ref = row.exchange_order_id
         present = (

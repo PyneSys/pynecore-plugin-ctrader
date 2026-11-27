@@ -122,6 +122,7 @@ from pynecore.core.broker.models import (
 from pynecore.core.broker.store_helpers import PENDING_DISPATCH_STATES
 from pynecore.core.broker.sync_engine import FILL_RECOVERY_HOLD_S
 
+from ._base import EXECUTION_HANDED_OVER_EXTRA, _UNKNOWN_DISPATCH_TTL_S
 from .exceptions import is_not_found
 from .helpers import (
     REQUEST_TIMEOUT,
@@ -163,6 +164,11 @@ logger = logging.getLogger(__name__)
 #: window: a fill never ages out of the lookback because the cursor reaches back
 #: to the order's own submit time.
 _DEAL_LOOKBACK_S = 300.0
+#: Delay (s) before a row adopted in the run reads its order's deal history
+#: again when a read left executions of the order unbooked; doubled after each
+#: such read up to :data:`_ADOPTION_READ_MAX_DELAY_S`.
+_ADOPTION_READ_FIRST_DELAY_S = 5.0
+_ADOPTION_READ_MAX_DELAY_S = 300.0
 
 #: Safety margin subtracted from a row's ``submitted_at_ms`` when deriving the
 #: deal-history ``fromTimestamp``. ``submitted_at_ms`` is already a true lower
@@ -240,6 +246,11 @@ _FEE_UNBOOKED_EXTRA = 'fee_unbooked'
 #: commission, and a range can be charged in parts (a deal covering only part
 #: of it), so its next fee event carries this total plus the new part.
 _FEE_RANGED_EXTRA = 'fee_ranged'
+
+
+def _vanished_cause(order_id: int) -> str:
+    """The quarantine cause of a vanished order the venue reports as not found."""
+    return f"vanished_order:{order_id}"
 
 
 def _snapshot_fill_id(client_order_id: str, end: float) -> str:
@@ -555,6 +566,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             rows.append((row, parse_protocol_id(order_id_raw, field='order_id')
                          if order_id_raw is not None else None))
         live_order_ids = {order_id for _row, order_id in rows}
+        self._release_settled_vanished_causes(rows)
         live_position_ids = {
             parse_protocol_id(raw, field='position_id')
             for raw in ((row.extras or {}).get('position_id') for row, _order_id in rows)
@@ -584,6 +596,22 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         filled_coids: list[str] = []
         for row, order_id in rows:
             extras = row.extras or {}
+            if order_id is not None and extras.get(EXECUTION_HANDED_OVER_EXTRA):
+                # Handed to the engine's held-execution recovery: it owns the
+                # order (its absence is no disappearance) until it settled it,
+                # and then the row takes the outcome from the venue.
+                if self._execution_handed_over(order_id):
+                    if 'missing_pending_since' in extras:
+                        self._clear_missing_pending(row)
+                else:
+                    for event in await self._settle_handed_over_row(
+                            row, order_id, open_positions):
+                        filled_coids.append(row.client_order_id)
+                        yield event
+                continue
+            adoption_owed = self._adoption_owed(row)
+            if adoption_owed and not self._adoption_read_due(row.client_order_id):
+                continue
             order = orders_by_id.get(order_id) if order_id is not None else None
             if order is not None:
                 # The order is still in ``order[]`` — reconcile partial-fill
@@ -594,6 +622,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 # still be diffed here.
                 events = await self._reconcile_working_row(
                     row, order, open_positions, now_ts)
+                if adoption_owed:
+                    self._pace_adoption_read(row.client_order_id)
                 if events:
                     filled_coids.append(row.client_order_id)
                     for event in events:
@@ -628,6 +658,8 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                     row, order_id, open_positions, now_ts, working_orders=orders_by_id):
                 filled_coids.append(row.client_order_id)
                 yield event
+            if adoption_owed:
+                self._pace_adoption_read(row.client_order_id)
         # Presence diff for the settled-position rows: stamp when the position
         # vanished from ``position[]``, clear the moment it is back. Runs AFTER
         # the row walk so a filled-then-closed retirement in this same pass
@@ -650,6 +682,76 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             yield event
         await self._judge_ambiguous_close_claims()
         await self._resolve_close_rows()
+
+    async def _order_details_response(
+            self, order_id: int) -> 'OpenApiMessages.ProtoOAOrderDetailsRes | None':
+        """An order's own details (``ProtoOAOrderDetailsReq``), within the pass budget.
+
+        The answer lists every deal the order's fills created, whatever its
+        age, so it is the venue's word on the order's execution where the
+        time-windowed deal history falls short (:meth:`_details_executed_cents`).
+
+        :param order_id: The venue order.
+        :return: The details; ``None`` when the read failed or the venue does
+            not find the order.
+        """
+        if self._live_account_id is None:
+            return None
+        deadline = self._reconcile_pass_deadline
+        try:
+            async with (asyncio.timeout_at(deadline) if deadline is not None
+                        else asyncio.timeout(REQUEST_TIMEOUT)):
+                return cast(OpenApiMessages.ProtoOAOrderDetailsRes, await self._account_request(
+                    OpenApiMessages.ProtoOAOrderDetailsReq(
+                        ctidTraderAccountId=self._live_account_id, orderId=order_id)))
+        except (BrokerError, CTraderWireError, TimeoutError) as exc:
+            logger.debug("cTrader order %d details read deferred: %s", order_id, exc)
+            return None
+
+    @staticmethod
+    def _details_executed_cents(res: 'OpenApiMessages.ProtoOAOrderDetailsRes') -> int:
+        """What an order executed by its details: the larger of its
+        ``executedVolume`` and its executed deals' sum (cents)."""
+        return max(int(res.order.executedVolume), sum(
+            int(deal.filledVolume) for deal in res.deal
+            if deal.filledVolume > 0 and deal.dealStatus in _EXECUTED_DEAL_STATUSES))
+
+    @staticmethod
+    def _adoption_owed(row) -> bool:
+        """Whether a row adopted in the run still owes executions of its order.
+
+        The row's ``executed_cents`` floor (what the order executed when its
+        fill was held, :meth:`~_EventStreamMixin._held_for_adoption_read`)
+        is above the cursor: the order's deal history must book the rest.
+        """
+        extras = row.extras or {}
+        return bool(extras.get('adopted_in_run')) and row.filled_qty < volume_to_units(
+            int(extras.get('executed_cents') or 0)) - _VOLUME_TOL
+
+    def _adoption_read_due(self, coid: str) -> bool:
+        """Whether the deal history of an adopted row's order is read on this pass.
+
+        The first read is due at once; one that leaves the row owing waits
+        :data:`_ADOPTION_READ_FIRST_DELAY_S`, doubling up to
+        :data:`_ADOPTION_READ_MAX_DELAY_S`, and is never given up
+        (:meth:`_pace_adoption_read`).
+        """
+        pace = self._adoption_reads.get(coid)
+        return pace is None or monotonic() >= pace[0]
+
+    def _pace_adoption_read(self, coid: str) -> None:
+        """Schedule the next read of an adopted row's order, or end its pacing once settled."""
+        store = self.store_ctx
+        row = store.get_order(coid) if store is not None else None
+        if row is None or row.closed_ts_ms is not None or not self._adoption_owed(row):
+            self._adoption_reads.pop(coid, None)
+            return
+        delay = self._adoption_reads.get(coid, (0.0, _ADOPTION_READ_FIRST_DELAY_S))[1]
+        self._adoption_reads[coid] = (
+            monotonic() + delay, min(delay * 2.0, _ADOPTION_READ_MAX_DELAY_S))
+        logger.warning(
+            "cTrader: row %s adopted in the run still owes executions of its order; its deal "
+            "history is read again in %.0f s", coid, delay)
 
     def fill_recovery_pending(self, entry_ids: Collection[str]) -> bool:
         """Whether the reconcile pass still owes the engine fills for these entries.
@@ -2218,11 +2320,21 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
 
         :param row: The vanished row.
         """
+        order_id_raw = (row.extras or {}).get('order_id')
+        if self._execution_handed_over(order_id_raw):
+            # The engine's held-execution recovery owns the order: its absence
+            # is no disappearance (the next pass clears the stamp).
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
         confirmation = await self._missing_verdict(row)
         if (confirmation.resolution is MissingResolution.CANCELLED
                 and self._execution_evidence(row, reported=row.filled_qty).executed
                 > row.filled_qty + _VOLUME_TOL):
-            return MissingConfirmation(MissingResolution.FILLED)
+            confirmation = MissingConfirmation(MissingResolution.FILLED)
+        if (confirmation.resolution is not MissingResolution.INCONCLUSIVE
+                and order_id_raw is not None):
+            self._release_vanished_cause(
+                parse_protocol_id(order_id_raw, field='order_id'),
+                f"the venue's evidence decided it ({confirmation.resolution.value})")
         return confirmation
 
     async def _missing_verdict(
@@ -2385,15 +2497,12 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         by someone the evidence cannot name (:meth:`_unattributed_cancel_reason`).
         A lookup that failed for now leaves the verdict to a later pass.
 
-        Two cases are never retired as a zero-fill cancel. A row whose
-        journalled ``executed_cents`` floor exceeds its fill cursor was
-        reported executed by the venue earlier, so it is FILLED: its fill
-        waits for the deal history. An order the venue reports as not found
-        carries no status, executed volume or deal list, so nothing proves it
-        unexecuted: its row stays unresolved and the bot is quarantined
-        (:meth:`_quarantine_undecidable_vanished`) until an operator resume
-        accepts the venue as it stands; only then is it retired as an
-        unattributed cancel.
+        A row whose journalled ``executed_cents`` floor exceeds its fill
+        cursor was reported executed by the venue earlier, so it is FILLED:
+        its fill waits for the deal history. An order the venue reports as not
+        found carries no status, executed volume or deal list, so its own
+        details prove nothing; the deal history decides
+        (:meth:`_not_found_vanished_verdict`).
 
         :param row: The vanished order's journal row.
         :param order_id: The order's id.
@@ -2414,10 +2523,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                         MissingResolution.CANCELLED,
                         cancel_reason=self._unattributed_cancel_reason(
                             row, order_id, status=exc.error_code))
-                if order_id not in self._vanished_not_found_warned:
-                    self._vanished_not_found_warned.add(order_id)
-                    self._quarantine_undecidable_vanished(row, order_id, exc.error_code)
-                return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+                return self._not_found_vanished_verdict(row, order_id, exc.error_code)
             logger.debug("cTrader vanished-order lookup for %d deferred: %s", order_id, exc)
             return MissingConfirmation(MissingResolution.INCONCLUSIVE)
         except (BrokerError, CTraderWireError, TimeoutError) as exc:
@@ -2429,6 +2535,10 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         if (status == statuses.ORDER_STATUS_FILLED or order.executedVolume > 0
                 or any(deal.filledVolume > 0 and deal.dealStatus in _EXECUTED_DEAL_STATUSES
                        for deal in res.deal)):
+            # Reached after a complete read of the order's deal history listed
+            # no fill of it (:meth:`_missing_verdict`): the history cannot
+            # deliver what the order's details show it executed.
+            self._hand_over_execution(row, order_id, 'deal history lists no fill of the order')
             return MissingConfirmation(MissingResolution.FILLED)
         if status == statuses.ORDER_STATUS_ACCEPTED:
             return MissingConfirmation(MissingResolution.STILL_PRESENT)
@@ -2444,17 +2554,59 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 row, order_id,
                 status=statuses.Name(status) if status in statuses.values() else str(status)))
 
+    def _not_found_vanished_verdict(
+            self, row: 'OrderRow', order_id: int, error_code: str,
+    ) -> MissingConfirmation:
+        """The verdict on a vanished order the venue reports as not found, from its deal history.
+
+        Reached only after a complete read of the order's deal history from
+        its since-anchor to now listed no execution of it
+        (:meth:`_missing_verdict`), and with no executed volume the venue
+        reported for it earlier (:meth:`_vanished_order_verdict`). A deal the
+        venue has not published yet may still show, and how late it publishes
+        one is not measured, so the history proves the order executed nothing
+        only once :data:`~pynecore_ctrader._base._UNKNOWN_DISPATCH_TTL_S` (the
+        bound of the venue's indexing lag the plugin already gives a lost
+        dispatch) passed since the order was first missed. Until then the row
+        stays unresolved and the bot is quarantined under the cause
+        ``vanished_order:<order id>`` (:meth:`_quarantine_undecidable_vanished`);
+        then the order is retired as an unattributed cancel
+        (:meth:`_unattributed_cancel_reason`) and the cause is released
+        (:meth:`_release_vanished_cause`). A later pass whose history lists a
+        fill of the order ends the cause as well: the bot gets out of this by
+        itself, no operator step.
+
+        :param row: The vanished order's journal row.
+        :param order_id: The order's id.
+        :param error_code: The lookup's not-found error code.
+        """
+        since = (row.extras or {}).get(MISSING_PENDING_EXTRA)
+        missed_at = float(since) if isinstance(since, (int, float)) else row.created_ts_ms / 1000.0
+        if epoch_time() < missed_at + _UNKNOWN_DISPATCH_TTL_S:
+            if order_id not in self._vanished_not_found_warned:
+                self._vanished_not_found_warned.add(order_id)
+                self._quarantine_undecidable_vanished(row, order_id, error_code)
+            return MissingConfirmation(MissingResolution.INCONCLUSIVE)
+        confirmation = MissingConfirmation(
+            MissingResolution.CANCELLED,
+            cancel_reason=self._unattributed_cancel_reason(row, order_id, status=error_code))
+        self._release_vanished_cause(
+            order_id, f"its deal history lists no execution {_UNKNOWN_DISPATCH_TTL_S:.0f}s "
+                      f"after the order left the venue: it executed nothing")
+        return confirmation
+
     def _quarantine_undecidable_vanished(
             self, row: 'OrderRow', order_id: int, error_code: str,
     ) -> None:
-        """Quarantine the bot on a vanished order whose execution nothing can decide.
+        """Quarantine the bot on a vanished order whose execution nothing decides yet.
 
         The venue reports the order as not found, so neither its status, its
         executed volume nor its deals are known, and a deal history listing no
         fill may only lag. The row stays unresolved, logged as an ERROR, and
-        the engine's entry-block quarantine (:attr:`quarantine_sink`) is latched: the bot stays alive but opens nothing new, and an
-        operator resume accepts the venue as it stands, after which the row is
-        retired as an unattributed cancel (:meth:`_vanished_order_verdict`).
+        the engine's entry-block quarantine (:attr:`quarantine_sink`) is
+        latched under the cause ``vanished_order:<order id>``: the bot stays
+        alive but opens nothing new until the deal history decides
+        (:meth:`_not_found_vanished_verdict`), which releases the cause.
 
         :param row: The vanished order's journal row.
         :param order_id: The order's id.
@@ -2462,10 +2614,9 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         """
         logger.error(
             "cTrader: bot order %d (%s) left the venue while the order stream missed it, "
-            "and the venue reports it as not found (%s): nothing proves whether it "
-            "executed; the row stays unresolved and the bot is quarantined until an "
-            "operator resume accepts the venue as it stands",
-            order_id, row.client_order_id, error_code)
+            "and the venue reports it as not found (%s): nothing proves yet whether it "
+            "executed; the row stays unresolved and new entries are blocked until its "
+            "deal history decides", order_id, row.client_order_id, error_code)
         if self.quarantine_sink is None:
             return
         # noinspection PyBroadException
@@ -2474,10 +2625,51 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
                 'vanished_order_not_found',
                 {'order_id': order_id, 'client_order_id': row.client_order_id,
                  'error_code': error_code, 'pine_entry_id': row.pine_entry_id},
-                kind=QuarantineKind.ENTRY_BLOCK)
+                kind=QuarantineKind.ENTRY_BLOCK, cause=_vanished_cause(order_id))
         except Exception:
             logger.exception(
                 "cTrader: quarantine request for vanished order %d failed", order_id)
+
+    def _release_vanished_cause(self, order_id: int, resolution: str) -> None:
+        """End the ``vanished_order:<order id>`` quarantine cause of a decided order.
+
+        A no-op for an order this process did not quarantine. The order stays
+        listed when the release sink raised, so the next pass releases it.
+
+        :param order_id: The vanished order's id.
+        :param resolution: What decided it, logged by the engine.
+        """
+        if order_id not in self._vanished_not_found_warned:
+            return
+        sink = self.quarantine_release_sink
+        if sink is not None:
+            # noinspection PyBroadException
+            try:
+                sink(_vanished_cause(order_id), resolution)
+            except Exception:
+                logger.exception(
+                    "cTrader: quarantine release for vanished order %d failed", order_id)
+                return
+        self._vanished_not_found_warned.discard(order_id)
+
+    def _release_settled_vanished_causes(
+            self, rows: 'Sequence[tuple[OrderRow, int | None]]',
+    ) -> None:
+        """End the vanished-order causes whose rows another path decided.
+
+        A row the stream, the startup recovery or any other pass retired, or
+        whose order the snapshot shows again (its missing stamp is gone), no
+        longer waits for its deal history.
+
+        :param rows: The live rows of this pass with their order ids.
+        """
+        if not self._vanished_not_found_warned:
+            return
+        missing = {order_id for row, order_id in rows
+                   if order_id is not None and MISSING_PENDING_EXTRA in (row.extras or {})}
+        for order_id in sorted(self._vanished_not_found_warned - missing):
+            self._release_vanished_cause(
+                order_id, "its journal row was decided by another path")
 
     def _closed_position_siblings(
             self, row: 'OrderRow', confirmation: MissingConfirmation,
@@ -2771,6 +2963,12 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         if self.store_ctx is None:
             return
         extras = row.extras or {}
+        handed_over = self._execution_handed_over(order_id)
+        if handed_over and 'missing_pending_since' in extras:
+            # The engine's held-execution recovery owns the order: its absence
+            # is no disappearance.
+            self._clear_missing_pending(row)
+            extras = row.extras or {}
         bridge = await self._find_fill_deal(
             order_id, self._deal_since_ms(extras),
             deadline=self._reconcile_pass_deadline)
@@ -2781,7 +2979,18 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
             if (closed_pid and closed_pid not in open_positions
                     and bridge.closed_cents > 0 and bridge.filled_cents > 0):
                 share = self._own_share(closed_pid)
-                if self._fill_history_short(bridge, row, order_id):
+                # The history may lack part of the order's fills: its own
+                # details are the venue's word on what it executed. A failed
+                # read leaves the check to the journal's evidence.
+                details = await self._order_details_response(order_id)
+                if self._fill_history_short(
+                        bridge, row, order_id,
+                        self._details_executed_cents(details) if details is not None else 0):
+                    if bridge.conclusive:
+                        # The position is closed and the complete history shows
+                        # less than the order executed.
+                        self._hand_over_execution(
+                            row, order_id, 'deal history shows less than the order executed')
                     return
                 widened = await self._with_group_position_history(
                     bridge, closed_pid, self._deal_since_ms(extras))
@@ -2830,6 +3039,7 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         # pending — so stamping ``missing_pending_since`` there would later raise
         # a false ``UnexpectedCancelError`` against an open position (surface c).
         if (bridge.conclusive
+                and not handed_over
                 and not extras.get('position_id')
                 and row.filled_qty <= 1e-9
                 and 'missing_pending_since' not in extras):
@@ -3687,9 +3897,11 @@ class _ReconcileMixin(_ProtectionMixin, ABC):
         live ``ORDER_CANCELLED`` PUSH event would. Only a cancel the evidence
         shows to be someone else's (an expiry the bot never set) applies the
         configured ``on_unexpected_cancel`` policy (``stop`` latches the
-        engine's external-intervention quarantine; ``halt``, or an unwired
-        quarantine sink, raises :class:`UnexpectedCancelError` through the
-        reconcile pass). An order the venue itself ended (expired, rejected)
+        engine's external-intervention quarantine; with an unwired or failing
+        quarantine sink it raises
+        :class:`~pynecore.core.broker.exceptions.UnexpectedCancelError` through the
+        reconcile pass, the fail-safe signal the engine latches the same
+        quarantine on). An order the venue itself ended (expired, rejected)
         is retired with its venue-driven ``cancel_reason``, and a cancel the
         evidence cannot attribute with an ERROR and an audit event; no
         policy applies to either.

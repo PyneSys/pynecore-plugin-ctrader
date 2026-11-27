@@ -68,7 +68,7 @@ class CTraderWireError(ProviderError):
 #: user-actionable error. A request that fails with one of these may well
 #: succeed once the broker's routing or maintenance window recovers, so the
 #: long-running ``--broker`` / ``--live`` startup waits and retries instead of
-#: halting. Kept deliberately narrow — auth, symbol and business-rule codes are
+#: failing. Kept deliberately narrow — auth, symbol and business-rule codes are
 #: NOT here, so they keep failing fast. ``CANT_ROUTE_REQUEST`` is the code
 #: Pepperstone returns while a broker backend is in maintenance.
 _CONNECTION_CLASS_CODES = frozenset({

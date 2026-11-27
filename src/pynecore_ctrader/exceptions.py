@@ -71,7 +71,7 @@ _MARKET_CLOSED_CODES = frozenset({
 })
 
 #: ``errorCode`` strings meaning the client exceeded a request-rate budget.
-#: Recoverable via backoff — never a halt.
+#: Recoverable via backoff — never a failure of the request's caller.
 _RATE_LIMIT_CODES = frozenset({
     'REQUEST_FREQUENCY_EXCEEDED',
     'BLOCKED_PAYLOAD_TYPE',

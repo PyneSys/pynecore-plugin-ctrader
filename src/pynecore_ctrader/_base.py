@@ -80,6 +80,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Audit event of an entry handed to the engine's held-execution recovery
+#: (:meth:`_CTraderBase._hand_over_execution`).
+_EXECUTION_HOLD_REQUESTED_EVENT = 'ctrader_execution_hold_requested'
+#: Row extra naming the venue order a row's entry was handed to the engine's
+#: held-execution recovery under; the row is synced from the venue once the
+#: engine settled it (``_RecoveryMixin._settle_handed_over_row``).
+EXECUTION_HANDED_OVER_EXTRA = 'execution_handed_over'
+
 _ResultT = TypeVar('_ResultT')
 
 
@@ -171,6 +179,14 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
     # backoff and account re-auth, and every deal-history page — share one
     # request-timeout budget (30 s) when the venue stalls.
     fill_report_grace_s = 45.0
+    # A netting account's ``held_execution_close`` is a
+    # ``ProtoOAClosePositionReq`` of the symbol's one venue position, sized
+    # from that position's own volume (never more), so it cannot open or grow
+    # opposite exposure (``_ExecutionMixin._held_execution_close_volume``). A
+    # hedged account closes the venue legs through the core's one-way emulator;
+    # ``fetch_raw_positions`` lists the leg a held entry's order opened
+    # (``_StateMixin._held_entry_position_ids``).
+    supports_held_execution_close = True
     multi_broker = True
     initial_connect_timeout = 180.0
 
@@ -349,6 +365,22 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         #: and a finished one later reads only the deals since. Pruned to the
         #: live rows each snapshot pass. See ``_ReconcileMixin._find_fill_deal``.
         self._deal_walks: 'dict[int, _DealWalk]' = {}
+        #: The ``positionId``s each order whose execution the engine still owes
+        #: its book executed into (``RunContext.held_execution_order_ids``), as
+        #: the venue's order details named them (the order's deals and its
+        #: linked position). Such an order is terminal, so the link never
+        #: changes once read. Pruned to the held orders on every read. See
+        #: ``_StateMixin._held_entry_links``.
+        self._held_order_positions: dict[int, frozenset[int]] = {}
+        #: Monotonic time of the last venue read of a held order whose link is
+        #: not known yet (no executed deal, or a read that failed), so a read
+        #: of the venue position asks the venue again only after
+        #: ``_HELD_ORDER_LINK_RECHECK_S``.
+        self._held_order_link_read: dict[int, float] = {}
+        #: Held orders whose last link read failed: what they executed into is
+        #: unknown, so the startup recovery adopts no untracked leg while one
+        #: is left (``_RecoveryMixin._recover_untracked_venue_state``).
+        self._held_order_link_unread: set[int] = set()
         #: Position ids whose pyramid-sharing was already audit-logged, so the
         #: ``ctrader_position_id_shared`` warning fires once per position per run
         #: rather than per linking entry. See :meth:`_link_position_ref`.
@@ -390,9 +422,19 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
         self._close_evidence_store: 'RunContext | None' = None
         #: Closing orders whose failed lookup was already warned about.
         self._close_lookup_warned: set[int] = set()
-        #: Vanished working orders the venue reported as not found, already
-        #: logged as an ERROR while their rows wait for an operator resume.
+        #: Vanished working orders the venue reported as not found whose
+        #: ``vanished_order:<order id>`` quarantine cause this process latched
+        #: and has not released yet: their rows wait for the deal history to
+        #: decide. See ``_ReconcileMixin._not_found_vanished_verdict``.
         self._vanished_not_found_warned: set[int] = set()
+        #: Rows adopted in the run whose order executed more before the fill
+        #: that adopted them than their cursor counts: coid -> (monotonic time
+        #: of the next deal-history read, the delay after it). See
+        #: ``_ReconcileMixin._adoption_read_due``.
+        self._adoption_reads: dict[str, tuple[float, float]] = {}
+        #: Venue orders this process handed to the engine's held-execution
+        #: recovery (:meth:`_hand_over_execution`), logged once each.
+        self._execution_holds_requested: set[str] = set()
         #: Manual-close reports waiting for the stream to yield their fill
         #: event (or the reconcile pass that recovered them to end), as
         #: ``(reason, context, client_order_id, exchange_order_id, key)``.
@@ -1804,6 +1846,77 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
                 payload={'fifo_head_coid': existing.client_order_id},
             )
 
+    def _execution_handed_over(self, order_id: int | str | None) -> bool:
+        """Whether the engine's held-execution recovery owns an order's execution.
+
+        The order is held for its execution
+        (:meth:`~pynecore.core.broker.storage.RunContext.held_execution_order_ids`),
+        or this run asked the engine to hold it and the engine has not taken
+        the request yet (:meth:`_hand_over_execution`). Its absence from the
+        venue is then no disappearance and no intervention: the engine reads
+        the order's execution itself (:meth:`fetch_order_execution`). Read
+        fresh on every call.
+
+        :param order_id: The venue order id; ``None`` names none.
+        """
+        store = self.store_ctx
+        if store is None or order_id is None:
+            return False
+        key = str(order_id)
+        if key in store.held_execution_order_ids():
+            return True
+        return any(str(request.get('order_id')) == key
+                   for request in store.execution_hold_requests().values())
+
+    def _hand_over_execution(self, row: 'OrderRow', order_id: int, reason: str) -> bool:
+        """Hand an entry whose execution the plugin cannot deliver to the engine's recovery.
+
+        The order reached the venue as ``order_id`` and ended there, it is no
+        longer listed, and its fills cannot be delivered from the deal history
+        (the history does not reach them, or shows less than the venue reports
+        the order executed). The engine holds the entry, reads the order's
+        execution with :meth:`fetch_order_execution` (from its order details,
+        which list every deal the order's fills created, whatever their age)
+        and books it with the venue's figures, so a re-declared entry adopts
+        the order instead of being sent again
+        (:meth:`~pynecore.core.plugin.broker.BrokerPlugin.request_execution_hold`).
+        Called outside every store transaction. WARNING and an audit event,
+        once per order.
+
+        :param row: The entry row.
+        :param order_id: The row's venue order.
+        :param reason: Why the plugin cannot deliver the execution (audit).
+        :return: Whether the engine's recovery owns the order now.
+        """
+        store = self.store_ctx
+        if store is None:
+            return False
+        current = store.get_order(row.client_order_id)
+        if current is not None and (current.extras or {}).get(EXECUTION_HANDED_OVER_EXTRA):
+            # Handed over already; once the engine settled it the row is
+            # synced from the venue, never handed over again.
+            return True
+        if self._execution_handed_over(order_id):
+            return True
+        if current is None or not store.execution_hold_applies(current):
+            return False
+        if not self.request_execution_hold(current.client_order_id, str(order_id)):
+            return False
+        store.upsert_order(current.client_order_id, extras={
+            **(current.extras or {}), EXECUTION_HANDED_OVER_EXTRA: str(order_id)})
+        if str(order_id) not in self._execution_holds_requested:
+            self._execution_holds_requested.add(str(order_id))
+            logger.warning(
+                "cTrader: entry %s (intent %s) executed on order %d, which the venue no longer "
+                "lists, and its fills cannot be delivered (%s); the engine holds the entry and "
+                "reads the order's execution from the venue",
+                current.client_order_id, current.intent_key, order_id, reason)
+            store.log_event(
+                _EXECUTION_HOLD_REQUESTED_EVENT, client_order_id=current.client_order_id,
+                exchange_order_id=str(order_id), intent_key=current.intent_key,
+                payload={'order_id': order_id, 'reason': reason})
+        return True
+
     @staticmethod
     def _executed_floor_cents(row: 'OrderRow') -> int:
         """The executed volume (cents) the venue already reported for a row's order.
@@ -1976,6 +2089,17 @@ class _CTraderBase(BrokerPlugin[CTraderConfig], ABC):
 
     @abstractmethod
     def _judgment_span(self) -> AbstractContextManager[None]: ...
+
+    @abstractmethod
+    async def _held_entry_links(self) -> tuple[set[int], set[int]]: ...
+
+    @abstractmethod
+    async def _settle_handed_over_row(
+            self, row: 'OrderRow', order_id: int, open_positions: Iterable[int],
+    ) -> 'list[OrderEvent]': ...
+
+    @abstractmethod
+    def _note_held_order_link(self, order_id: int, positions: frozenset[int]) -> None: ...
 
     @staticmethod
     @abstractmethod
