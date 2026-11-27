@@ -2028,10 +2028,13 @@ def __test_vanished_close_a_process_died_on_is_in_the_restarted_books_once__(
     CLOSED verdict (the rows are live, the journal does not hold the close),
     or after it retired the rows and before the yielded fill was booked (the
     journal holds it). The restart adopts the flat venue either way. Before
-    the verdict, the next judgment delivers the close as a new fill; after it,
-    the fill is delivered again from its delivery record, marked journaled
-    before the restart: the engine records its receipt and books nothing, the
-    record goes once the receipt shows, and no later process delivers it."""
+    the verdict, the next judgment delivers the close as a new fill, which the
+    engine holds for the venue's verdict; after it, the fill is delivered
+    again from its delivery record, marked journaled before the restart: the
+    engine records its receipt and closes the restored trade once, at the
+    deal's price and fee, without moving the flat book; the record goes once
+    the receipt shows, and neither a further reconcile nor a later process
+    books it again."""
     monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
     qty = volume_to_units(2000)
     broker = _ReconcileBroker(
@@ -2075,13 +2078,25 @@ def __test_vanished_close_a_process_died_on_is_in_the_restarted_books_once__(
     delivered = [(e.fill_id, e.journaled_before_restart) for e in (*redelivered, *judged)]
     assert delivered == [('900', verdict_applied)]
     assert restarted._position.size == pytest.approx(0.0)
-    assert len(restarted._position.closed_trades) == 0
+    closed = [(trade.entry_id, trade.size, trade.entry_price, trade.exit_price,
+               trade.commission, trade.profit) for trade in restarted._position.closed_trades]
+    if verdict_applied:
+        # Deal 900 closed the 20-unit position (entry 1.1) at its own 1.1
+        # price, with no commission.
+        assert closed == [('long', pytest.approx(qty), pytest.approx(1.1), pytest.approx(1.1),
+                           pytest.approx(0.0), pytest.approx(qty * (1.1 - 1.1)))]
+    else:
+        assert closed == []
     assert _live_coids(process) == []
     assert process.store_ctx.keyed_events_for_run_id(ctrader_reconcile._VANISHED_CLOSE_EVENT) == {}
     if verdict_applied:
         assert process.store_ctx.fill_delivered('900')
         assert process._settle_deliveries() == []
         assert process.store_ctx.keyed_events_for_run_id(_FILL_DELIVERY_EVENT) == {}
+        restarted.reconcile()
+        __test_helper_book(restarted, __test_helper_stream_start(process))
+        assert restarted._position.size == pytest.approx(0.0)
+        assert len(restarted._position.closed_trades) == 1
         later = _next_process(process)
         assert __test_helper_stream_start(later) == []
         assert _drive_tracker(later) == ([], None)

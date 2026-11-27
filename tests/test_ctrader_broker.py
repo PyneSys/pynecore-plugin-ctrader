@@ -1735,8 +1735,11 @@ def __test_push_fill_journaled_before_the_engine_took_it_is_received_once_after_
     judged and debited or its rows retired) and died before its engine booked
     the event. The restart adopts the position from the venue and the journal,
     which already hold the fill; the next process delivers the fill again
-    marked as journaled before the restart, the engine records its receipt and
-    books nothing, and the delivery record goes once the receipt shows."""
+    marked as journaled before the restart, and the engine records its
+    receipt: an entry fill books nothing more, a close closes the restored
+    trade once, at the close's own price and fee, without moving the position
+    the restart adopted. The delivery record goes once the receipt shows, and
+    neither a further reconcile nor another stream books it again."""
     monkeypatch.setattr(lib, '_script', SimpleNamespace(initial_capital=1_000_000.0))
     venue_cents, fill_id, expected = __test_helper_PUSH_CRASHES[kind]
     broker = _FakeBroker(reconcile=__test_helper_venue(0))
@@ -1767,10 +1770,24 @@ def __test_push_fill_journaled_before_the_engine_took_it_is_received_once_after_
     assert [(event.fill_id, event.journaled_before_restart) for event in redelivered] == [
         (fill_id, True)]
     assert restarted._position.size == pytest.approx(expected)
-    assert len(restarted._position.closed_trades) == closed_before
+    closed = list(restarted._position.closed_trades)[closed_before:]
+    if kind == 'entry':
+        assert closed == []
+    else:
+        # The bracket close of deal 83: (1000 - venue_cents) cents at 1.2 with
+        # its 40-cent commission (moneyDigits 2), against the 1.1 entry.
+        closed_units = volume_to_units(1000 - venue_cents)
+        assert [(trade.entry_id, trade.size, trade.entry_price, trade.exit_price,
+                 trade.commission, trade.profit) for trade in closed] == [
+            ('L', pytest.approx(closed_units), pytest.approx(1.1), pytest.approx(1.2),
+             pytest.approx(0.4), pytest.approx(closed_units * (1.2 - 1.1) - 0.4))]
     assert process.store_ctx.fill_delivered(fill_id)
     assert process._settle_deliveries() == []
     assert __test_helper_delivery_records(process) == {}
+    restarted.reconcile()
+    __test_helper_book(restarted, __test_helper_stream_start(process))
+    assert restarted._position.size == pytest.approx(expected)
+    assert len(restarted._position.closed_trades) == closed_before + len(closed)
     later = _FakeBroker(reconcile=__test_helper_venue(venue_cents))
     later.store_ctx = broker.store_ctx
     assert __test_helper_stream_start(later) == []
